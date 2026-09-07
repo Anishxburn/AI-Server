@@ -1,13 +1,53 @@
-"""Minimal chatbot API with a provider seam for a future LLM integration."""
+"""Minimal chatbot API backed by Ollama when available."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 
 
 HOST = os.getenv("CHATBOT_HOST", "127.0.0.1")
 PORT = int(os.getenv("CHATBOT_PORT", "8000"))
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
+ALLOWED_ORIGINS = {
+    origin.strip()
+    for origin in os.getenv(
+        "CHATBOT_ALLOWED_ORIGINS",
+        "http://127.0.0.1:5500,http://localhost:5500",
+    ).split(",")
+    if origin.strip()
+}
+
+
+def ask_ollama(message: str) -> str:
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": message,
+        "stream": False,
+        "options": {
+            "temperature": 0.7,
+        },
+    }
+    request = Request(
+        f"{OLLAMA_URL}/api/generate",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=120) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (TimeoutError, URLError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Ollama is not ready: {error}") from error
+
+    reply = str(data.get("response", "")).strip()
+    if not reply:
+        raise RuntimeError("Ollama returned an empty response")
+    return reply
 
 
 class ChatHandler(BaseHTTPRequestHandler):
@@ -16,7 +56,9 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "http://127.0.0.1:5500")
+        origin = self.headers.get("Origin")
+        if origin in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
@@ -48,7 +90,13 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "message is required"})
             return
 
-        self._send_json(200, {"reply": f"Echo: {message}", "provider": "placeholder"})
+        try:
+            reply = ask_ollama(message)
+        except RuntimeError as error:
+            self._send_json(503, {"error": str(error), "provider": "ollama"})
+            return
+
+        self._send_json(200, {"reply": reply, "provider": "ollama", "model": OLLAMA_MODEL})
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"{self.address_string()} - {format % args}")
