@@ -190,6 +190,153 @@ def ask_ollama(message: str, contexts: list[dict], request_id: str) -> str:
     return reply
 
 
+def ask_role_agent(agent_name: str, role: str, message: str, contexts: list[dict], request_id: str) -> str:
+    context_block = "\n\n".join(
+        f"{row.get('title')} / {row.get('standard_name') or 'EMS library'}\n{row.get('chunk_text')}"
+        for row in contexts[:3]
+    ) or "No matching EMS library context was found."
+    prompt = f"""You are {agent_name}.
+Role: {role}
+Answer only from this role. Keep it to 3 compact bullets.
+
+EMS library context:
+{context_block}
+
+Question:
+{message}
+
+{agent_name} answer:"""
+    started_at = time.perf_counter()
+    log_event("multi_agent_to_ollama_request", request_id=request_id, agent=agent_name, model=OLLAMA_MODEL)
+    try:
+        data = ollama_json(
+            "/api/generate",
+            {
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.2},
+            },
+        )
+    except (TimeoutError, URLError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Ollama is not ready: {error}") from error
+    reply = str(data.get("response", "")).strip()
+    if not reply:
+        raise RuntimeError(f"{agent_name} returned an empty response")
+    log_event(
+        "multi_agent_from_ollama_response",
+        request_id=request_id,
+        agent=agent_name,
+        duration_ms=round((time.perf_counter() - started_at) * 1000),
+    )
+    return reply
+
+
+def ask_synthesizer(message: str, agent_answers: list[dict], request_id: str) -> str:
+    discussion = "\n\n".join(
+        f"{item['agent']} ({item['role']}):\n{item['answer']}" for item in agent_answers
+    )
+    prompt = f"""You are the Chief EMS Advisor.
+Two specialist agents answered the same EMS question. Compare them and produce the better final answer.
+Keep the final answer simple, practical, and maximum 5 short bullets.
+
+Question:
+{message}
+
+Specialist discussion:
+{discussion}
+
+Better final answer:"""
+    started_at = time.perf_counter()
+    log_event("synthesizer_to_ollama_request", request_id=request_id, model=OLLAMA_MODEL)
+    try:
+        data = ollama_json(
+            "/api/generate",
+            {
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.15},
+            },
+        )
+    except (TimeoutError, URLError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Ollama is not ready: {error}") from error
+    reply = str(data.get("response", "")).strip()
+    if not reply:
+        raise RuntimeError("Synthesizer returned an empty response")
+    log_event("synthesizer_from_ollama_response", request_id=request_id, duration_ms=round((time.perf_counter() - started_at) * 1000))
+    return reply
+
+
+def run_multi_agent_poc(message: str, request_id: str) -> dict:
+    related = is_ems_related(message)
+    if not related:
+        return {
+            "reply": REFUSAL,
+            "provider": "ems-guard",
+            "model": None,
+            "is_ems_related": False,
+            "agent_discussion": [],
+            "agent_trace": build_agent_trace(False, [], REFUSAL),
+            "sources": [],
+        }
+
+    contexts = retrieve_context(message)
+    sources = [
+        {
+            "title": row.get("title"),
+            "standard_name": row.get("standard_name"),
+            "score": float(row.get("score") or 0),
+            "section_reference": row.get("section_reference"),
+        }
+        for row in contexts
+    ]
+    agent_answers = [
+        {
+            "agent": "Power Quality Agent",
+            "role": "Find likely electrical causes and meter readings to inspect.",
+            "answer": ask_role_agent(
+                "Power Quality Agent",
+                "Find likely electrical causes and meter readings to inspect.",
+                message,
+                contexts,
+                request_id,
+            ),
+        },
+        {
+            "agent": "Energy Manager Agent",
+            "role": "Convert the issue into EMS actions, cost impact, and operational priority.",
+            "answer": ask_role_agent(
+                "Energy Manager Agent",
+                "Convert the issue into EMS actions, cost impact, and operational priority.",
+                message,
+                contexts,
+                request_id,
+            ),
+        },
+    ]
+    final_answer = ask_synthesizer(message, agent_answers, request_id)
+    qa_id = store_chat(message, final_answer, True, sources, None)
+    agent_trace = [
+        {"agent": "EMS Guard", "status": "passed", "detail": "Question is EMS/power related."},
+        {"agent": "Knowledge Retriever", "status": "completed", "detail": f"Found {len(contexts)} EMS source(s)."},
+        {"agent": "Power Quality Agent", "status": "completed", "detail": "Produced first specialist answer."},
+        {"agent": "Energy Manager Agent", "status": "completed", "detail": "Produced second specialist answer."},
+        {"agent": "Chief EMS Advisor", "status": "completed", "detail": "Combined both answers into the better final response."},
+        {"agent": "DB Logger", "status": "completed", "detail": f"Saved QA log {qa_id}."},
+    ]
+    return {
+        "reply": final_answer,
+        "provider": "multi-agent-poc",
+        "model": OLLAMA_MODEL,
+        "is_ems_related": True,
+        "sources": sources,
+        "agent_discussion": agent_answers,
+        "agent_trace": agent_trace,
+        "qa_log_id": qa_id,
+    }
+
+
 def build_agent_trace(related: bool, contexts: list[dict], reply: str, qa_id: str | None = None) -> list[dict]:
     trace = [
         {
@@ -341,6 +488,20 @@ class ChatHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": str(error)})
                 return
             self._send_json(201, result)
+            return
+
+        if path == "/multi-agent-chat":
+            message = str(request.get("message", "")).strip()
+            if not message:
+                self._send_json(400, {"error": "message is required"})
+                return
+            request_id = str(uuid.uuid4())
+            try:
+                result = run_multi_agent_poc(message, request_id)
+            except RuntimeError as error:
+                self._send_json(503, {"error": str(error), "provider": "ollama"})
+                return
+            self._send_json(200, result)
             return
 
         if path != "/chat":
