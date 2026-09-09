@@ -151,6 +151,7 @@ def build_prompt(message: str, contexts: list[dict]) -> str:
 
     return f"""You are an Energy Management System specialist.
 Answer only EMS, energy management, ISO 50001, IEC, IEEE, power monitoring, metering, tariff, demand, and electrical energy questions.
+Keep the final answer simple and compact: maximum 5 short bullets or 1 short paragraph.
 Use the EMS library context when relevant. If the context is insufficient, say what is missing and give a cautious EMS-focused answer.
 For Janitza UMG device, voltage sag, power quality, alarm, THD, or meter troubleshooting questions, prioritize likely root causes, what readings to check, and practical EMS investigation steps.
 If the user says "main cost" in a voltage sag or fault context, treat it as possibly meaning "main cause" and clarify both cause and cost impact briefly.
@@ -187,6 +188,54 @@ def ask_ollama(message: str, contexts: list[dict], request_id: str) -> str:
         raise RuntimeError("Ollama returned an empty response")
     log_event("api_from_ollama_response", request_id=request_id, duration_ms=round((time.perf_counter() - started_at) * 1000))
     return reply
+
+
+def build_agent_trace(related: bool, contexts: list[dict], reply: str, qa_id: str | None = None) -> list[dict]:
+    trace = [
+        {
+            "agent": "EMS Guard",
+            "status": "passed" if related else "blocked",
+            "detail": "Question is EMS/power related." if related else "Question is outside EMS scope.",
+        }
+    ]
+    if related:
+        trace.append(
+            {
+                "agent": "Knowledge Retriever",
+                "status": "completed",
+                "detail": f"Found {len(contexts)} matching EMS library source(s).",
+            }
+        )
+        trace.append(
+            {
+                "agent": "Answer Generator",
+                "status": "completed",
+                "detail": f"Generated compact answer with {OLLAMA_MODEL}.",
+            }
+        )
+    else:
+        trace.append(
+            {
+                "agent": "Answer Generator",
+                "status": "skipped",
+                "detail": "LLM was not called because the EMS guard blocked the question.",
+            }
+        )
+    trace.append(
+        {
+            "agent": "DB Logger",
+            "status": "completed" if qa_id else "skipped",
+            "detail": f"Saved QA log {qa_id}." if qa_id else "No QA log id was created.",
+        }
+    )
+    trace.append(
+        {
+            "agent": "Final Response",
+            "status": "completed",
+            "detail": preview(reply, 120),
+        }
+    )
+    return trace
 
 
 def store_chat(question: str, answer: str, is_related: bool, sources: list[dict], session_id: str | None) -> str:
@@ -324,6 +373,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 for row in contexts
             ]
             qa_id = store_chat(message, reply, related, sources, session_id)
+            agent_trace = build_agent_trace(related, contexts, reply, qa_id)
         except RuntimeError as error:
             log_event("api_to_ui_error", request_id=request_id, error=str(error))
             self._send_json(503, {"error": str(error), "provider": "ollama"})
@@ -345,6 +395,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 "model": OLLAMA_MODEL if related else None,
                 "is_ems_related": related,
                 "sources": sources,
+                "agent_trace": agent_trace,
                 "qa_log_id": qa_id,
             },
         )
