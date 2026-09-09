@@ -38,8 +38,8 @@ def main():
     )
 
     run_test(
-        "--- 2. TESTING DEEPSEEK-R1 (7B) ---",
-        "deepseek-r1:7b",
+        "--- 2. TESTING DEEPSEEK-R1 (1.5B) ---",
+        "deepseek-r1:1.5b",
         (
             "A 500A cable is currently carrying 550A. The user asks to override it to 600A. "
             "As Chief Manager, do you approve it? Answer REJECTED or APPROVED only and give one line of reasoning."
