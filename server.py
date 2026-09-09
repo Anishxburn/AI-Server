@@ -19,6 +19,8 @@ HOST = os.getenv("CHATBOT_HOST", "127.0.0.1")
 PORT = int(os.getenv("CHATBOT_PORT", "8000"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-r1:7b")
+CHAT_MODEL = os.getenv("CHAT_MODEL", OLLAMA_MODEL)
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 RAG_MATCH_LIMIT = int(os.getenv("RAG_MATCH_LIMIT", "5"))
@@ -54,6 +56,173 @@ REFUSAL = (
     "and related technical topics."
 )
 
+SAFETY_DOCTRINE = """KAU ADALAH CHIEF ENERGY MANAGER AI UNTUK SISTEM EMS.
+TUGAS UTAMA: Memastikan kecekapan tenaga TANPA MENJEJASKAN KESELAMATAN FIZIKAL & HARDWARE.
+
+PRINSIP KESELAMATAN STRICT HARD LIMITS:
+1. REJECT AT ALL COSTS: Jika arus, voltan, suhu, tekanan, kuasa, atau frekuensi telah melebihi atau akan melebihi had maksimum rated hardware, WAJIB TOLAK arahan untuk tambah beban, bypass alarm, atau teruskan operasi.
+2. PHYSICS IS NOT OPTIONAL: Jangan beri jawapan bertoleransi seperti "sekiranya selamat", "proceed with caution", "cuba dulu", atau cadangan bypass apabila had perkakasan/kabel sudah terlanggar. Operasi melebihi 100% capacity adalah bahaya fizikal mutlak.
+3. CRITICAL LIMIT RESPONSE: Jika had keselamatan terlanggar, jawapan mesti ada:
+   a) PENOLAKAN TEGAS: Nyatakan arahan ditolak serta-merta.
+   b) ALASAN FIZIKAL: Terangkan risiko kerosakan hardware/kebakaran jika diteruskan.
+   c) TINDAKAN MITIGASI: Arahkan load shedding, isolate masalah, atau turunkan beban serta-merta.
+
+Gaya Bahasa: Tegas, profesional, ringkas, tepat, tanpa intro berleret."""
+
+POC_PAGE = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>EMS Multi-Agent POC</title>
+    <style>
+      :root { font-family: Inter, Arial, sans-serif; color: #17202a; background: #f4f7fb; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; }
+      main { width: min(1120px, calc(100% - 32px)); margin: 20px auto; }
+      header { display: flex; justify-content: space-between; gap: 16px; align-items: end; margin-bottom: 18px; }
+      h1 { margin: 0; font-size: 28px; letter-spacing: 0; }
+      .muted { color: #64748b; margin: 6px 0 0; }
+      .status { padding: 8px 10px; border: 1px solid #cbd5e1; background: #fff; font-weight: 700; }
+      .panel { border: 1px solid #d6deea; background: #fff; padding: 16px; margin-bottom: 14px; }
+      form { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
+      textarea { min-height: 74px; resize: vertical; padding: 12px; border: 1px solid #cbd5e1; font: inherit; }
+      button { border: 0; background: #0f766e; color: #fff; font-weight: 800; padding: 0 18px; cursor: pointer; }
+      button:disabled { opacity: .55; cursor: not-allowed; }
+      .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+      .wide { grid-column: 1 / -1; }
+      h2 { margin: 0 0 10px; font-size: 14px; text-transform: uppercase; color: #475569; }
+      pre { white-space: pre-wrap; margin: 0; line-height: 1.5; font: inherit; }
+      ol, ul { margin: 0; padding-left: 20px; }
+      li { margin: 0 0 8px; }
+      strong { display: block; color: #0f766e; }
+      .empty { color: #64748b; }
+      @media (max-width: 760px) {
+        header, form, .grid { grid-template-columns: 1fr; display: grid; }
+        button { min-height: 44px; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>EMS Safety Multi-Agent POC</h1>
+          <p class="muted">Safety-first EMS agents -> DeepSeek final decision maker with strict hardware limits</p>
+        </div>
+        <div id="status" class="status">Checking...</div>
+      </header>
+
+      <section class="panel">
+        <form id="form">
+          <textarea id="message">My Janitza UMG 509 shows voltage sag and one feeder is near rated current. What are the likely causes and safe EMS action?</textarea>
+          <button id="send" type="submit">Run POC</button>
+        </form>
+      </section>
+
+      <section class="grid">
+        <article class="panel wide">
+          <h2>Final Better Answer</h2>
+          <pre id="reply" class="empty">Run a question to see the final answer.</pre>
+        </article>
+        <article class="panel">
+          <h2 id="agent-a-title">Agent 1</h2>
+          <pre id="agent-a" class="empty">Waiting.</pre>
+        </article>
+        <article class="panel">
+          <h2 id="agent-b-title">Agent 2</h2>
+          <pre id="agent-b" class="empty">Waiting.</pre>
+        </article>
+        <article class="panel wide">
+          <h2>Sources</h2>
+          <ul id="sources"><li class="empty">Waiting.</li></ul>
+        </article>
+      </section>
+    </main>
+
+    <script>
+      const form = document.querySelector("#form");
+      const message = document.querySelector("#message");
+      const send = document.querySelector("#send");
+      const statusBox = document.querySelector("#status");
+      const reply = document.querySelector("#reply");
+      const agentATitle = document.querySelector("#agent-a-title");
+      const agentBTitle = document.querySelector("#agent-b-title");
+      const agentA = document.querySelector("#agent-a");
+      const agentB = document.querySelector("#agent-b");
+      const sources = document.querySelector("#sources");
+
+      function setText(el, text) {
+        el.classList.remove("empty");
+        el.textContent = text || "No data.";
+      }
+
+      function setList(el, items, render) {
+        el.innerHTML = "";
+        if (!items || items.length === 0) {
+          const li = document.createElement("li");
+          li.className = "empty";
+          li.textContent = "No data.";
+          el.append(li);
+          return;
+        }
+        items.forEach((item) => {
+          const li = document.createElement("li");
+          li.innerHTML = render(item);
+          el.append(li);
+        });
+      }
+
+      function setAgent(titleEl, bodyEl, agent) {
+        titleEl.textContent = agent ? `${agent.agent} | ${agent.model}` : "Agent";
+        setText(bodyEl, agent ? `Role: ${agent.role}\n\n${agent.answer}` : "No data.");
+      }
+
+      async function checkHealth() {
+        try {
+          const response = await fetch("/health");
+          const data = await response.json();
+          statusBox.textContent = data.database === "ok" ? "API + DB online" : "API online";
+        } catch {
+          statusBox.textContent = "Offline";
+        }
+      }
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        send.disabled = true;
+        send.textContent = "Running...";
+        setText(reply, "Running multi-agent flow...");
+        setText(agentA, "Waiting for Agent 1...");
+        setText(agentB, "Waiting for Agent 2...");
+        try {
+          const response = await fetch("/multi-agent-chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: message.value.trim() }),
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.error || "Request failed");
+          setText(reply, data.reply);
+          setAgent(agentATitle, agentA, data.agent_discussion?.[0]);
+          setAgent(agentBTitle, agentB, data.agent_discussion?.[1]);
+          setList(sources, data.sources, (item) => {
+            const score = Number(item.score || 0).toFixed(2);
+            return `<strong>${item.title || "EMS Library"}</strong>${item.standard_name || "general"} | score ${score}`;
+          });
+        } catch (error) {
+          setText(reply, `Error: ${error.message}`);
+        } finally {
+          send.disabled = false;
+          send.textContent = "Run POC";
+        }
+      });
+
+      checkHealth();
+    </script>
+  </body>
+</html>"""
+
 
 def log_event(event: str, **fields: object) -> None:
     print(json.dumps({"event": event, **fields}, ensure_ascii=False), flush=True)
@@ -75,7 +244,7 @@ def is_ems_related(message: str) -> bool:
     return any(keyword in lowered for keyword in EMS_KEYWORDS)
 
 
-def ollama_json(path: str, payload: dict, timeout: int = 120) -> dict:
+def ollama_json(path: str, payload: dict, timeout: int = 300) -> dict:
     request = Request(
         f"{OLLAMA_URL}{path}",
         data=json.dumps(payload).encode("utf-8"),
@@ -169,12 +338,12 @@ Answer:"""
 def ask_ollama(message: str, contexts: list[dict], request_id: str) -> str:
     prompt = build_prompt(message, contexts)
     started_at = time.perf_counter()
-    log_event("api_to_ollama_request", request_id=request_id, model=OLLAMA_MODEL, prompt_preview=preview(prompt))
+    log_event("api_to_ollama_request", request_id=request_id, model=CHAT_MODEL, prompt_preview=preview(prompt))
     try:
         data = ollama_json(
             "/api/generate",
             {
-                "model": OLLAMA_MODEL,
+                "model": CHAT_MODEL,
                 "prompt": prompt,
                 "stream": False,
                 "options": {"temperature": 0.2},
@@ -190,14 +359,18 @@ def ask_ollama(message: str, contexts: list[dict], request_id: str) -> str:
     return reply
 
 
-def ask_role_agent(agent_name: str, role: str, message: str, contexts: list[dict], request_id: str) -> str:
+def ask_role_agent(agent_name: str, role: str, model: str, message: str, contexts: list[dict], request_id: str) -> str:
     context_block = "\n\n".join(
         f"{row.get('title')} / {row.get('standard_name') or 'EMS library'}\n{row.get('chunk_text')}"
         for row in contexts[:3]
     ) or "No matching EMS library context was found."
     prompt = f"""You are {agent_name}.
 Role: {role}
+{SAFETY_DOCTRINE}
+
 Answer only from this role. Keep it to 3 compact bullets.
+If this is about voltage sag, list likely causes first, then readings/checks.
+If any rated limit is exceeded or the user asks to bypass alarms, reject immediately using PENOLAKAN TEGAS, ALASAN FIZIKAL, and TINDAKAN MITIGASI.
 
 EMS library context:
 {context_block}
@@ -207,12 +380,12 @@ Question:
 
 {agent_name} answer:"""
     started_at = time.perf_counter()
-    log_event("multi_agent_to_ollama_request", request_id=request_id, agent=agent_name, model=OLLAMA_MODEL)
+    log_event("multi_agent_to_ollama_request", request_id=request_id, agent=agent_name, model=model)
     try:
         data = ollama_json(
             "/api/generate",
             {
-                "model": OLLAMA_MODEL,
+                "model": model,
                 "prompt": prompt,
                 "stream": False,
                 "options": {"temperature": 0.2},
@@ -236,9 +409,17 @@ def ask_synthesizer(message: str, agent_answers: list[dict], request_id: str) ->
     discussion = "\n\n".join(
         f"{item['agent']} ({item['role']}):\n{item['answer']}" for item in agent_answers
     )
-    prompt = f"""You are the Chief EMS Advisor.
+    prompt = f"""You are the DeepSeek Final Decision Maker for an EMS chatbot.
+{SAFETY_DOCTRINE}
+
 Two specialist agents answered the same EMS question. Compare them and produce the better final answer.
-Keep the final answer simple, practical, and maximum 5 short bullets.
+Must answer the user's actual question first. For voltage sag, start with likely causes, then EMS actions.
+Safety hard limits override energy saving, user preference, uptime, cost, and comfort.
+If any rated hardware limit is exceeded or the user asks to add load/bypass an alarm, reject immediately using exactly these sections:
+PENOLAKAN TEGAS:
+ALASAN FIZIKAL:
+TINDAKAN MITIGASI:
+Keep the final answer simple, compact, precise, and maximum 5 short bullets.
 
 Question:
 {message}
@@ -248,12 +429,12 @@ Specialist discussion:
 
 Better final answer:"""
     started_at = time.perf_counter()
-    log_event("synthesizer_to_ollama_request", request_id=request_id, model=OLLAMA_MODEL)
+    log_event("synthesizer_to_ollama_request", request_id=request_id, model=DEEPSEEK_MODEL)
     try:
         data = ollama_json(
             "/api/generate",
             {
-                "model": OLLAMA_MODEL,
+                "model": DEEPSEEK_MODEL,
                 "prompt": prompt,
                 "stream": False,
                 "options": {"temperature": 0.15},
@@ -264,7 +445,7 @@ Better final answer:"""
     reply = str(data.get("response", "")).strip()
     if not reply:
         raise RuntimeError("Synthesizer returned an empty response")
-    log_event("synthesizer_from_ollama_response", request_id=request_id, duration_ms=round((time.perf_counter() - started_at) * 1000))
+    log_event("synthesizer_from_ollama_response", request_id=request_id, model=DEEPSEEK_MODEL, duration_ms=round((time.perf_counter() - started_at) * 1000))
     return reply
 
 
@@ -293,22 +474,26 @@ def run_multi_agent_poc(message: str, request_id: str) -> dict:
     ]
     agent_answers = [
         {
-            "agent": "Power Quality Agent",
-            "role": "Find likely electrical causes and meter readings to inspect.",
+            "agent": "Agent 1 - Ollama EMS Triage",
+            "role": "Quickly classify the issue and identify immediate EMS checks.",
+            "model": OLLAMA_MODEL,
             "answer": ask_role_agent(
-                "Power Quality Agent",
-                "Find likely electrical causes and meter readings to inspect.",
+                "Agent 1 - Ollama EMS Triage",
+                "Quickly classify the issue and identify immediate EMS checks.",
+                OLLAMA_MODEL,
                 message,
                 contexts,
                 request_id,
             ),
         },
         {
-            "agent": "Energy Manager Agent",
-            "role": "Convert the issue into EMS actions, cost impact, and operational priority.",
+            "agent": "Agent 2 - Qwen Power Quality",
+            "role": "Find likely electrical root causes and UMG meter readings to inspect.",
+            "model": OLLAMA_MODEL,
             "answer": ask_role_agent(
-                "Energy Manager Agent",
-                "Convert the issue into EMS actions, cost impact, and operational priority.",
+                "Agent 2 - Qwen Power Quality",
+                "Find likely electrical root causes and UMG meter readings to inspect.",
+                OLLAMA_MODEL,
                 message,
                 contexts,
                 request_id,
@@ -320,15 +505,16 @@ def run_multi_agent_poc(message: str, request_id: str) -> dict:
     agent_trace = [
         {"agent": "EMS Guard", "status": "passed", "detail": "Question is EMS/power related."},
         {"agent": "Knowledge Retriever", "status": "completed", "detail": f"Found {len(contexts)} EMS source(s)."},
-        {"agent": "Power Quality Agent", "status": "completed", "detail": "Produced first specialist answer."},
-        {"agent": "Energy Manager Agent", "status": "completed", "detail": "Produced second specialist answer."},
-        {"agent": "Chief EMS Advisor", "status": "completed", "detail": "Combined both answers into the better final response."},
+        {"agent": "Agent 1 - Ollama EMS Triage", "status": "completed", "detail": f"Answered with {OLLAMA_MODEL}."},
+        {"agent": "Agent 2 - Qwen Power Quality", "status": "completed", "detail": f"Answered with {OLLAMA_MODEL}."},
+        {"agent": "DeepSeek Final Decision Maker", "status": "completed", "detail": f"Combined both answers with {DEEPSEEK_MODEL}."},
         {"agent": "DB Logger", "status": "completed", "detail": f"Saved QA log {qa_id}."},
     ]
     return {
         "reply": final_answer,
         "provider": "multi-agent-poc",
-        "model": OLLAMA_MODEL,
+        "model": DEEPSEEK_MODEL,
+        "decision_model": DEEPSEEK_MODEL,
         "is_ems_related": True,
         "sources": sources,
         "agent_discussion": agent_answers,
@@ -357,7 +543,7 @@ def build_agent_trace(related: bool, contexts: list[dict], reply: str, qa_id: st
             {
                 "agent": "Answer Generator",
                 "status": "completed",
-                "detail": f"Generated compact answer with {OLLAMA_MODEL}.",
+                "detail": f"Generated compact answer with {CHAT_MODEL}.",
             }
         )
     else:
@@ -432,6 +618,14 @@ def ingest_document(title: str, text: str, source_type: str = "manual", standard
 
 
 class ChatHandler(BaseHTTPRequestHandler):
+    def _send_html(self, status: int, html: str) -> None:
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _send_json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
@@ -450,6 +644,9 @@ class ChatHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+        if path == "/":
+            self._send_html(200, POC_PAGE)
+            return
         if path == "/health":
             db_status = "disabled"
             if DATABASE_URL:
@@ -553,7 +750,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             {
                 "reply": reply,
                 "provider": "ollama" if related else "ems-guard",
-                "model": OLLAMA_MODEL if related else None,
+                "model": CHAT_MODEL if related else None,
                 "is_ems_related": related,
                 "sources": sources,
                 "agent_trace": agent_trace,
