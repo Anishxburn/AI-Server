@@ -47,6 +47,19 @@ CREATE TABLE IF NOT EXISTS qa_logs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS qa_embeddings (
+    id UUID PRIMARY KEY,
+    qa_log_id UUID NOT NULL REFERENCES qa_logs(id) ON DELETE CASCADE,
+    question TEXT NOT NULL,
+    answer TEXT NOT NULL,
+    embedding vector(768) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS qa_embeddings_embedding_idx
+ON qa_embeddings USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 100);
+
 CREATE TABLE IF NOT EXISTS feedback (
     id UUID PRIMARY KEY,
     qa_log_id UUID NOT NULL REFERENCES qa_logs(id) ON DELETE CASCADE,

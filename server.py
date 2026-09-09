@@ -56,18 +56,37 @@ REFUSAL = (
     "and related technical topics."
 )
 
-SAFETY_DOCTRINE = """KAU ADALAH CHIEF ENERGY MANAGER AI UNTUK SISTEM EMS.
-TUGAS UTAMA: Memastikan kecekapan tenaga TANPA MENJEJASKAN KESELAMATAN FIZIKAL & HARDWARE.
+SAFETY_DOCTRINE = """YOU ARE THE CHIEF ENERGY MANAGER AI FOR AN EMS SYSTEM.
 
-PRINSIP KESELAMATAN STRICT HARD LIMITS:
-1. REJECT AT ALL COSTS: Jika arus, voltan, suhu, tekanan, kuasa, atau frekuensi telah melebihi atau akan melebihi had maksimum rated hardware, WAJIB TOLAK arahan untuk tambah beban, bypass alarm, atau teruskan operasi.
-2. PHYSICS IS NOT OPTIONAL: Jangan beri jawapan bertoleransi seperti "sekiranya selamat", "proceed with caution", "cuba dulu", atau cadangan bypass apabila had perkakasan/kabel sudah terlanggar. Operasi melebihi 100% capacity adalah bahaya fizikal mutlak.
-3. CRITICAL LIMIT RESPONSE: Jika had keselamatan terlanggar, jawapan mesti ada:
-   a) PENOLAKAN TEGAS: Nyatakan arahan ditolak serta-merta.
-   b) ALASAN FIZIKAL: Terangkan risiko kerosakan hardware/kebakaran jika diteruskan.
-   c) TINDAKAN MITIGASI: Arahkan load shedding, isolate masalah, atau turunkan beban serta-merta.
+LANGUAGE RULE STRICT:
+Detect the user's language and always respond in the exact same language as the user's prompt.
+If the user asks in English, respond only in English.
+If the user asks in Malay, respond only in Malay.
+Do not mix languages.
 
-Gaya Bahasa: Tegas, profesional, ringkas, tepat, tanpa intro berleret."""
+PRIMARY MISSION:
+Ensure energy efficiency without compromising physical safety and hardware limits.
+
+SAFETY GUARDRAIL RULES STRICT HARD LIMITS:
+1. REJECT AT ALL COSTS:
+If any operating parameter including current, voltage, temperature, pressure, power, or frequency exceeds or will exceed maximum hardware rated capacity or limits, strictly reject any request to increase load or override alarms.
+
+2. PHYSICS IS NOT OPTIONAL:
+Never provide tolerant or hesitant answers like "if safe proceed", "proceed with caution", or "try first" when hardware limits are breached. Operating above 100% capacity is an absolute physical hazard.
+
+3. RESPONSE STRUCTURE FOR CRITICAL LIMIT BREACHES:
+Your response must contain exactly these sections:
+- DIRECT REJECTION: State clearly that the action is rejected.
+- PHYSICAL REASONING: Explain the risk of hardware damage, insulation failure, or fire hazard.
+- MITIGATION ACTION: Direct immediate load shedding or isolation to reduce load below rated limits.
+
+Tone: Professional, direct, concise, strict, no conversational fluff."""
+
+MATH_DOCTRINE = """MATHEMATICAL ACCURACY RULE:
+When calculating energy cost, always use this exact formula:
+Cost (RM) = Power (kW) x Operating Hours (h) x Tariff Rate (RM/kWh).
+Show the step-by-step arithmetic when a cost calculation is requested.
+Do not invent missing values. If power, hours, or tariff rate is missing, ask for the missing value or state the assumption clearly."""
 
 POC_PAGE = """<!doctype html>
 <html lang="en">
@@ -92,6 +111,8 @@ POC_PAGE = """<!doctype html>
       .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
       .wide { grid-column: 1 / -1; }
       h2 { margin: 0 0 10px; font-size: 14px; text-transform: uppercase; color: #475569; }
+      .answer-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+      .pill { border: 1px solid #cbd5e1; background: #f8fafc; color: #334155; padding: 5px 8px; font-size: 12px; font-weight: 700; }
       pre { white-space: pre-wrap; margin: 0; line-height: 1.5; font: inherit; }
       ol, ul { margin: 0; padding-left: 20px; }
       li { margin: 0 0 8px; }
@@ -122,8 +143,9 @@ POC_PAGE = """<!doctype html>
 
       <section class="grid">
         <article class="panel wide">
-          <h2>Final Better Answer</h2>
-          <pre id="reply" class="empty">Run a question to see the final answer.</pre>
+          <h2>Answer</h2>
+          <div id="answer-meta" class="answer-meta"></div>
+          <pre id="reply" class="empty">Run a question to see the answer.</pre>
         </article>
         <article class="panel">
           <h2 id="agent-a-title">Agent 1</h2>
@@ -146,6 +168,7 @@ POC_PAGE = """<!doctype html>
       const send = document.querySelector("#send");
       const statusBox = document.querySelector("#status");
       const reply = document.querySelector("#reply");
+      const answerMeta = document.querySelector("#answer-meta");
       const agentATitle = document.querySelector("#agent-a-title");
       const agentBTitle = document.querySelector("#agent-b-title");
       const agentA = document.querySelector("#agent-a");
@@ -178,6 +201,24 @@ POC_PAGE = """<!doctype html>
         setText(bodyEl, agent ? `Role: ${agent.role}\n\n${agent.answer}` : "No data.");
       }
 
+      function setMeta(data) {
+        answerMeta.innerHTML = "";
+        const source = data.sources?.[0];
+        const items = [
+          `Processing time: ${Number(data.processing_time_seconds || 0).toFixed(1)}s`,
+          `Decision model: ${data.decision_model || data.model || "n/a"}`,
+        ];
+        if (source) {
+          items.push(`Top source score: ${Number(source.score || 0).toFixed(2)}`);
+        }
+        items.forEach((text) => {
+          const span = document.createElement("span");
+          span.className = "pill";
+          span.textContent = text;
+          answerMeta.append(span);
+        });
+      }
+
       async function checkHealth() {
         try {
           const response = await fetch("/health");
@@ -203,6 +244,7 @@ POC_PAGE = """<!doctype html>
           });
           const data = await response.json();
           if (!response.ok) throw new Error(data.error || "Request failed");
+          setMeta(data);
           setText(reply, data.reply);
           setAgent(agentATitle, agentA, data.agent_discussion?.[0]);
           setAgent(agentBTitle, agentB, data.agent_discussion?.[1]);
@@ -367,10 +409,11 @@ def ask_role_agent(agent_name: str, role: str, model: str, message: str, context
     prompt = f"""You are {agent_name}.
 Role: {role}
 {SAFETY_DOCTRINE}
+{MATH_DOCTRINE}
 
 Answer only from this role. Keep it to 3 compact bullets.
 If this is about voltage sag, list likely causes first, then readings/checks.
-If any rated limit is exceeded or the user asks to bypass alarms, reject immediately using PENOLAKAN TEGAS, ALASAN FIZIKAL, and TINDAKAN MITIGASI.
+If any rated limit is exceeded or the user asks to bypass alarms, reject immediately using DIRECT REJECTION, PHYSICAL REASONING, and MITIGATION ACTION.
 
 EMS library context:
 {context_block}
@@ -411,14 +454,21 @@ def ask_synthesizer(message: str, agent_answers: list[dict], request_id: str) ->
     )
     prompt = f"""You are the DeepSeek Final Decision Maker for an EMS chatbot.
 {SAFETY_DOCTRINE}
+{MATH_DOCTRINE}
 
-Two specialist agents answered the same EMS question. Compare them and produce the better final answer.
+Two specialist agents answered the same EMS question. Use their answers internally, then return only the final user-facing answer.
+Do not mention which agent is better.
+Do not mention "better final answer".
+Do not explain that the response is professional, concise, strict, compliant, or follows guidelines.
+Do not include separators like "---".
+Do not reveal the discussion process.
+Write naturally like a senior EMS engineer speaking to an operator: clear, practical, and human.
 Must answer the user's actual question first. For voltage sag, start with likely causes, then EMS actions.
 Safety hard limits override energy saving, user preference, uptime, cost, and comfort.
 If any rated hardware limit is exceeded or the user asks to add load/bypass an alarm, reject immediately using exactly these sections:
-PENOLAKAN TEGAS:
-ALASAN FIZIKAL:
-TINDAKAN MITIGASI:
+DIRECT REJECTION:
+PHYSICAL REASONING:
+MITIGATION ACTION:
 Keep the final answer simple, compact, precise, and maximum 5 short bullets.
 
 Question:
@@ -427,7 +477,7 @@ Question:
 Specialist discussion:
 {discussion}
 
-Better final answer:"""
+Final answer only:"""
     started_at = time.perf_counter()
     log_event("synthesizer_to_ollama_request", request_id=request_id, model=DEEPSEEK_MODEL)
     try:
@@ -446,12 +496,34 @@ Better final answer:"""
     if not reply:
         raise RuntimeError("Synthesizer returned an empty response")
     log_event("synthesizer_from_ollama_response", request_id=request_id, model=DEEPSEEK_MODEL, duration_ms=round((time.perf_counter() - started_at) * 1000))
-    return reply
+    return clean_final_answer(reply)
+
+
+def clean_final_answer(reply: str) -> str:
+    lines = []
+    skip_patterns = (
+        "the better final answer is",
+        "better final answer",
+        "this response is",
+        "this answer is",
+        "as the final decision maker",
+    )
+    for raw_line in reply.splitlines():
+        line = raw_line.strip()
+        lowered = line.lower().strip("* ")
+        if not line or line == "---":
+            continue
+        if any(pattern in lowered for pattern in skip_patterns):
+            continue
+        lines.append(raw_line)
+    return "\n".join(lines).strip() or reply.strip()
 
 
 def run_multi_agent_poc(message: str, request_id: str) -> dict:
+    started_at = time.perf_counter()
     related = is_ems_related(message)
     if not related:
+        duration_ms = round((time.perf_counter() - started_at) * 1000)
         return {
             "reply": REFUSAL,
             "provider": "ems-guard",
@@ -460,6 +532,8 @@ def run_multi_agent_poc(message: str, request_id: str) -> dict:
             "agent_discussion": [],
             "agent_trace": build_agent_trace(False, [], REFUSAL),
             "sources": [],
+            "duration_ms": duration_ms,
+            "processing_time_seconds": duration_ms / 1000,
         }
 
     contexts = retrieve_context(message)
@@ -502,6 +576,7 @@ def run_multi_agent_poc(message: str, request_id: str) -> dict:
     ]
     final_answer = ask_synthesizer(message, agent_answers, request_id)
     qa_id = store_chat(message, final_answer, True, sources, None)
+    duration_ms = round((time.perf_counter() - started_at) * 1000)
     agent_trace = [
         {"agent": "EMS Guard", "status": "passed", "detail": "Question is EMS/power related."},
         {"agent": "Knowledge Retriever", "status": "completed", "detail": f"Found {len(contexts)} EMS source(s)."},
@@ -520,6 +595,8 @@ def run_multi_agent_poc(message: str, request_id: str) -> dict:
         "agent_discussion": agent_answers,
         "agent_trace": agent_trace,
         "qa_log_id": qa_id,
+        "duration_ms": duration_ms,
+        "processing_time_seconds": duration_ms / 1000,
     }
 
 
@@ -591,6 +668,11 @@ def store_chat(question: str, answer: str, is_related: bool, sources: list[dict]
                 "INSERT INTO qa_logs (id, session_id, question, answer, is_ems_related, sources_used) VALUES (%s, %s, %s, %s, %s, %s)",
                 (qa_id, session, question, answer, is_related, json.dumps(sources)),
             )
+            if is_related:
+                cur.execute(
+                    "INSERT INTO qa_embeddings (id, qa_log_id, question, answer, embedding) VALUES (%s, %s, %s, %s, %s::vector)",
+                    (str(uuid.uuid4()), qa_id, question, answer, vector_literal(embed_text(question))),
+                )
         conn.commit()
     return qa_id
 
