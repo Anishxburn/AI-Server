@@ -82,7 +82,10 @@ DAXVIEW_TOOL_KEYWORDS = {
     },
     "get_daxview_open_alarms": {
         "open alarm", "open alarms", "active alarm", "active alarms", "current alarm",
-        "current alarms", "alarm status", "faults", "events",
+        "current alarms", "alarm status", "alarm count", "active alarm count",
+        "open alert", "open alerts", "active alert", "active alerts", "current alert",
+        "current alerts", "alert", "alerts", "alert count", "active alert count",
+        "faults", "events",
     },
     "get_daxview_billing": {
         "billing", "bill", "current month", "this month cost", "monthly cost",
@@ -294,14 +297,21 @@ POC_PAGE = """<!doctype html>
           if (structured?.backend_endpoint) lines.push(`Backend endpoint: ${structured.backend_endpoint}`);
           if (structured?.backend_http_status) lines.push(`Backend HTTP status: ${structured.backend_http_status}`);
           if (backend?.count !== undefined) lines.push(`Backend count: ${backend.count}`);
+          if (backend?.active_count !== undefined) lines.push(`Active count: ${backend.active_count}`);
+          if (backend?.open_count !== undefined) lines.push(`Open count: ${backend.open_count}`);
+          const alarmList = backend?.alarms || backend?.alerts || backend?.open_alarms || backend?.active_alarms;
+          if (Array.isArray(alarmList)) {
+            lines.push(`Alerts returned: ${alarmList.length}`);
+            alarmList.slice(0, 10).forEach((alarm) => {
+              lines.push(`- ${alarm.title || alarm.name || alarm.rule_name || alarm.id || alarm.alarm_id || "alert"} | ${alarm.status || alarm.state || "unknown"} | ${alarm.severity || "no severity"}`);
+            });
+          }
           if (Array.isArray(backend?.devices)) {
             lines.push("Devices:");
             backend.devices.forEach((device) => {
               lines.push(`- ${device.device_name || device.remote_device_id} | ${device.remote_device_id || "no id"} | ${device.site_name || "no site"} | ${device.status || "no status"}`);
             });
           }
-          lines.push("Raw structured data:");
-          lines.push(JSON.stringify(structured, null, 2));
         });
         (mcp.errors || []).forEach((item) => {
           lines.push("");
@@ -408,6 +418,9 @@ def daxview_clarification_needed(message: str, tools: list[str]) -> bool:
     if not tools:
         return False
     if not any(tool in DAXVIEW_SCOPE_REQUIRED_TOOLS for tool in tools):
+        return False
+    lowered = message.lower()
+    if any(phrase in lowered for phrase in ("how many", "count", "list", "show all", "all daxview")):
         return False
     return not has_daxview_scope(message)
 
@@ -594,6 +607,9 @@ def summarize_mcp_result(tool_name: str, result: dict) -> list[str]:
         lines.append(f"Backend HTTP status: {structured.get('backend_http_status')}")
     if backend.get("count") is not None:
         lines.append(f"Returned count: {backend.get('count')}")
+    alarm_count = extract_alarm_count(structured) if tool_name == "get_daxview_open_alarms" else None
+    if alarm_count is not None:
+        lines.append(f"Active alerts: {alarm_count}")
     devices = backend.get("devices")
     if isinstance(devices, list):
         online_count = sum(1 for device in devices if str(device.get("status", "")).lower() == "online")
@@ -611,10 +627,65 @@ def summarize_mcp_result(tool_name: str, result: dict) -> list[str]:
     return lines
 
 
+def first_numeric_value(data: dict, keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str) and value.strip().isdigit():
+            return int(value.strip())
+    return None
+
+
+def extract_alarm_count(structured: dict) -> int | None:
+    if not isinstance(structured, dict):
+        return None
+    candidates = [structured]
+    backend = structured.get("backend_response")
+    if isinstance(backend, dict):
+        candidates.insert(0, backend)
+        totals = backend.get("totals")
+        if isinstance(totals, dict):
+            candidates.insert(0, totals)
+    count_keys = (
+        "active_alerts", "active_alert_count", "open_alerts", "open_alert_count",
+        "active_alarms", "active_alarm_count", "open_alarms", "open_alarm_count",
+        "alarm_count", "alert_count", "active_count", "open_count", "count", "total",
+    )
+    for candidate in candidates:
+        value = first_numeric_value(candidate, count_keys)
+        if value is not None:
+            return value
+    list_keys = ("alarms", "alerts", "open_alarms", "active_alarms", "open_alerts", "active_alerts")
+    for candidate in candidates:
+        for key in list_keys:
+            value = candidate.get(key)
+            if isinstance(value, list):
+                return len(value)
+    return None
+
+
 def answer_from_mcp_if_direct_count_question(message: str, mcp_context: dict) -> str | None:
     lowered = message.lower()
     if not any(phrase in lowered for phrase in ("how many", "count", "online devices", "devices online")):
         return None
+    wants_alarm_count = any(
+        phrase in lowered
+        for phrase in ("alarm", "alarms", "alert", "alerts", "fault", "faults", "event", "events")
+    )
+    if wants_alarm_count:
+        for item in mcp_context.get("results") or []:
+            if item.get("tool") != "get_daxview_open_alarms":
+                continue
+            structured = mcp_structured_result(item.get("result") or {})
+            alarm_count = extract_alarm_count(structured)
+            if alarm_count is not None:
+                return f"{alarm_count} Daxview alerts are active."
+        return "I could not determine the active Daxview alert count from the MCP response."
     for item in mcp_context.get("results") or []:
         if item.get("tool") != "get_daxview_device_summary":
             continue
@@ -639,9 +710,6 @@ def format_daxview_context(mcp_context: dict) -> str:
     lines = []
     for item in results:
         lines.extend(summarize_mcp_result(item.get("tool"), item.get("result") or {}))
-        structured = mcp_structured_result(item.get("result") or {})
-        lines.append("Structured MCP data:")
-        lines.append(json.dumps(structured, ensure_ascii=False, indent=2))
     for item in errors:
         lines.append(f"Tool {item.get('tool')} error: {item.get('error')}")
     return "\n\n".join(lines)
