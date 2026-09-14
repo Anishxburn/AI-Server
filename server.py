@@ -1,6 +1,7 @@
 """EMS-only chatbot API with Ollama, PostgreSQL, and pgvector RAG."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 import re
@@ -23,6 +24,8 @@ OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-r1:1.5b")
 CHAT_MODEL = os.getenv("CHAT_MODEL", OLLAMA_MODEL)
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
+OLLAMA_GENERATE_TIMEOUT = int(os.getenv("OLLAMA_GENERATE_TIMEOUT", "120"))
+OLLAMA_EMBEDDING_TIMEOUT = int(os.getenv("OLLAMA_EMBEDDING_TIMEOUT", "30"))
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 RAG_MATCH_LIMIT = int(os.getenv("RAG_MATCH_LIMIT", "5"))
 RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.2"))
@@ -209,7 +212,7 @@ POC_PAGE = """<!doctype html>
 
       <section class="panel">
         <form id="form">
-          <textarea id="message">My Janitza UMG 509 shows voltage sag and one feeder is near rated current. What are the likely causes and safe EMS action?</textarea>
+          <textarea id="message" placeholder="Ask an EMS or Daxview question..."></textarea>
           <button id="send" type="submit">Run POC</button>
         </form>
       </section>
@@ -252,6 +255,7 @@ POC_PAGE = """<!doctype html>
       const agentA = document.querySelector("#agent-a");
       const agentB = document.querySelector("#agent-b");
       const sources = document.querySelector("#sources");
+      const POC_BROWSER_TIMEOUT_MS = 180000;
 
       function setText(el, text) {
         el.classList.remove("empty");
@@ -357,11 +361,15 @@ POC_PAGE = """<!doctype html>
         setText(agentA, "Waiting for Agent 1...");
         setText(agentB, "Waiting for Agent 2...");
         try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), POC_BROWSER_TIMEOUT_MS);
           const response = await fetch("/multi-agent-chat", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ message: message.value.trim() }),
+            signal: controller.signal,
           });
+          clearTimeout(timeout);
           const data = await response.json();
           if (!response.ok) throw new Error(data.error || "Request failed");
           setMeta(data);
@@ -374,7 +382,10 @@ POC_PAGE = """<!doctype html>
             return `<strong>${item.title || "EMS Library"}</strong>${item.standard_name || "general"} | score ${score}`;
           });
         } catch (error) {
-          setText(reply, `Error: ${error.message}`);
+          const message = error.name === "AbortError"
+            ? "Error: The POC took too long to respond. Try a shorter question, check Ollama load, or increase POC_BROWSER_TIMEOUT_MS."
+            : `Error: ${error.message}`;
+          setText(reply, message);
         } finally {
           send.disabled = false;
           send.textContent = "Run POC";
@@ -729,7 +740,7 @@ def daxview_trace_status(mcp_context: dict) -> tuple[str, str]:
 
 
 def embed_text(text: str) -> list[float]:
-    data = ollama_json("/api/embeddings", {"model": EMBEDDING_MODEL, "prompt": text})
+    data = ollama_json("/api/embeddings", {"model": EMBEDDING_MODEL, "prompt": text}, timeout=OLLAMA_EMBEDDING_TIMEOUT)
     embedding = data.get("embedding")
     if not isinstance(embedding, list):
         raise RuntimeError("Ollama returned an invalid embedding")
@@ -826,6 +837,7 @@ def ask_ollama(message: str, contexts: list[dict], request_id: str, mcp_context:
                 "stream": False,
                 "options": {"temperature": 0.2},
             },
+            timeout=OLLAMA_GENERATE_TIMEOUT,
         )
     except (TimeoutError, URLError, json.JSONDecodeError) as error:
         log_event("api_to_ollama_error", request_id=request_id, error=str(error))
@@ -883,6 +895,7 @@ Question:
                 "stream": False,
                 "options": {"temperature": 0.2},
             },
+            timeout=OLLAMA_GENERATE_TIMEOUT,
         )
     except (TimeoutError, URLError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Ollama is not ready: {error}") from error
@@ -944,6 +957,7 @@ Final answer only:"""
                 "stream": False,
                 "options": {"temperature": 0.15},
             },
+            timeout=OLLAMA_GENERATE_TIMEOUT,
         )
     except (TimeoutError, URLError, json.JSONDecodeError) as error:
         raise RuntimeError(f"Ollama is not ready: {error}") from error
@@ -1069,36 +1083,30 @@ def langchain_generate_multi_agent_answer(state: dict) -> dict:
     contexts = state["contexts"]
     request_id = state["request_id"]
     mcp_context = state["mcp_context"]
-    agent_answers = [
-        {
-            "agent": "Agent 1 - Ollama EMS Triage",
-            "role": "Quickly classify the issue and identify immediate EMS checks.",
-            "model": OLLAMA_MODEL,
-            "answer": ask_role_agent(
-                "Agent 1 - Ollama EMS Triage",
-                "Quickly classify the issue and identify immediate EMS checks.",
-                OLLAMA_MODEL,
-                message,
-                contexts,
-                request_id,
-                mcp_context,
-            ),
-        },
-        {
-            "agent": "Agent 2 - Qwen Power Quality",
-            "role": "Find likely electrical root causes and UMG meter readings to inspect.",
-            "model": OLLAMA_MODEL,
-            "answer": ask_role_agent(
-                "Agent 2 - Qwen Power Quality",
-                "Find likely electrical root causes and UMG meter readings to inspect.",
-                OLLAMA_MODEL,
-                message,
-                contexts,
-                request_id,
-                mcp_context,
-            ),
-        },
+    agent_specs = [
+        (
+            "Agent 1 - Ollama EMS Triage",
+            "Quickly classify the issue and identify immediate EMS checks.",
+            OLLAMA_MODEL,
+        ),
+        (
+            "Agent 2 - Qwen Power Quality",
+            "Find likely electrical root causes and UMG meter readings to inspect.",
+            OLLAMA_MODEL,
+        ),
     ]
+
+    def run_agent(spec: tuple[str, str, str]) -> dict:
+        agent_name, role, model = spec
+        return {
+            "agent": agent_name,
+            "role": role,
+            "model": model,
+            "answer": ask_role_agent(agent_name, role, model, message, contexts, request_id, mcp_context),
+        }
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        agent_answers = list(executor.map(run_agent, agent_specs))
     state["agent_answers"] = agent_answers
     state["reply"] = ask_synthesizer(message, agent_answers, request_id, mcp_context)
     state["provider"] = "multi-agent-poc"
