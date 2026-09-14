@@ -30,6 +30,8 @@ DAXVIEW_MCP_ENABLED = os.getenv("DAXVIEW_MCP_ENABLED", "false").lower() in {"1",
 DAXVIEW_MCP_URL = os.getenv("DAXVIEW_MCP_URL", "").strip()
 DAXVIEW_MCP_AUTH_TOKEN = os.getenv("DAXVIEW_MCP_AUTH_TOKEN", "").strip()
 DAXVIEW_MCP_TIMEOUT = int(os.getenv("DAXVIEW_MCP_TIMEOUT", "20"))
+DAXVIEW_MCP_PROTOCOL_VERSION = os.getenv("DAXVIEW_MCP_PROTOCOL_VERSION", "2025-06-18")
+DAXVIEW_MCP_SESSION_ID = None
 TRACES = deque(maxlen=TRACE_LIMIT)
 ALLOWED_ORIGINS = {
     origin.strip()
@@ -409,9 +411,55 @@ def parse_mcp_response(raw: str) -> dict:
     return json.loads(raw)
 
 
-def mcp_json_rpc(method: str, params: dict | None = None, request_id: str | int | None = None) -> dict:
+def mcp_headers(include_session: bool = True) -> dict:
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+        "MCP-Protocol-Version": DAXVIEW_MCP_PROTOCOL_VERSION,
+    }
+    if DAXVIEW_MCP_AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {DAXVIEW_MCP_AUTH_TOKEN}"
+    if include_session and DAXVIEW_MCP_SESSION_ID:
+        headers["Mcp-Session-Id"] = DAXVIEW_MCP_SESSION_ID
+    return headers
+
+
+def mcp_post(payload: dict, include_session: bool = True) -> tuple[dict, object]:
     if not DAXVIEW_MCP_URL:
         raise RuntimeError("DAXVIEW_MCP_URL is not configured")
+    request = Request(
+        DAXVIEW_MCP_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=mcp_headers(include_session),
+        method="POST",
+    )
+    with urlopen(request, timeout=DAXVIEW_MCP_TIMEOUT) as response:
+        return parse_mcp_response(response.read().decode("utf-8")), response.headers
+
+
+def initialize_mcp_session() -> None:
+    global DAXVIEW_MCP_SESSION_ID
+    if DAXVIEW_MCP_SESSION_ID:
+        return
+    payload = {
+        "jsonrpc": "2.0",
+        "id": f"initialize:{uuid.uuid4()}",
+        "method": "initialize",
+        "params": {
+            "protocolVersion": DAXVIEW_MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "ems-chatbot-ai-server", "version": "1.0.0"},
+        },
+    }
+    response, headers = mcp_post(payload, include_session=False)
+    if response.get("error"):
+        raise RuntimeError(response["error"])
+    DAXVIEW_MCP_SESSION_ID = headers.get("Mcp-Session-Id") or headers.get("mcp-session-id")
+
+
+def mcp_json_rpc(method: str, params: dict | None = None, request_id: str | int | None = None) -> dict:
+    if method != "initialize":
+        initialize_mcp_session()
     payload = {
         "jsonrpc": "2.0",
         "id": request_id or str(uuid.uuid4()),
@@ -419,20 +467,8 @@ def mcp_json_rpc(method: str, params: dict | None = None, request_id: str | int 
     }
     if params is not None:
         payload["params"] = params
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-    }
-    if DAXVIEW_MCP_AUTH_TOKEN:
-        headers["Authorization"] = f"Bearer {DAXVIEW_MCP_AUTH_TOKEN}"
-    request = Request(
-        DAXVIEW_MCP_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    with urlopen(request, timeout=DAXVIEW_MCP_TIMEOUT) as response:
-        return parse_mcp_response(response.read().decode("utf-8"))
+    response, _ = mcp_post(payload)
+    return response
 
 
 def call_daxview_mcp_tool(tool_name: str, arguments: dict | None, request_id: str) -> dict:
