@@ -28,6 +28,7 @@ RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.2"))
 TRACE_LIMIT = int(os.getenv("CHATBOT_TRACE_LIMIT", "25"))
 DAXVIEW_MCP_ENABLED = os.getenv("DAXVIEW_MCP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 DAXVIEW_MCP_URL = os.getenv("DAXVIEW_MCP_URL", "").strip()
+DAXVIEW_MCP_AUTH_TOKEN = os.getenv("DAXVIEW_MCP_AUTH_TOKEN", "").strip()
 DAXVIEW_MCP_TIMEOUT = int(os.getenv("DAXVIEW_MCP_TIMEOUT", "20"))
 TRACES = deque(maxlen=TRACE_LIMIT)
 ALLOWED_ORIGINS = {
@@ -418,13 +419,16 @@ def mcp_json_rpc(method: str, params: dict | None = None, request_id: str | int 
     }
     if params is not None:
         payload["params"] = params
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if DAXVIEW_MCP_AUTH_TOKEN:
+        headers["Authorization"] = f"Bearer {DAXVIEW_MCP_AUTH_TOKEN}"
     request = Request(
         DAXVIEW_MCP_URL,
         data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json, text/event-stream",
-        },
+        headers=headers,
         method="POST",
     )
     with urlopen(request, timeout=DAXVIEW_MCP_TIMEOUT) as response:
