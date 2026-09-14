@@ -11,6 +11,7 @@ from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from langchain_core.runnables import RunnableLambda
 import psycopg
 from psycopg.rows import dict_row
 
@@ -905,7 +906,268 @@ def clean_final_answer(reply: str) -> str:
     return "\n".join(lines).strip() or reply.strip()
 
 
+def langchain_start_state(payload: dict) -> dict:
+    message = str(payload.get("message", "")).strip()
+    return {
+        "message": message,
+        "request_id": payload.get("request_id") or str(uuid.uuid4()),
+        "session_id": payload.get("session_id"),
+        "mode": payload.get("mode", "chat"),
+        "started_at": payload.get("started_at") or time.perf_counter(),
+        "contexts": [],
+        "sources": [],
+        "mcp_context": {"enabled": DAXVIEW_MCP_ENABLED, "tools": [], "results": [], "errors": []},
+        "agent_answers": [],
+        "agent_trace": [],
+        "reply": "",
+        "provider": "ems-guard",
+        "model": None,
+    }
+
+
+def langchain_classify_and_validate(state: dict) -> dict:
+    message = state["message"]
+    related = is_ems_related(message)
+    selected_tools = select_daxview_tools(message) if related else []
+    state.update(
+        {
+            "is_ems_related": related,
+            "selected_tools": selected_tools,
+            "needs_clarification": related and daxview_clarification_needed(message, selected_tools),
+        }
+    )
+    if not related:
+        state["reply"] = REFUSAL
+        state["provider"] = "ems-guard"
+    elif state["needs_clarification"]:
+        state["reply"] = build_daxview_clarification(message, selected_tools)
+        state["provider"] = "daxview-question-filter"
+        state["mcp_context"] = {"enabled": DAXVIEW_MCP_ENABLED, "tools": selected_tools, "results": [], "errors": []}
+    return state
+
+
+def langchain_retrieve_context(state: dict) -> dict:
+    if not state.get("is_ems_related") or state.get("needs_clarification"):
+        return state
+    message = state["message"]
+    contexts = retrieve_context(message)
+    state["contexts"] = contexts
+    state["sources"] = [
+        {
+            "title": row.get("title"),
+            "standard_name": row.get("standard_name"),
+            "score": float(row.get("score") or 0),
+            "section_reference": row.get("section_reference"),
+        }
+        for row in contexts
+    ]
+    state["mcp_context"] = retrieve_daxview_context(message, state["request_id"])
+    return state
+
+
+def langchain_direct_mcp_answer(state: dict) -> dict:
+    if state.get("reply") or not state.get("is_ems_related"):
+        return state
+    direct_answer = answer_from_mcp_if_direct_count_question(state["message"], state["mcp_context"])
+    if direct_answer:
+        state["reply"] = direct_answer
+        state["provider"] = "daxview-mcp-direct"
+        state["model"] = None
+        state["decision_model"] = "Daxview MCP direct extractor"
+        state["agent_answers"] = [
+            {
+                "agent": "Daxview MCP Direct Extractor",
+                "role": "Read structured MCP data and answer deterministic count/status questions.",
+                "model": "deterministic",
+                "answer": direct_answer,
+            }
+        ]
+    return state
+
+
+def langchain_generate_chat_answer(state: dict) -> dict:
+    if state.get("reply") or not state.get("is_ems_related"):
+        return state
+    state["reply"] = ask_ollama(state["message"], state["contexts"], state["request_id"], state["mcp_context"])
+    state["provider"] = "ollama"
+    state["model"] = CHAT_MODEL
+    return state
+
+
+def langchain_generate_multi_agent_answer(state: dict) -> dict:
+    if state.get("reply") or not state.get("is_ems_related"):
+        return state
+    message = state["message"]
+    contexts = state["contexts"]
+    request_id = state["request_id"]
+    mcp_context = state["mcp_context"]
+    agent_answers = [
+        {
+            "agent": "Agent 1 - Ollama EMS Triage",
+            "role": "Quickly classify the issue and identify immediate EMS checks.",
+            "model": OLLAMA_MODEL,
+            "answer": ask_role_agent(
+                "Agent 1 - Ollama EMS Triage",
+                "Quickly classify the issue and identify immediate EMS checks.",
+                OLLAMA_MODEL,
+                message,
+                contexts,
+                request_id,
+                mcp_context,
+            ),
+        },
+        {
+            "agent": "Agent 2 - Qwen Power Quality",
+            "role": "Find likely electrical root causes and UMG meter readings to inspect.",
+            "model": OLLAMA_MODEL,
+            "answer": ask_role_agent(
+                "Agent 2 - Qwen Power Quality",
+                "Find likely electrical root causes and UMG meter readings to inspect.",
+                OLLAMA_MODEL,
+                message,
+                contexts,
+                request_id,
+                mcp_context,
+            ),
+        },
+    ]
+    state["agent_answers"] = agent_answers
+    state["reply"] = ask_synthesizer(message, agent_answers, request_id, mcp_context)
+    state["provider"] = "multi-agent-poc"
+    state["model"] = DEEPSEEK_MODEL
+    state["decision_model"] = DEEPSEEK_MODEL
+    return state
+
+
+def langchain_persist_and_trace(state: dict) -> dict:
+    related = bool(state.get("is_ems_related"))
+    qa_id = store_chat(
+        state["message"],
+        state["reply"],
+        related,
+        state.get("sources") or [],
+        state.get("session_id"),
+    )
+    state["qa_log_id"] = qa_id
+    mcp_context = state.get("mcp_context") or {}
+    if not related:
+        state["agent_trace"] = build_agent_trace(False, [], state["reply"], qa_id, mcp_context)
+    elif state.get("needs_clarification"):
+        state["agent_trace"] = [
+            {"agent": "EMS Guard", "status": "passed", "detail": "Question is EMS/Daxview related."},
+            {"agent": "Question Completeness Filter", "status": "needs_clarification", "detail": "Daxview data request is missing site, building, meter, device, or explicit all-scope target."},
+            {"agent": "Daxview MCP", "status": "skipped", "detail": "MCP was not called because the question needs clarification first."},
+            {"agent": "DB Logger", "status": "completed", "detail": f"Saved QA log {qa_id}."},
+            {"agent": "Final Response", "status": "completed", "detail": preview(state["reply"], 120)},
+        ]
+    elif state.get("provider") == "daxview-mcp-direct":
+        mcp_status, mcp_detail = daxview_trace_status(mcp_context)
+        state["agent_trace"] = [
+            {"agent": "EMS Guard", "status": "passed", "detail": "Question is EMS/Daxview related."},
+            {"agent": "Knowledge Retriever", "status": "completed", "detail": f"Found {len(state.get('contexts') or [])} matching EMS library source(s)."},
+            {"agent": "Daxview MCP", "status": mcp_status, "detail": mcp_detail},
+            {"agent": "MCP Direct Extractor", "status": "completed", "detail": "Answered directly from structured MCP device data."},
+            {"agent": "DB Logger", "status": "completed", "detail": f"Saved QA log {qa_id}."},
+            {"agent": "Final Response", "status": "completed", "detail": preview(state["reply"], 120)},
+        ]
+    else:
+        state["agent_trace"] = build_agent_trace(
+            True,
+            state.get("contexts") or [],
+            state["reply"],
+            qa_id,
+            mcp_context,
+        )
+        if state.get("mode") == "multi-agent":
+            mcp_status, mcp_detail = daxview_trace_status(mcp_context)
+            state["agent_trace"] = [
+                {"agent": "EMS Guard", "status": "passed", "detail": "Question is EMS/power related."},
+                {"agent": "Knowledge Retriever", "status": "completed", "detail": f"Found {len(state.get('contexts') or [])} EMS source(s)."},
+                {"agent": "Daxview MCP", "status": mcp_status, "detail": mcp_detail},
+                {"agent": "Agent 1 - Ollama EMS Triage", "status": "completed", "detail": f"Answered with {OLLAMA_MODEL}."},
+                {"agent": "Agent 2 - Qwen Power Quality", "status": "completed", "detail": f"Answered with {OLLAMA_MODEL}."},
+                {"agent": "DeepSeek Final Decision Maker", "status": "completed", "detail": f"Combined both answers with {DEEPSEEK_MODEL}."},
+                {"agent": "DB Logger", "status": "completed", "detail": f"Saved QA log {qa_id}."},
+            ]
+    return state
+
+
+CHAT_LANGCHAIN = (
+    RunnableLambda(langchain_start_state)
+    | RunnableLambda(langchain_classify_and_validate)
+    | RunnableLambda(langchain_retrieve_context)
+    | RunnableLambda(langchain_direct_mcp_answer)
+    | RunnableLambda(langchain_generate_chat_answer)
+    | RunnableLambda(langchain_persist_and_trace)
+)
+
+MULTI_AGENT_LANGCHAIN = (
+    RunnableLambda(langchain_start_state)
+    | RunnableLambda(langchain_classify_and_validate)
+    | RunnableLambda(langchain_retrieve_context)
+    | RunnableLambda(langchain_direct_mcp_answer)
+    | RunnableLambda(langchain_generate_multi_agent_answer)
+    | RunnableLambda(langchain_persist_and_trace)
+)
+
+
+def langchain_chat_response(message: str, request_id: str, session_id: str | None) -> dict:
+    state = CHAT_LANGCHAIN.invoke(
+        {
+            "message": message,
+            "request_id": request_id,
+            "session_id": session_id,
+            "mode": "chat",
+            "started_at": time.perf_counter(),
+        }
+    )
+    return {
+        "reply": state["reply"],
+        "provider": state.get("provider"),
+        "model": state.get("model"),
+        "is_ems_related": state.get("is_ems_related"),
+        "sources": state.get("sources") or [],
+        "agent_trace": state.get("agent_trace") or [],
+        "daxview_mcp": state.get("mcp_context"),
+        "mcp_summary": format_daxview_context(state.get("mcp_context") or {}),
+        "qa_log_id": state.get("qa_log_id"),
+    }
+
+
+def langchain_multi_agent_response(message: str, request_id: str) -> dict:
+    started_at = time.perf_counter()
+    state = MULTI_AGENT_LANGCHAIN.invoke(
+        {
+            "message": message,
+            "request_id": request_id,
+            "session_id": None,
+            "mode": "multi-agent",
+            "started_at": started_at,
+        }
+    )
+    duration_ms = round((time.perf_counter() - started_at) * 1000)
+    return {
+        "reply": state["reply"],
+        "provider": state.get("provider"),
+        "model": state.get("model"),
+        "decision_model": state.get("decision_model") or state.get("model"),
+        "is_ems_related": state.get("is_ems_related"),
+        "sources": state.get("sources") or [],
+        "agent_discussion": state.get("agent_answers") or [],
+        "agent_trace": state.get("agent_trace") or [],
+        "daxview_mcp": state.get("mcp_context"),
+        "mcp_summary": format_daxview_context(state.get("mcp_context") or {}),
+        "qa_log_id": state.get("qa_log_id"),
+        "duration_ms": duration_ms,
+        "processing_time_seconds": duration_ms / 1000,
+    }
+
+
 def run_multi_agent_poc(message: str, request_id: str) -> dict:
+    return langchain_multi_agent_response(message, request_id)
+
+
+def run_legacy_multi_agent_poc(message: str, request_id: str) -> dict:
     started_at = time.perf_counter()
     related = is_ems_related(message)
     if not related:
@@ -1266,62 +1528,8 @@ class ChatHandler(BaseHTTPRequestHandler):
 
         request_id = str(uuid.uuid4())
         started_at = time.perf_counter()
-        related = is_ems_related(message)
-        contexts = []
-        mcp_context = {"enabled": DAXVIEW_MCP_ENABLED, "tools": [], "results": [], "errors": []}
-        answer_provider = "ems-guard"
-        answer_model = None
         try:
-            if related:
-                selected_tools = select_daxview_tools(message)
-                if daxview_clarification_needed(message, selected_tools):
-                    reply = build_daxview_clarification(message, selected_tools)
-                    mcp_context = {"enabled": DAXVIEW_MCP_ENABLED, "tools": selected_tools, "results": [], "errors": []}
-                    answer_provider = "daxview-question-filter"
-                else:
-                    contexts = retrieve_context(message)
-                    mcp_context = retrieve_daxview_context(message, request_id)
-                    direct_answer = answer_from_mcp_if_direct_count_question(message, mcp_context)
-                    if direct_answer:
-                        reply = direct_answer
-                        answer_provider = "daxview-mcp-direct"
-                        answer_model = None
-                    else:
-                        reply = ask_ollama(message, contexts, request_id, mcp_context)
-                        answer_provider = "ollama"
-                        answer_model = CHAT_MODEL
-            else:
-                reply = REFUSAL
-            sources = [
-                {
-                    "title": row.get("title"),
-                    "standard_name": row.get("standard_name"),
-                    "score": float(row.get("score") or 0),
-                    "section_reference": row.get("section_reference"),
-                }
-                for row in contexts
-            ]
-            qa_id = store_chat(message, reply, related, sources, session_id)
-            if related and daxview_clarification_needed(message, mcp_context.get("tools") or []):
-                agent_trace = [
-                    {"agent": "EMS Guard", "status": "passed", "detail": "Question is EMS/Daxview related."},
-                    {"agent": "Question Completeness Filter", "status": "needs_clarification", "detail": "Daxview data request is missing site, building, meter, device, or explicit all-scope target."},
-                    {"agent": "Daxview MCP", "status": "skipped", "detail": "MCP was not called because the question needs clarification first."},
-                    {"agent": "DB Logger", "status": "completed", "detail": f"Saved QA log {qa_id}."},
-                    {"agent": "Final Response", "status": "completed", "detail": preview(reply, 120)},
-                ]
-            elif answer_provider == "daxview-mcp-direct":
-                mcp_status, mcp_detail = daxview_trace_status(mcp_context)
-                agent_trace = [
-                    {"agent": "EMS Guard", "status": "passed", "detail": "Question is EMS/Daxview related."},
-                    {"agent": "Knowledge Retriever", "status": "completed", "detail": f"Found {len(contexts)} matching EMS library source(s)."},
-                    {"agent": "Daxview MCP", "status": mcp_status, "detail": mcp_detail},
-                    {"agent": "MCP Direct Extractor", "status": "completed", "detail": "Answered directly from structured MCP device data."},
-                    {"agent": "DB Logger", "status": "completed", "detail": f"Saved QA log {qa_id}."},
-                    {"agent": "Final Response", "status": "completed", "detail": preview(reply, 120)},
-                ]
-            else:
-                agent_trace = build_agent_trace(related, contexts, reply, qa_id, mcp_context)
+            response_payload = langchain_chat_response(message, request_id, session_id)
         except RuntimeError as error:
             log_event("api_to_ui_error", request_id=request_id, error=str(error))
             self._send_json(503, {"error": str(error), "provider": "ollama"})
@@ -1330,27 +1538,14 @@ class ChatHandler(BaseHTTPRequestHandler):
         trace = {
             "request_id": request_id,
             "status": "ok",
-            "is_ems_related": related,
-            "sources": sources,
-            "daxview_mcp": mcp_context,
-            "mcp_summary": format_daxview_context(mcp_context),
+            "is_ems_related": response_payload.get("is_ems_related"),
+            "sources": response_payload.get("sources") or [],
+            "daxview_mcp": response_payload.get("daxview_mcp"),
+            "mcp_summary": response_payload.get("mcp_summary"),
             "duration_ms": round((time.perf_counter() - started_at) * 1000),
         }
         TRACES.appendleft(trace)
-        self._send_json(
-            200,
-            {
-                "reply": reply,
-                "provider": answer_provider,
-                "model": answer_model,
-                "is_ems_related": related,
-                "sources": sources,
-                "agent_trace": agent_trace,
-                "daxview_mcp": mcp_context,
-                "mcp_summary": format_daxview_context(mcp_context),
-                "qa_log_id": qa_id,
-            },
-        )
+        self._send_json(200, response_payload)
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"{self.address_string()} - {format % args}")
