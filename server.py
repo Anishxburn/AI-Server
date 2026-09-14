@@ -396,18 +396,17 @@ def parse_mcp_response(raw: str) -> dict:
     raw = raw.strip()
     if not raw:
         return {}
-    if raw.startswith("data:"):
-        chunks = []
-        for line in raw.splitlines():
-            if line.startswith("data:"):
-                payload = line.removeprefix("data:").strip()
-                if payload and payload != "[DONE]":
-                    chunks.append(payload)
-        for payload in reversed(chunks):
-            try:
-                return json.loads(payload)
-            except json.JSONDecodeError:
-                continue
+    chunks = []
+    for line in raw.splitlines():
+        if line.startswith("data:"):
+            payload = line.removeprefix("data:").strip()
+            if payload and payload != "[DONE]":
+                chunks.append(payload)
+    for payload in reversed(chunks):
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            continue
     return json.loads(raw)
 
 
