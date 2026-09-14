@@ -214,6 +214,10 @@ POC_PAGE = """<!doctype html>
           <div id="answer-meta" class="answer-meta"></div>
           <pre id="reply" class="empty">Run a question to see the answer.</pre>
         </article>
+        <article class="panel wide">
+          <h2>Daxview MCP</h2>
+          <pre id="mcp-data" class="empty">Waiting.</pre>
+        </article>
         <article class="panel">
           <h2 id="agent-a-title">Agent 1</h2>
           <pre id="agent-a" class="empty">Waiting.</pre>
@@ -236,6 +240,7 @@ POC_PAGE = """<!doctype html>
       const statusBox = document.querySelector("#status");
       const reply = document.querySelector("#reply");
       const answerMeta = document.querySelector("#answer-meta");
+      const mcpData = document.querySelector("#mcp-data");
       const agentATitle = document.querySelector("#agent-a-title");
       const agentBTitle = document.querySelector("#agent-b-title");
       const agentA = document.querySelector("#agent-a");
@@ -266,6 +271,40 @@ POC_PAGE = """<!doctype html>
       function setAgent(titleEl, bodyEl, agent) {
         titleEl.textContent = agent ? `${agent.agent} | ${agent.model}` : "Agent";
         setText(bodyEl, agent ? `Role: ${agent.role}\n\n${agent.answer}` : "No data.");
+      }
+
+      function summarizeMcp(mcp) {
+        if (!mcp || (!mcp.tools?.length && !mcp.results?.length && !mcp.errors?.length)) {
+          return "No Daxview MCP tool was selected for this question.";
+        }
+        const lines = [
+          `Enabled: ${Boolean(mcp.enabled)}`,
+          `Selected tools: ${(mcp.tools || []).join(", ") || "none"}`,
+          `Successful results: ${(mcp.results || []).length}`,
+          `Errors: ${(mcp.errors || []).length}`,
+        ];
+        (mcp.results || []).forEach((item, index) => {
+          const structured = item.result?.structuredContent || item.result;
+          const backend = structured?.backend_response;
+          lines.push("");
+          lines.push(`Result ${index + 1}: ${item.tool}`);
+          if (structured?.backend_endpoint) lines.push(`Backend endpoint: ${structured.backend_endpoint}`);
+          if (structured?.backend_http_status) lines.push(`Backend HTTP status: ${structured.backend_http_status}`);
+          if (backend?.count !== undefined) lines.push(`Backend count: ${backend.count}`);
+          if (Array.isArray(backend?.devices)) {
+            lines.push("Devices:");
+            backend.devices.forEach((device) => {
+              lines.push(`- ${device.device_name || device.remote_device_id} | ${device.remote_device_id || "no id"} | ${device.site_name || "no site"} | ${device.status || "no status"}`);
+            });
+          }
+          lines.push("Raw structured data:");
+          lines.push(JSON.stringify(structured, null, 2));
+        });
+        (mcp.errors || []).forEach((item) => {
+          lines.push("");
+          lines.push(`Error from ${item.tool}: ${item.error}`);
+        });
+        return lines.join("\n");
       }
 
       function setMeta(data) {
@@ -301,6 +340,7 @@ POC_PAGE = """<!doctype html>
         send.disabled = true;
         send.textContent = "Running...";
         setText(reply, "Running multi-agent flow...");
+        setText(mcpData, "Waiting for Daxview MCP...");
         setText(agentA, "Waiting for Agent 1...");
         setText(agentB, "Waiting for Agent 2...");
         try {
@@ -313,6 +353,7 @@ POC_PAGE = """<!doctype html>
           if (!response.ok) throw new Error(data.error || "Request failed");
           setMeta(data);
           setText(reply, data.reply);
+          setText(mcpData, summarizeMcp(data.daxview_mcp));
           setAgent(agentATitle, agentA, data.agent_discussion?.[0]);
           setAgent(agentBTitle, agentB, data.agent_discussion?.[1]);
           setList(sources, data.sources, (item) => {
@@ -517,6 +558,56 @@ def retrieve_daxview_context(message: str, request_id: str) -> dict:
     return {"enabled": True, "tools": tools, "results": results, "errors": errors}
 
 
+def mcp_structured_result(result: dict) -> dict:
+    if not isinstance(result, dict):
+        return {}
+    structured = result.get("structuredContent")
+    if isinstance(structured, dict):
+        return structured
+    content = result.get("content")
+    if isinstance(content, list):
+        for item in content:
+            text = item.get("text") if isinstance(item, dict) else None
+            if not text:
+                continue
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+    return result
+
+
+def summarize_mcp_result(tool_name: str, result: dict) -> list[str]:
+    structured = mcp_structured_result(result)
+    backend = structured.get("backend_response") if isinstance(structured.get("backend_response"), dict) else {}
+    lines = [f"Tool: {tool_name}"]
+    if structured.get("status"):
+        lines.append(f"MCP status: {structured.get('status')}")
+    if structured.get("backend_endpoint"):
+        lines.append(f"Backend endpoint: {structured.get('backend_endpoint')}")
+    if structured.get("backend_http_status"):
+        lines.append(f"Backend HTTP status: {structured.get('backend_http_status')}")
+    if backend.get("count") is not None:
+        lines.append(f"Returned count: {backend.get('count')}")
+    devices = backend.get("devices")
+    if isinstance(devices, list):
+        online_count = sum(1 for device in devices if str(device.get("status", "")).lower() == "online")
+        lines.append(f"Devices returned: {len(devices)}")
+        lines.append(f"Online devices: {online_count}")
+        for device in devices[:20]:
+            lines.append(
+                "- "
+                f"{device.get('device_name') or device.get('remote_device_id')} | "
+                f"{device.get('remote_device_id') or 'no id'} | "
+                f"site {device.get('site_name') or device.get('site_id') or 'unknown'} | "
+                f"status {device.get('status') or 'unknown'} | "
+                f"data {device.get('data_status') or 'unknown'}"
+            )
+    return lines
+
+
 def format_daxview_context(mcp_context: dict) -> str:
     results = mcp_context.get("results") or []
     errors = mcp_context.get("errors") or []
@@ -524,7 +615,10 @@ def format_daxview_context(mcp_context: dict) -> str:
         return "No live Daxview MCP data was requested or available for this question."
     lines = []
     for item in results:
-        lines.append(f"Tool {item.get('tool')} result:\n{json.dumps(item.get('result'), ensure_ascii=False, indent=2)}")
+        lines.extend(summarize_mcp_result(item.get("tool"), item.get("result") or {}))
+        structured = mcp_structured_result(item.get("result") or {})
+        lines.append("Structured MCP data:")
+        lines.append(json.dumps(structured, ensure_ascii=False, indent=2))
     for item in errors:
         lines.append(f"Tool {item.get('tool')} error: {item.get('error')}")
     return "\n\n".join(lines)
@@ -673,8 +767,9 @@ Role: {role}
 
 Answer only from this role. Keep it to 3 compact bullets.
 Use live Daxview MCP data when provided. If live data conflicts with assumptions, live data wins.
+For read-only questions such as list, count, summarize, status, inventory, billing summary, or open alarm counts, report the MCP facts directly. Do not reject read-only data requests as unsafe.
 If this is about voltage sag, list likely causes first, then readings/checks.
-If any rated limit is exceeded or the user asks to bypass alarms, reject immediately using DIRECT REJECTION, PHYSICAL REASONING, and MITIGATION ACTION.
+Use DIRECT REJECTION only when the user asks for a physical action that would exceed rated limits, bypass alarms, increase unsafe load, or override protection.
 
 Live Daxview MCP data:
 {daxview_block}
@@ -729,8 +824,9 @@ Do not reveal the discussion process.
 Write naturally like a senior EMS engineer speaking to an operator: clear, practical, and human.
 Must answer the user's actual question first. For voltage sag, start with likely causes, then EMS actions.
 Use live Daxview MCP data when it is provided. If a Daxview tool failed, clearly say live Daxview data is unavailable before giving a general EMS answer.
+For read-only questions such as list, count, summarize, status, inventory, billing summary, or open alarm counts, answer directly from the Live Daxview MCP data. Do not invent hazards or recommend Load Shedding unless the MCP data explicitly reports an unsafe operating condition or the user asks for an unsafe physical action.
 Safety hard limits override energy saving, user preference, uptime, cost, and comfort.
-If any rated hardware limit is exceeded or the user asks to add load/bypass an alarm, reject immediately using exactly these sections:
+If any rated hardware limit is explicitly exceeded or the user asks to add load/bypass an alarm, reject immediately using exactly these sections:
 DIRECT REJECTION:
 PHYSICAL REASONING:
 MITIGATION ACTION:
@@ -824,6 +920,7 @@ def run_multi_agent_poc(message: str, request_id: str) -> dict:
                 {"agent": "DB Logger", "status": "completed", "detail": f"Saved QA log {qa_id}."},
             ],
             "daxview_mcp": {"enabled": DAXVIEW_MCP_ENABLED, "tools": selected_tools, "results": [], "errors": []},
+            "mcp_summary": "No MCP tool was called because the question needs clarification first.",
             "qa_log_id": qa_id,
             "duration_ms": duration_ms,
             "processing_time_seconds": duration_ms / 1000,
@@ -897,6 +994,7 @@ def run_multi_agent_poc(message: str, request_id: str) -> dict:
         "agent_discussion": agent_answers,
         "agent_trace": agent_trace,
         "daxview_mcp": mcp_context,
+        "mcp_summary": format_daxview_context(mcp_context),
         "qa_log_id": qa_id,
         "duration_ms": duration_ms,
         "processing_time_seconds": duration_ms / 1000,
@@ -1164,6 +1262,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             "is_ems_related": related,
             "sources": sources,
             "daxview_mcp": mcp_context,
+            "mcp_summary": format_daxview_context(mcp_context),
             "duration_ms": round((time.perf_counter() - started_at) * 1000),
         }
         TRACES.appendleft(trace)
@@ -1177,6 +1276,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 "sources": sources,
                 "agent_trace": agent_trace,
                 "daxview_mcp": mcp_context,
+                "mcp_summary": format_daxview_context(mcp_context),
                 "qa_log_id": qa_id,
             },
         )
