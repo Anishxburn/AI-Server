@@ -65,17 +65,19 @@ DAXVIEW_TOOL_KEYWORDS = {
         "backend status", "is daxview healthy", "daxview ok",
     },
     "get_daxview_inventory": {
-        "inventory", "devices", "device list", "meters", "meter list",
-        "equipment list", "assets",
-    },
-    "get_daxview_site_summary": {
-        "site summary", "site status", "site overview", "sites", "building summary",
-        "facility summary",
+        "inventory", "equipment list", "assets",
     },
     "get_daxview_device_summary": {
         "device summary", "meter summary", "device status", "meter status",
         "janitza status", "umg status", "max demand", "maximum demand",
-        "demand reading", "meter demand", "main switch board",
+        "demand reading", "meter demand", "main switch board", "devices",
+        "device list", "meters", "meter list", "online devices",
+        "devices online", "how many daxview devices", "how many devices",
+        "device count", "online count",
+    },
+    "get_daxview_site_summary": {
+        "site summary", "site status", "site overview", "sites", "building summary",
+        "facility summary",
     },
     "get_daxview_open_alarms": {
         "open alarm", "open alarms", "active alarm", "active alarms", "current alarm",
@@ -608,6 +610,26 @@ def summarize_mcp_result(tool_name: str, result: dict) -> list[str]:
     return lines
 
 
+def answer_from_mcp_if_direct_count_question(message: str, mcp_context: dict) -> str | None:
+    lowered = message.lower()
+    if not any(phrase in lowered for phrase in ("how many", "count", "online devices", "devices online")):
+        return None
+    for item in mcp_context.get("results") or []:
+        if item.get("tool") != "get_daxview_device_summary":
+            continue
+        structured = mcp_structured_result(item.get("result") or {})
+        backend = structured.get("backend_response") if isinstance(structured.get("backend_response"), dict) else {}
+        devices = backend.get("devices")
+        if not isinstance(devices, list):
+            continue
+        online = [
+            device for device in devices
+            if str(device.get("status", "")).lower() == "online"
+        ]
+        return f"{len(online)} Daxview devices are online out of {len(devices)} returned devices."
+    return None
+
+
 def format_daxview_context(mcp_context: dict) -> str:
     results = mcp_context.get("results") or []
     errors = mcp_context.get("errors") or []
@@ -937,6 +959,39 @@ def run_multi_agent_poc(message: str, request_id: str) -> dict:
         }
         for row in contexts
     ]
+    direct_answer = answer_from_mcp_if_direct_count_question(message, mcp_context)
+    if direct_answer:
+        qa_id = store_chat(message, direct_answer, True, sources, None)
+        duration_ms = round((time.perf_counter() - started_at) * 1000)
+        mcp_status, mcp_detail = daxview_trace_status(mcp_context)
+        return {
+            "reply": direct_answer,
+            "provider": "daxview-mcp-direct",
+            "model": None,
+            "decision_model": "Daxview MCP direct extractor",
+            "is_ems_related": True,
+            "sources": sources,
+            "agent_discussion": [
+                {
+                    "agent": "Daxview MCP Direct Extractor",
+                    "role": "Read structured MCP data and answer deterministic count/status questions.",
+                    "model": "deterministic",
+                    "answer": direct_answer,
+                }
+            ],
+            "agent_trace": [
+                {"agent": "EMS Guard", "status": "passed", "detail": "Question is EMS/Daxview related."},
+                {"agent": "Knowledge Retriever", "status": "completed", "detail": f"Found {len(contexts)} EMS source(s)."},
+                {"agent": "Daxview MCP", "status": mcp_status, "detail": mcp_detail},
+                {"agent": "MCP Direct Extractor", "status": "completed", "detail": "Answered directly from structured MCP device data."},
+                {"agent": "DB Logger", "status": "completed", "detail": f"Saved QA log {qa_id}."},
+            ],
+            "daxview_mcp": mcp_context,
+            "mcp_summary": format_daxview_context(mcp_context),
+            "qa_log_id": qa_id,
+            "duration_ms": duration_ms,
+            "processing_time_seconds": duration_ms / 1000,
+        }
     agent_answers = [
         {
             "agent": "Agent 1 - Ollama EMS Triage",
@@ -1226,9 +1281,15 @@ class ChatHandler(BaseHTTPRequestHandler):
                 else:
                     contexts = retrieve_context(message)
                     mcp_context = retrieve_daxview_context(message, request_id)
-                    reply = ask_ollama(message, contexts, request_id, mcp_context)
-                    answer_provider = "ollama"
-                    answer_model = CHAT_MODEL
+                    direct_answer = answer_from_mcp_if_direct_count_question(message, mcp_context)
+                    if direct_answer:
+                        reply = direct_answer
+                        answer_provider = "daxview-mcp-direct"
+                        answer_model = None
+                    else:
+                        reply = ask_ollama(message, contexts, request_id, mcp_context)
+                        answer_provider = "ollama"
+                        answer_model = CHAT_MODEL
             else:
                 reply = REFUSAL
             sources = [
@@ -1246,6 +1307,16 @@ class ChatHandler(BaseHTTPRequestHandler):
                     {"agent": "EMS Guard", "status": "passed", "detail": "Question is EMS/Daxview related."},
                     {"agent": "Question Completeness Filter", "status": "needs_clarification", "detail": "Daxview data request is missing site, building, meter, device, or explicit all-scope target."},
                     {"agent": "Daxview MCP", "status": "skipped", "detail": "MCP was not called because the question needs clarification first."},
+                    {"agent": "DB Logger", "status": "completed", "detail": f"Saved QA log {qa_id}."},
+                    {"agent": "Final Response", "status": "completed", "detail": preview(reply, 120)},
+                ]
+            elif answer_provider == "daxview-mcp-direct":
+                mcp_status, mcp_detail = daxview_trace_status(mcp_context)
+                agent_trace = [
+                    {"agent": "EMS Guard", "status": "passed", "detail": "Question is EMS/Daxview related."},
+                    {"agent": "Knowledge Retriever", "status": "completed", "detail": f"Found {len(contexts)} matching EMS library source(s)."},
+                    {"agent": "Daxview MCP", "status": mcp_status, "detail": mcp_detail},
+                    {"agent": "MCP Direct Extractor", "status": "completed", "detail": "Answered directly from structured MCP device data."},
                     {"agent": "DB Logger", "status": "completed", "detail": f"Saved QA log {qa_id}."},
                     {"agent": "Final Response", "status": "completed", "detail": preview(reply, 120)},
                 ]
