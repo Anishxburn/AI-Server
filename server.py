@@ -343,11 +343,15 @@ POC_PAGE = """<!doctype html>
       }
 
       async function checkHealth() {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
         try {
-          const response = await fetch("/health");
+          const response = await fetch("/health", { signal: controller.signal });
+          clearTimeout(timeout);
           const data = await response.json();
           statusBox.textContent = data.database === "ok" ? "API + DB online" : "API online";
         } catch {
+          clearTimeout(timeout);
           statusBox.textContent = "Offline";
         }
       }
