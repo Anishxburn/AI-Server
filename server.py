@@ -26,6 +26,9 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 RAG_MATCH_LIMIT = int(os.getenv("RAG_MATCH_LIMIT", "5"))
 RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.2"))
 TRACE_LIMIT = int(os.getenv("CHATBOT_TRACE_LIMIT", "25"))
+DAXVIEW_MCP_ENABLED = os.getenv("DAXVIEW_MCP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+DAXVIEW_MCP_URL = os.getenv("DAXVIEW_MCP_URL", "").strip()
+DAXVIEW_MCP_TIMEOUT = int(os.getenv("DAXVIEW_MCP_TIMEOUT", "20"))
 TRACES = deque(maxlen=TRACE_LIMIT)
 ALLOWED_ORIGINS = {
     origin.strip()
@@ -47,6 +50,37 @@ EMS_KEYWORDS = {
     "swell", "transient", "flicker", "unbalance", "imbalance", "phase loss",
     "overvoltage", "undervoltage", "current", "frequency", "thd", "power quality",
     "event", "alarm", "fault", "disturbance", "waveform", "rms", "l-n", "l-l",
+    "daxview", "site summary", "device summary", "inventory", "open alarms",
+}
+
+DAXVIEW_TOOL_KEYWORDS = {
+    "health_check": {
+        "mcp health", "mcp status", "mcp server", "mcp ok",
+    },
+    "get_daxview_api_status": {
+        "daxview health", "daxview status", "api status", "api health",
+        "backend status", "is daxview healthy", "daxview ok",
+    },
+    "get_daxview_inventory": {
+        "inventory", "devices", "device list", "meters", "meter list",
+        "equipment list", "assets",
+    },
+    "get_daxview_site_summary": {
+        "site summary", "site status", "site overview", "sites", "building summary",
+        "facility summary",
+    },
+    "get_daxview_device_summary": {
+        "device summary", "meter summary", "device status", "meter status",
+        "janitza status", "umg status",
+    },
+    "get_daxview_open_alarms": {
+        "open alarm", "open alarms", "active alarm", "active alarms", "current alarm",
+        "current alarms", "alarm status", "faults", "events",
+    },
+    "get_daxview_billing": {
+        "billing", "bill", "current month", "this month cost", "monthly cost",
+        "invoice summary", "energy cost", "tariff cost",
+    },
 }
 
 REFUSAL = (
@@ -58,11 +92,13 @@ REFUSAL = (
 
 SAFETY_DOCTRINE = """YOU ARE THE CHIEF ENERGY MANAGER AI FOR AN EMS SYSTEM.
 
-LANGUAGE RULE STRICT:
-Detect the user's language and always respond in the exact same language as the user's prompt.
-If the user asks in English, respond only in English.
-If the user asks in Malay, respond only in Malay.
-Do not mix languages.
+LANGUAGE CONTROL RULE STRICT:
+1. Detect the primary language used in the user's prompt, including English, Malay, Manglish, or Technical Malay.
+2. Always respond in the exact same primary language as the user's prompt.
+3. If the user uses Manglish or Technical Malay, respond in the same Manglish or Technical Malay style.
+4. Keep technical and engineering terms intact, including Busbar, Feeder Cable, Load Shedding, Power Factor, Rated Capacity, EMS, Daxview, Janitza, UMG, ISO 50001, IEC, IEEE, kW, kWh, THD, voltage sag, and alarm identifiers.
+5. Do not translate equipment names, model names, standards, units, API names, or alarm identifiers.
+6. Do not mix languages unless the user's prompt mixes languages or explicitly asks for translation.
 
 PRIMARY MISSION:
 Ensure energy efficiency without compromising physical safety and hardware limits.
@@ -297,6 +333,122 @@ def ollama_json(path: str, payload: dict, timeout: int = 300) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def parse_mcp_response(raw: str) -> dict:
+    """Accept normal JSON or simple SSE-style MCP responses."""
+    raw = raw.strip()
+    if not raw:
+        return {}
+    if raw.startswith("data:"):
+        chunks = []
+        for line in raw.splitlines():
+            if line.startswith("data:"):
+                payload = line.removeprefix("data:").strip()
+                if payload and payload != "[DONE]":
+                    chunks.append(payload)
+        for payload in reversed(chunks):
+            try:
+                return json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+    return json.loads(raw)
+
+
+def mcp_json_rpc(method: str, params: dict | None = None, request_id: str | int | None = None) -> dict:
+    if not DAXVIEW_MCP_URL:
+        raise RuntimeError("DAXVIEW_MCP_URL is not configured")
+    payload = {
+        "jsonrpc": "2.0",
+        "id": request_id or str(uuid.uuid4()),
+        "method": method,
+    }
+    if params is not None:
+        payload["params"] = params
+    request = Request(
+        DAXVIEW_MCP_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=DAXVIEW_MCP_TIMEOUT) as response:
+        return parse_mcp_response(response.read().decode("utf-8"))
+
+
+def call_daxview_mcp_tool(tool_name: str, arguments: dict | None, request_id: str) -> dict:
+    started_at = time.perf_counter()
+    log_event("mcp_tool_request", request_id=request_id, tool=tool_name, url=DAXVIEW_MCP_URL)
+    response = mcp_json_rpc(
+        "tools/call",
+        {"name": tool_name, "arguments": arguments or {}},
+        request_id=f"{request_id}:{tool_name}",
+    )
+    if response.get("error"):
+        raise RuntimeError(response["error"])
+    result = response.get("result", response)
+    log_event(
+        "mcp_tool_response",
+        request_id=request_id,
+        tool=tool_name,
+        duration_ms=round((time.perf_counter() - started_at) * 1000),
+    )
+    return result
+
+
+def select_daxview_tools(message: str) -> list[str]:
+    lowered = message.lower()
+    selected = []
+    for tool_name, phrases in DAXVIEW_TOOL_KEYWORDS.items():
+        if any(phrase in lowered for phrase in phrases):
+            selected.append(tool_name)
+    if "daxview" in lowered and not selected:
+        selected.append("get_daxview_api_status")
+    return selected[:3]
+
+
+def retrieve_daxview_context(message: str, request_id: str) -> dict:
+    tools = select_daxview_tools(message)
+    if not DAXVIEW_MCP_ENABLED or not DAXVIEW_MCP_URL or not tools:
+        return {"enabled": DAXVIEW_MCP_ENABLED, "tools": [], "results": [], "errors": []}
+
+    results = []
+    errors = []
+    for tool_name in tools:
+        try:
+            results.append({"tool": tool_name, "result": call_daxview_mcp_tool(tool_name, {}, request_id)})
+        except Exception as error:
+            errors.append({"tool": tool_name, "error": str(error)})
+            log_event("mcp_tool_error", request_id=request_id, tool=tool_name, error=str(error))
+    return {"enabled": True, "tools": tools, "results": results, "errors": errors}
+
+
+def format_daxview_context(mcp_context: dict) -> str:
+    results = mcp_context.get("results") or []
+    errors = mcp_context.get("errors") or []
+    if not results and not errors:
+        return "No live Daxview MCP data was requested or available for this question."
+    lines = []
+    for item in results:
+        lines.append(f"Tool {item.get('tool')} result:\n{json.dumps(item.get('result'), ensure_ascii=False, indent=2)}")
+    for item in errors:
+        lines.append(f"Tool {item.get('tool')} error: {item.get('error')}")
+    return "\n\n".join(lines)
+
+
+def daxview_trace_status(mcp_context: dict) -> tuple[str, str]:
+    tools = mcp_context.get("tools") or []
+    results = mcp_context.get("results") or []
+    errors = mcp_context.get("errors") or []
+    if not tools:
+        return "skipped", "No live Daxview tool was needed for this question."
+    if results and errors:
+        return "partial", f"Called {len(results)} Daxview tool(s); {len(errors)} tool(s) failed."
+    if results:
+        return "completed", f"Called {len(results)} Daxview tool(s)."
+    return "failed", f"Tried {len(tools)} Daxview tool(s); {len(errors)} failed."
+
+
 def embed_text(text: str) -> list[float]:
     data = ollama_json("/api/embeddings", {"model": EMBEDDING_MODEL, "prompt": text})
     embedding = data.get("embedding")
@@ -351,7 +503,7 @@ def retrieve_context(question: str) -> list[dict]:
             return list(cur.fetchall())
 
 
-def build_prompt(message: str, contexts: list[dict]) -> str:
+def build_prompt(message: str, contexts: list[dict], mcp_context: dict | None = None) -> str:
     context_block = "\n\n".join(
         f"Source {idx}: {row.get('title')} / {row.get('standard_name') or 'EMS library'}\n"
         f"{row.get('chunk_text')}"
@@ -359,14 +511,19 @@ def build_prompt(message: str, contexts: list[dict]) -> str:
     )
     if not context_block:
         context_block = "No matching EMS library context was found."
+    daxview_block = format_daxview_context(mcp_context or {})
 
     return f"""You are an Energy Management System specialist.
 Answer only EMS, energy management, ISO 50001, IEC, IEEE, power monitoring, metering, tariff, demand, and electrical energy questions.
 Keep the final answer simple and compact: maximum 5 short bullets or 1 short paragraph.
 Use the EMS library context when relevant. If the context is insufficient, say what is missing and give a cautious EMS-focused answer.
+Use live Daxview data when it is provided. If a Daxview tool failed, say live Daxview data is currently unavailable for that part.
 For Janitza UMG device, voltage sag, power quality, alarm, THD, or meter troubleshooting questions, prioritize likely root causes, what readings to check, and practical EMS investigation steps.
 If the user says "main cost" in a voltage sag or fault context, treat it as possibly meaning "main cause" and clarify both cause and cost impact briefly.
 Do not answer unrelated general questions.
+
+Live Daxview MCP data:
+{daxview_block}
 
 EMS library context:
 {context_block}
@@ -377,8 +534,8 @@ User question:
 Answer:"""
 
 
-def ask_ollama(message: str, contexts: list[dict], request_id: str) -> str:
-    prompt = build_prompt(message, contexts)
+def ask_ollama(message: str, contexts: list[dict], request_id: str, mcp_context: dict | None = None) -> str:
+    prompt = build_prompt(message, contexts, mcp_context)
     started_at = time.perf_counter()
     log_event("api_to_ollama_request", request_id=request_id, model=CHAT_MODEL, prompt_preview=preview(prompt))
     try:
@@ -401,19 +558,32 @@ def ask_ollama(message: str, contexts: list[dict], request_id: str) -> str:
     return reply
 
 
-def ask_role_agent(agent_name: str, role: str, model: str, message: str, contexts: list[dict], request_id: str) -> str:
+def ask_role_agent(
+    agent_name: str,
+    role: str,
+    model: str,
+    message: str,
+    contexts: list[dict],
+    request_id: str,
+    mcp_context: dict | None = None,
+) -> str:
     context_block = "\n\n".join(
         f"{row.get('title')} / {row.get('standard_name') or 'EMS library'}\n{row.get('chunk_text')}"
         for row in contexts[:3]
     ) or "No matching EMS library context was found."
+    daxview_block = format_daxview_context(mcp_context or {})
     prompt = f"""You are {agent_name}.
 Role: {role}
 {SAFETY_DOCTRINE}
 {MATH_DOCTRINE}
 
 Answer only from this role. Keep it to 3 compact bullets.
+Use live Daxview MCP data when provided. If live data conflicts with assumptions, live data wins.
 If this is about voltage sag, list likely causes first, then readings/checks.
 If any rated limit is exceeded or the user asks to bypass alarms, reject immediately using DIRECT REJECTION, PHYSICAL REASONING, and MITIGATION ACTION.
+
+Live Daxview MCP data:
+{daxview_block}
 
 EMS library context:
 {context_block}
@@ -448,7 +618,7 @@ Question:
     return reply
 
 
-def ask_synthesizer(message: str, agent_answers: list[dict], request_id: str) -> str:
+def ask_synthesizer(message: str, agent_answers: list[dict], request_id: str, mcp_context: dict | None = None) -> str:
     discussion = "\n\n".join(
         f"{item['agent']} ({item['role']}):\n{item['answer']}" for item in agent_answers
     )
@@ -464,6 +634,7 @@ Do not include separators like "---".
 Do not reveal the discussion process.
 Write naturally like a senior EMS engineer speaking to an operator: clear, practical, and human.
 Must answer the user's actual question first. For voltage sag, start with likely causes, then EMS actions.
+Use live Daxview MCP data when it is provided. If a Daxview tool failed, clearly say live Daxview data is unavailable before giving a general EMS answer.
 Safety hard limits override energy saving, user preference, uptime, cost, and comfort.
 If any rated hardware limit is exceeded or the user asks to add load/bypass an alarm, reject immediately using exactly these sections:
 DIRECT REJECTION:
@@ -473,6 +644,9 @@ Keep the final answer simple, compact, precise, and maximum 5 short bullets.
 
 Question:
 {message}
+
+Live Daxview MCP data:
+{format_daxview_context(mcp_context or {})}
 
 Specialist discussion:
 {discussion}
@@ -537,6 +711,7 @@ def run_multi_agent_poc(message: str, request_id: str) -> dict:
         }
 
     contexts = retrieve_context(message)
+    mcp_context = retrieve_daxview_context(message, request_id)
     sources = [
         {
             "title": row.get("title"),
@@ -558,6 +733,7 @@ def run_multi_agent_poc(message: str, request_id: str) -> dict:
                 message,
                 contexts,
                 request_id,
+                mcp_context,
             ),
         },
         {
@@ -571,15 +747,22 @@ def run_multi_agent_poc(message: str, request_id: str) -> dict:
                 message,
                 contexts,
                 request_id,
+                mcp_context,
             ),
         },
     ]
-    final_answer = ask_synthesizer(message, agent_answers, request_id)
+    final_answer = ask_synthesizer(message, agent_answers, request_id, mcp_context)
     qa_id = store_chat(message, final_answer, True, sources, None)
     duration_ms = round((time.perf_counter() - started_at) * 1000)
+    mcp_status, mcp_detail = daxview_trace_status(mcp_context)
     agent_trace = [
         {"agent": "EMS Guard", "status": "passed", "detail": "Question is EMS/power related."},
         {"agent": "Knowledge Retriever", "status": "completed", "detail": f"Found {len(contexts)} EMS source(s)."},
+        {
+            "agent": "Daxview MCP",
+            "status": mcp_status,
+            "detail": mcp_detail,
+        },
         {"agent": "Agent 1 - Ollama EMS Triage", "status": "completed", "detail": f"Answered with {OLLAMA_MODEL}."},
         {"agent": "Agent 2 - Qwen Power Quality", "status": "completed", "detail": f"Answered with {OLLAMA_MODEL}."},
         {"agent": "DeepSeek Final Decision Maker", "status": "completed", "detail": f"Combined both answers with {DEEPSEEK_MODEL}."},
@@ -594,13 +777,20 @@ def run_multi_agent_poc(message: str, request_id: str) -> dict:
         "sources": sources,
         "agent_discussion": agent_answers,
         "agent_trace": agent_trace,
+        "daxview_mcp": mcp_context,
         "qa_log_id": qa_id,
         "duration_ms": duration_ms,
         "processing_time_seconds": duration_ms / 1000,
     }
 
 
-def build_agent_trace(related: bool, contexts: list[dict], reply: str, qa_id: str | None = None) -> list[dict]:
+def build_agent_trace(
+    related: bool,
+    contexts: list[dict],
+    reply: str,
+    qa_id: str | None = None,
+    mcp_context: dict | None = None,
+) -> list[dict]:
     trace = [
         {
             "agent": "EMS Guard",
@@ -614,6 +804,15 @@ def build_agent_trace(related: bool, contexts: list[dict], reply: str, qa_id: st
                 "agent": "Knowledge Retriever",
                 "status": "completed",
                 "detail": f"Found {len(contexts)} matching EMS library source(s).",
+            }
+        )
+        mcp_context = mcp_context or {}
+        mcp_status, mcp_detail = daxview_trace_status(mcp_context)
+        trace.append(
+            {
+                "agent": "Daxview MCP",
+                "status": mcp_status,
+                "detail": mcp_detail,
             }
         )
         trace.append(
@@ -797,10 +996,12 @@ class ChatHandler(BaseHTTPRequestHandler):
         started_at = time.perf_counter()
         related = is_ems_related(message)
         contexts = []
+        mcp_context = {"enabled": DAXVIEW_MCP_ENABLED, "tools": [], "results": [], "errors": []}
         try:
             if related:
                 contexts = retrieve_context(message)
-                reply = ask_ollama(message, contexts, request_id)
+                mcp_context = retrieve_daxview_context(message, request_id)
+                reply = ask_ollama(message, contexts, request_id, mcp_context)
             else:
                 reply = REFUSAL
             sources = [
@@ -813,7 +1014,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 for row in contexts
             ]
             qa_id = store_chat(message, reply, related, sources, session_id)
-            agent_trace = build_agent_trace(related, contexts, reply, qa_id)
+            agent_trace = build_agent_trace(related, contexts, reply, qa_id, mcp_context)
         except RuntimeError as error:
             log_event("api_to_ui_error", request_id=request_id, error=str(error))
             self._send_json(503, {"error": str(error), "provider": "ollama"})
@@ -824,6 +1025,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             "status": "ok",
             "is_ems_related": related,
             "sources": sources,
+            "daxview_mcp": mcp_context,
             "duration_ms": round((time.perf_counter() - started_at) * 1000),
         }
         TRACES.appendleft(trace)
@@ -836,6 +1038,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                 "is_ems_related": related,
                 "sources": sources,
                 "agent_trace": agent_trace,
+                "daxview_mcp": mcp_context,
                 "qa_log_id": qa_id,
             },
         )
