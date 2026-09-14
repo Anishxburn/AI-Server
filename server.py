@@ -71,7 +71,8 @@ DAXVIEW_TOOL_KEYWORDS = {
     },
     "get_daxview_device_summary": {
         "device summary", "meter summary", "device status", "meter status",
-        "janitza status", "umg status",
+        "janitza status", "umg status", "max demand", "maximum demand",
+        "demand reading", "meter demand", "main switch board",
     },
     "get_daxview_open_alarms": {
         "open alarm", "open alarms", "active alarm", "active alarms", "current alarm",
@@ -82,6 +83,33 @@ DAXVIEW_TOOL_KEYWORDS = {
         "invoice summary", "energy cost", "tariff cost",
     },
 }
+
+DAXVIEW_SCOPE_REQUIRED_TOOLS = {
+    "get_daxview_site_summary",
+    "get_daxview_device_summary",
+    "get_daxview_open_alarms",
+    "get_daxview_billing",
+}
+
+DAXVIEW_GLOBAL_SCOPE_PHRASES = {
+    "all", "overall", "global", "entire", "every", "current", "today",
+    "now", "latest", "system wide", "system-wide", "whole site",
+    "all sites", "all meters", "all devices", "all buildings",
+}
+
+DAXVIEW_TARGET_SCOPE_PATTERNS = (
+    r"\bsite\s*[:#-]?\s*[\w.-]+",
+    r"\bbuilding\s*[:#-]?\s*[\w.-]+",
+    r"\bblock\s*[:#-]?\s*[\w.-]+",
+    r"\bfloor\s*[:#-]?\s*[\w.-]+",
+    r"\bmeter\s*[:#-]?\s*[\w.-]+",
+    r"\bdevice\s*[:#-]?\s*[\w.-]+",
+    r"\bfeeder\s*[:#-]?\s*[\w.-]+",
+    r"\bpanel\s*[:#-]?\s*[\w.-]+",
+    r"\bmsb\b",
+    r"\bmain switch board\b",
+    r"\bumg[\s-]?\d+\b",
+)
 
 REFUSAL = (
     "I can only assist with Energy Management System related questions, including "
@@ -320,6 +348,33 @@ def db() -> psycopg.Connection:
 def is_ems_related(message: str) -> bool:
     lowered = message.lower()
     return any(keyword in lowered for keyword in EMS_KEYWORDS)
+
+
+def has_daxview_scope(message: str) -> bool:
+    lowered = message.lower()
+    if any(phrase in lowered for phrase in DAXVIEW_GLOBAL_SCOPE_PHRASES):
+        return True
+    return any(re.search(pattern, lowered) for pattern in DAXVIEW_TARGET_SCOPE_PATTERNS)
+
+
+def daxview_clarification_needed(message: str, tools: list[str]) -> bool:
+    if not tools:
+        return False
+    if not any(tool in DAXVIEW_SCOPE_REQUIRED_TOOLS for tool in tools):
+        return False
+    return not has_daxview_scope(message)
+
+
+def build_daxview_clarification(message: str, tools: list[str]) -> str:
+    if "get_daxview_billing" in tools:
+        return "Which site, building, or meter should I check for the Daxview billing summary?"
+    if "get_daxview_open_alarms" in tools:
+        return "Which site, building, meter, or device should I check for Daxview open alarms? You can also say \"all sites\" for a system-wide check."
+    if "get_daxview_device_summary" in tools:
+        return "Which Daxview device, meter, or site should I summarize? You can also say \"all devices\" for a full device summary."
+    if "get_daxview_site_summary" in tools:
+        return "Which Daxview site or building should I summarize? You can also say \"all sites\" for an overall summary."
+    return "Which Daxview site, building, meter, or device should I check?"
 
 
 def ollama_json(path: str, payload: dict, timeout: int = 300) -> dict:
@@ -710,6 +765,31 @@ def run_multi_agent_poc(message: str, request_id: str) -> dict:
             "processing_time_seconds": duration_ms / 1000,
         }
 
+    selected_tools = select_daxview_tools(message)
+    if daxview_clarification_needed(message, selected_tools):
+        reply = build_daxview_clarification(message, selected_tools)
+        qa_id = store_chat(message, reply, True, [], None)
+        duration_ms = round((time.perf_counter() - started_at) * 1000)
+        return {
+            "reply": reply,
+            "provider": "daxview-question-filter",
+            "model": None,
+            "decision_model": None,
+            "is_ems_related": True,
+            "sources": [],
+            "agent_discussion": [],
+            "agent_trace": [
+                {"agent": "EMS Guard", "status": "passed", "detail": "Question is EMS/Daxview related."},
+                {"agent": "Question Completeness Filter", "status": "needs_clarification", "detail": "Daxview data request is missing site, building, meter, device, or explicit all-scope target."},
+                {"agent": "Daxview MCP", "status": "skipped", "detail": "MCP was not called because the question needs clarification first."},
+                {"agent": "DB Logger", "status": "completed", "detail": f"Saved QA log {qa_id}."},
+            ],
+            "daxview_mcp": {"enabled": DAXVIEW_MCP_ENABLED, "tools": selected_tools, "results": [], "errors": []},
+            "qa_log_id": qa_id,
+            "duration_ms": duration_ms,
+            "processing_time_seconds": duration_ms / 1000,
+        }
+
     contexts = retrieve_context(message)
     mcp_context = retrieve_daxview_context(message, request_id)
     sources = [
@@ -997,11 +1077,21 @@ class ChatHandler(BaseHTTPRequestHandler):
         related = is_ems_related(message)
         contexts = []
         mcp_context = {"enabled": DAXVIEW_MCP_ENABLED, "tools": [], "results": [], "errors": []}
+        answer_provider = "ems-guard"
+        answer_model = None
         try:
             if related:
-                contexts = retrieve_context(message)
-                mcp_context = retrieve_daxview_context(message, request_id)
-                reply = ask_ollama(message, contexts, request_id, mcp_context)
+                selected_tools = select_daxview_tools(message)
+                if daxview_clarification_needed(message, selected_tools):
+                    reply = build_daxview_clarification(message, selected_tools)
+                    mcp_context = {"enabled": DAXVIEW_MCP_ENABLED, "tools": selected_tools, "results": [], "errors": []}
+                    answer_provider = "daxview-question-filter"
+                else:
+                    contexts = retrieve_context(message)
+                    mcp_context = retrieve_daxview_context(message, request_id)
+                    reply = ask_ollama(message, contexts, request_id, mcp_context)
+                    answer_provider = "ollama"
+                    answer_model = CHAT_MODEL
             else:
                 reply = REFUSAL
             sources = [
@@ -1014,7 +1104,16 @@ class ChatHandler(BaseHTTPRequestHandler):
                 for row in contexts
             ]
             qa_id = store_chat(message, reply, related, sources, session_id)
-            agent_trace = build_agent_trace(related, contexts, reply, qa_id, mcp_context)
+            if related and daxview_clarification_needed(message, mcp_context.get("tools") or []):
+                agent_trace = [
+                    {"agent": "EMS Guard", "status": "passed", "detail": "Question is EMS/Daxview related."},
+                    {"agent": "Question Completeness Filter", "status": "needs_clarification", "detail": "Daxview data request is missing site, building, meter, device, or explicit all-scope target."},
+                    {"agent": "Daxview MCP", "status": "skipped", "detail": "MCP was not called because the question needs clarification first."},
+                    {"agent": "DB Logger", "status": "completed", "detail": f"Saved QA log {qa_id}."},
+                    {"agent": "Final Response", "status": "completed", "detail": preview(reply, 120)},
+                ]
+            else:
+                agent_trace = build_agent_trace(related, contexts, reply, qa_id, mcp_context)
         except RuntimeError as error:
             log_event("api_to_ui_error", request_id=request_id, error=str(error))
             self._send_json(503, {"error": str(error), "provider": "ollama"})
@@ -1033,8 +1132,8 @@ class ChatHandler(BaseHTTPRequestHandler):
             200,
             {
                 "reply": reply,
-                "provider": "ollama" if related else "ems-guard",
-                "model": CHAT_MODEL if related else None,
+                "provider": answer_provider,
+                "model": answer_model,
                 "is_ems_related": related,
                 "sources": sources,
                 "agent_trace": agent_trace,
