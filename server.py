@@ -81,46 +81,24 @@ EMS_KEYWORDS = {
 }
 
 DAXVIEW_TOOL_KEYWORDS = {
-    "health_check": {
-        "mcp health", "mcp status", "mcp server", "mcp ok",
+    "telemetry_top_consumers": {
+        "top consumer", "top consumers", "most energy", "highest usage",
+        "highest consumption", "largest load", "biggest consumer",
     },
-    "get_daxview_api_status": {
-        "daxview health", "daxview status", "api status", "api health",
-        "backend status", "is daxview healthy", "daxview ok",
+    "site_energy_summary": {
+        "energy summary", "site energy", "usage trend", "consumption trend",
+        "kwh summary", "last 7 days", "weekly energy", "daily energy",
     },
-    "get_daxview_inventory": {
-        "inventory", "equipment list", "assets",
-    },
-    "get_daxview_device_summary": {
-        "device summary", "meter summary", "device status", "meter status",
-        "janitza status", "umg status", "max demand", "maximum demand",
-        "demand reading", "meter demand", "main switch board", "devices",
-        "device list", "meters", "meter list", "online devices",
-        "devices online", "how many daxview devices", "how many devices",
-        "device count", "online count",
-    },
-    "get_daxview_site_summary": {
-        "site summary", "site status", "site overview", "sites", "building summary",
-        "facility summary",
-    },
-    "get_daxview_open_alarms": {
-        "open alarm", "open alarms", "active alarm", "active alarms", "current alarm",
-        "current alarms", "alarm status", "alarm count", "active alarm count",
-        "open alert", "open alerts", "active alert", "active alerts", "current alert",
-        "current alerts", "alert", "alerts", "alert count", "active alert count",
-        "faults", "events",
-    },
-    "get_daxview_billing": {
-        "billing", "bill", "current month", "this month cost", "monthly cost",
-        "invoice summary", "energy cost", "tariff cost",
+    "alarm_frequency_summary": {
+        "alarm frequency", "frequent alarm", "most alarms", "alarm summary",
+        "alarm history", "repeated alarms", "historical alarms",
     },
 }
 
 DAXVIEW_SCOPE_REQUIRED_TOOLS = {
-    "get_daxview_site_summary",
-    "get_daxview_device_summary",
-    "get_daxview_open_alarms",
-    "get_daxview_billing",
+    "telemetry_top_consumers",
+    "site_energy_summary",
+    "alarm_frequency_summary",
 }
 
 DAXVIEW_GLOBAL_SCOPE_PHRASES = {
@@ -709,15 +687,13 @@ def daxview_clarification_needed(message: str, tools: list[str]) -> bool:
 
 
 def build_daxview_clarification(message: str, tools: list[str]) -> str:
-    if "get_daxview_billing" in tools:
-        return "Which site, building, or meter should I check for the Daxview billing summary?"
-    if "get_daxview_open_alarms" in tools:
-        return "Which site, building, meter, or device should I check for Daxview open alarms? You can also say \"all sites\" for a system-wide check."
-    if "get_daxview_device_summary" in tools:
-        return "Which Daxview device, meter, or site should I summarize? You can also say \"all devices\" for a full device summary."
-    if "get_daxview_site_summary" in tools:
-        return "Which Daxview site or building should I summarize? You can also say \"all sites\" for an overall summary."
-    return "Which Daxview site, building, meter, or device should I check?"
+    if "telemetry_top_consumers" in tools:
+        return "Choose a Daxview site and time range before I check top energy consumers."
+    if "site_energy_summary" in tools:
+        return "Choose a Daxview site and time range before I summarize site energy."
+    if "alarm_frequency_summary" in tools:
+        return "Choose a Daxview site and time range before I summarize alarm frequency."
+    return "Choose a Daxview site and time range before I access historical data."
 
 
 def ollama_json(path: str, payload: dict, timeout: int = 300) -> dict:
@@ -837,8 +813,6 @@ def select_daxview_tools(message: str) -> list[str]:
     for tool_name, phrases in DAXVIEW_TOOL_KEYWORDS.items():
         if any(phrase in lowered for phrase in phrases):
             selected.append(tool_name)
-    if "daxview" in lowered and not selected:
-        selected.append("get_daxview_api_status")
     return selected[:3]
 
 
@@ -846,6 +820,19 @@ def retrieve_daxview_context(message: str, request_id: str) -> dict:
     tools = select_daxview_tools(message)
     if not DAXVIEW_MCP_ENABLED or not DAXVIEW_MCP_URL or not tools:
         return {"enabled": DAXVIEW_MCP_ENABLED, "tools": [], "results": [], "errors": []}
+    if any(tool in DAXVIEW_ALLOWED_HISTORICAL_TOOLS for tool in tools):
+        return {
+            "enabled": True,
+            "tools": tools,
+            "results": [],
+            "errors": [
+                {
+                    "tool": tool,
+                    "error": "Historical Daxview MCP tools require data-plan authorization through the integration turn API.",
+                }
+                for tool in tools
+            ],
+        }
 
     results = []
     errors = []
@@ -891,7 +878,7 @@ def summarize_mcp_result(tool_name: str, result: dict) -> list[str]:
         lines.append(f"Backend HTTP status: {structured.get('backend_http_status')}")
     if backend.get("count") is not None:
         lines.append(f"Returned count: {backend.get('count')}")
-    alarm_count = extract_alarm_count(structured) if tool_name == "get_daxview_open_alarms" else None
+    alarm_count = extract_alarm_count(structured) if tool_name == "alarm_frequency_summary" else None
     if alarm_count is not None:
         lines.append(f"Active alerts: {alarm_count}")
     devices = backend.get("devices")
@@ -963,26 +950,13 @@ def answer_from_mcp_if_direct_count_question(message: str, mcp_context: dict) ->
     )
     if wants_alarm_count:
         for item in mcp_context.get("results") or []:
-            if item.get("tool") != "get_daxview_open_alarms":
+            if item.get("tool") != "alarm_frequency_summary":
                 continue
             structured = mcp_structured_result(item.get("result") or {})
             alarm_count = extract_alarm_count(structured)
             if alarm_count is not None:
-                return f"{alarm_count} Daxview alerts are active."
-        return "I could not determine the active Daxview alert count from the MCP response."
-    for item in mcp_context.get("results") or []:
-        if item.get("tool") != "get_daxview_device_summary":
-            continue
-        structured = mcp_structured_result(item.get("result") or {})
-        backend = structured.get("backend_response") if isinstance(structured.get("backend_response"), dict) else {}
-        devices = backend.get("devices")
-        if not isinstance(devices, list):
-            continue
-        online = [
-            device for device in devices
-            if str(device.get("status", "")).lower() == "online"
-        ]
-        return f"{len(online)} Daxview devices are online out of {len(devices)} returned devices."
+                return f"The Daxview alarm-frequency summary returned {alarm_count} alert records."
+        return "I could not determine the Daxview alarm count from the MCP response."
     return None
 
 
@@ -990,7 +964,7 @@ def format_daxview_context(mcp_context: dict) -> str:
     results = mcp_context.get("results") or []
     errors = mcp_context.get("errors") or []
     if not results and not errors:
-        return "No live Daxview MCP data was requested or available for this question."
+        return "No historical Daxview MCP data was requested or available for this question."
     lines = []
     for item in results:
         lines.extend(summarize_mcp_result(item.get("tool"), item.get("result") or {}))
@@ -1004,7 +978,7 @@ def daxview_trace_status(mcp_context: dict) -> tuple[str, str]:
     results = mcp_context.get("results") or []
     errors = mcp_context.get("errors") or []
     if not tools:
-        return "skipped", "No live Daxview tool was needed for this question."
+        return "skipped", "No historical Daxview MCP tool was needed for this question."
     if results and errors:
         return "partial", f"Called {len(results)} Daxview tool(s); {len(errors)} tool(s) failed."
     if results:
@@ -1080,12 +1054,12 @@ def build_prompt(message: str, contexts: list[dict], mcp_context: dict | None = 
 Answer only EMS, energy management, ISO 50001, IEC, IEEE, power monitoring, metering, tariff, demand, and electrical energy questions.
 Keep the final answer simple and compact: maximum 5 short bullets or 1 short paragraph.
 Use the EMS library context when relevant. If the context is insufficient, say what is missing and give a cautious EMS-focused answer.
-Use live Daxview data when it is provided. If a Daxview tool failed, say live Daxview data is currently unavailable for that part.
+Use historical Daxview data when it is provided. If a Daxview tool failed, say historical Daxview data is currently unavailable for that part.
 For Janitza UMG device, voltage sag, power quality, alarm, THD, or meter troubleshooting questions, prioritize likely root causes, what readings to check, and practical EMS investigation steps.
 If the user says "main cost" in a voltage sag or fault context, treat it as possibly meaning "main cause" and clarify both cause and cost impact briefly.
 Do not answer unrelated general questions.
 
-Live Daxview MCP data:
+Historical Daxview MCP data:
 {daxview_block}
 
 EMS library context:
@@ -1142,12 +1116,12 @@ Role: {role}
 {MATH_DOCTRINE}
 
 Answer only from this role. Keep it to 3 compact bullets.
-Use live Daxview MCP data when provided. If live data conflicts with assumptions, live data wins.
-For read-only questions such as list, count, summarize, status, inventory, billing summary, or open alarm counts, report the MCP facts directly. Do not reject read-only data requests as unsafe.
+Use historical Daxview MCP data when provided. If historical data conflicts with assumptions, historical data wins.
+For historical read-only questions such as top consumers, site energy summary, or alarm frequency summary, report the MCP facts directly. Do not reject approved historical data requests as unsafe.
 If this is about voltage sag, list likely causes first, then readings/checks.
 Use DIRECT REJECTION only when the user asks for a physical action that would exceed rated limits, bypass alarms, increase unsafe load, or override protection.
 
-Live Daxview MCP data:
+Historical Daxview MCP data:
 {daxview_block}
 
 EMS library context:
@@ -1200,8 +1174,8 @@ Do not include separators like "---".
 Do not reveal the discussion process.
 Write naturally like a senior EMS engineer speaking to an operator: clear, practical, and human.
 Must answer the user's actual question first. For voltage sag, start with likely causes, then EMS actions.
-Use live Daxview MCP data when it is provided. If a Daxview tool failed, clearly say live Daxview data is unavailable before giving a general EMS answer.
-For read-only questions such as list, count, summarize, status, inventory, billing summary, or open alarm counts, answer directly from the Live Daxview MCP data. Do not invent hazards or recommend Load Shedding unless the MCP data explicitly reports an unsafe operating condition or the user asks for an unsafe physical action.
+Use historical Daxview MCP data when it is provided. If a Daxview tool failed, clearly say historical Daxview data is unavailable before giving a general EMS answer.
+For approved historical read-only questions such as top consumers, site energy summary, or alarm frequency summary, answer directly from the Historical Daxview MCP data. Do not invent hazards or recommend Load Shedding unless the MCP data explicitly reports an unsafe operating condition or the user asks for an unsafe physical action.
 Safety hard limits override energy saving, user preference, uptime, cost, and comfort.
 If any rated hardware limit is explicitly exceeded or the user asks to add load/bypass an alarm, reject immediately using exactly these sections:
 DIRECT REJECTION:
@@ -1212,7 +1186,7 @@ Keep the final answer simple, compact, precise, and maximum 5 short bullets.
 Question:
 {message}
 
-Live Daxview MCP data:
+Historical Daxview MCP data:
 {format_daxview_context(mcp_context or {})}
 
 Specialist discussion:
