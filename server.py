@@ -752,6 +752,7 @@ def parse_mcp_response(raw: str) -> dict:
 
 def mcp_headers(include_session: bool = True) -> dict:
     headers = {
+        "User-Agent": "DaxView-AI-Server/1.0",
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
         "MCP-Protocol-Version": DAXVIEW_MCP_PROTOCOL_VERSION,
