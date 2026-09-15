@@ -340,7 +340,7 @@ POC_PAGE = """<!doctype html>
           lines.push("");
           lines.push(`Error from ${item.tool}: ${item.error}`);
         });
-        return lines.join("\n");
+        return lines.join("\\n");
       }
 
       function setMeta(data) {
