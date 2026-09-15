@@ -46,6 +46,7 @@ AI_SERVER_API_KEY_PREVIOUS = os.getenv("AI_SERVER_API_KEY_PREVIOUS", "").strip()
 AI_SERVER_AUDIENCE = os.getenv("AI_SERVER_AUDIENCE", "daxview-ai").strip()
 AI_CHAT_ASSERTION_SECRET = os.getenv("AI_CHAT_ASSERTION_SECRET", "").strip()
 AI_JOB_WORKERS = int(os.getenv("AI_JOB_WORKERS", "4"))
+DAXVIEW_ALLOW_MISSING_COMPANY = os.getenv("DAXVIEW_ALLOW_MISSING_COMPANY", "false").lower() in {"1", "true", "yes", "on"}
 DAXVIEW_CALLBACK_BASE_URL = os.getenv("DAXVIEW_CALLBACK_BASE_URL", "").strip().rstrip("/")
 DAXVIEW_CALLBACK_KEY = os.getenv("DAXVIEW_CALLBACK_KEY", "").strip()
 DAXVIEW_CALLBACK_KEY_PREVIOUS = os.getenv("DAXVIEW_CALLBACK_KEY_PREVIOUS", "").strip()
@@ -481,8 +482,10 @@ def verify_hs256_jwt(token: str, secret: str) -> dict:
         raise ValueError("wrong deployment issuer")
     if claims.get("sub") in (None, ""):
         raise ValueError("missing assertion subject")
-    if claims.get("company_id") in (None, ""):
+    if claims.get("company_id") in (None, "") and not DAXVIEW_ALLOW_MISSING_COMPANY:
         raise ValueError("missing assertion company")
+    if claims.get("company_id") in (None, ""):
+        claims["company_id"] = "missing-company"
     return claims
 
 
