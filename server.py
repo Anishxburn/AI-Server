@@ -2,14 +2,18 @@
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
 import time
 import uuid
 from collections import deque
+from datetime import datetime, timedelta, timezone
 from urllib.error import URLError
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from langchain_core.runnables import RunnableLambda
@@ -36,6 +40,21 @@ DAXVIEW_MCP_AUTH_TOKEN = os.getenv("DAXVIEW_MCP_AUTH_TOKEN", "").strip()
 DAXVIEW_MCP_TIMEOUT = int(os.getenv("DAXVIEW_MCP_TIMEOUT", "20"))
 DAXVIEW_MCP_PROTOCOL_VERSION = os.getenv("DAXVIEW_MCP_PROTOCOL_VERSION", "2025-06-18")
 DAXVIEW_MCP_SESSION_ID = None
+DAXVIEW_DEPLOYMENT_ID = os.getenv("DAXVIEW_DEPLOYMENT_ID", "v2-dev")
+AI_SERVER_API_KEY = os.getenv("AI_SERVER_API_KEY", "").strip()
+AI_SERVER_API_KEY_PREVIOUS = os.getenv("AI_SERVER_API_KEY_PREVIOUS", "").strip()
+AI_SERVER_AUDIENCE = os.getenv("AI_SERVER_AUDIENCE", "daxview-ai").strip()
+AI_CHAT_ASSERTION_SECRET = os.getenv("AI_CHAT_ASSERTION_SECRET", "").strip()
+AI_JOB_WORKERS = int(os.getenv("AI_JOB_WORKERS", "4"))
+DAXVIEW_CALLBACK_BASE_URL = os.getenv("DAXVIEW_CALLBACK_BASE_URL", "").strip().rstrip("/")
+DAXVIEW_CALLBACK_KEY = os.getenv("DAXVIEW_CALLBACK_KEY", "").strip()
+DAXVIEW_CALLBACK_KEY_PREVIOUS = os.getenv("DAXVIEW_CALLBACK_KEY_PREVIOUS", "").strip()
+DAXVIEW_ALLOWED_HISTORICAL_TOOLS = {
+    "telemetry_top_consumers",
+    "site_energy_summary",
+    "alarm_frequency_summary",
+}
+DAXVIEW_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=AI_JOB_WORKERS)
 TRACES = deque(maxlen=TRACE_LIMIT)
 ALLOWED_ORIGINS = {
     origin.strip()
@@ -403,7 +422,12 @@ POC_PAGE = """<!doctype html>
 
 
 def log_event(event: str, **fields: object) -> None:
-    print(json.dumps({"event": event, **fields}, ensure_ascii=False), flush=True)
+    sensitive_markers = ("key", "token", "secret", "assertion", "authorization", "prompt", "answer", "message")
+    safe_fields = {
+        name: "[redacted]" if any(marker in name.lower() for marker in sensitive_markers) else value
+        for name, value in fields.items()
+    }
+    print(json.dumps({"event": event, **safe_fields}, ensure_ascii=False), flush=True)
 
 
 def preview(text: str, limit: int = 240) -> str:
@@ -415,6 +439,247 @@ def db() -> psycopg.Connection:
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured")
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+
+def json_error(code: str, message: str, retryable: bool = False, request_id: str | None = None) -> dict:
+    error = {"code": code, "message": message, "retryable": retryable}
+    if request_id:
+        error["request_id"] = request_id
+    return {"error": error}
+
+
+def b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode((value + padding).encode("ascii"))
+
+
+def verify_hs256_jwt(token: str, secret: str) -> dict:
+    if not secret:
+        raise ValueError("AI_CHAT_ASSERTION_SECRET is not configured")
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise ValueError("assertion must be a JWT")
+    signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
+    signature = b64url_decode(parts[2])
+    expected = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+    if not hmac.compare_digest(signature, expected):
+        raise ValueError("invalid assertion signature")
+    header = json.loads(b64url_decode(parts[0]).decode("utf-8"))
+    if header.get("alg") != "HS256":
+        raise ValueError("unsupported assertion algorithm")
+    claims = json.loads(b64url_decode(parts[1]).decode("utf-8"))
+    now = int(time.time())
+    exp = int(claims.get("exp", 0))
+    iat = int(claims.get("iat", 0))
+    if exp < now:
+        raise ValueError("assertion expired")
+    if iat > now + 60:
+        raise ValueError("assertion issued in the future")
+    if claims.get("aud") != AI_SERVER_AUDIENCE:
+        raise ValueError("wrong assertion audience")
+    if claims.get("iss") != DAXVIEW_DEPLOYMENT_ID:
+        raise ValueError("wrong deployment issuer")
+    if claims.get("sub") in (None, ""):
+        raise ValueError("missing assertion subject")
+    if claims.get("company_id") in (None, ""):
+        raise ValueError("missing assertion company")
+    return claims
+
+
+def daxview_identity(headers) -> dict:
+    auth_header = headers.get("Authorization", "")
+    expected = {key for key in (AI_SERVER_API_KEY, AI_SERVER_API_KEY_PREVIOUS) if key}
+    if not expected:
+        raise PermissionError("AI_SERVER_API_KEY is not configured")
+    if not auth_header.startswith("Bearer "):
+        raise PermissionError("missing bearer service key")
+    supplied_key = auth_header.removeprefix("Bearer ").strip()
+    if supplied_key not in expected:
+        raise PermissionError("invalid service key")
+    assertion = headers.get("X-DaxView-Assertion", "").strip()
+    if not assertion:
+        raise PermissionError("missing DaxView assertion")
+    claims = verify_hs256_jwt(assertion, AI_CHAT_ASSERTION_SECRET)
+    return {
+        "deployment_id": str(claims["iss"]),
+        "company_id": str(claims["company_id"]),
+        "user_id": str(claims["sub"]),
+        "claims": claims,
+    }
+
+
+def require_database() -> None:
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured")
+
+
+def safe_job_id(turn_id: str) -> str:
+    compact = re.sub(r"[^A-Za-z0-9_-]", "", turn_id)
+    return f"job_{compact[:48] or uuid.uuid4().hex}"
+
+
+def add_job_event(job_id: str, event_type: str, data: dict) -> int:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(MAX(event_id), 0) + 1 AS next_id FROM daxview_job_events WHERE job_id = %s",
+                (job_id,),
+            )
+            event_id = int(cur.fetchone()["next_id"])
+            cur.execute(
+                "INSERT INTO daxview_job_events (job_id, event_id, event_type, event_data) VALUES (%s, %s, %s, %s)",
+                (job_id, event_id, event_type, json.dumps(data)),
+            )
+        conn.commit()
+    return event_id
+
+
+def is_job_cancelled(job_id: str) -> bool:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT status FROM daxview_jobs WHERE id = %s", (job_id,))
+            row = cur.fetchone()
+            return bool(row and row.get("status") == "cancelled")
+
+
+def update_job_status(job_id: str, status: str) -> None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE daxview_jobs SET status = %s, updated_at = now() WHERE id = %s",
+                (status, job_id),
+            )
+        conn.commit()
+
+
+def select_historical_operation(message: str) -> str | None:
+    lowered = message.lower()
+    if any(phrase in lowered for phrase in ("top consumer", "top consumers", "most energy", "highest usage", "highest consumption")):
+        return "telemetry_top_consumers"
+    if any(phrase in lowered for phrase in ("energy summary", "site energy", "usage trend", "consumption trend", "kwh summary")):
+        return "site_energy_summary"
+    if any(phrase in lowered for phrase in ("alarm frequency", "frequent alarm", "most alarms", "alarm summary")):
+        return "alarm_frequency_summary"
+    return None
+
+
+def default_historical_range() -> dict:
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=7)
+    return {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "timezone": "Asia/Kuala_Lumpur",
+    }
+
+
+def build_historical_arguments(operation_id: str, context: dict) -> dict:
+    site_id = context.get("site_id")
+    if not site_id:
+        raise ValueError("site_id is required for Daxview historical data")
+    args = {
+        "site_id": int(site_id),
+        **default_historical_range(),
+    }
+    if context.get("building_id"):
+        args["building_id"] = int(context["building_id"])
+    if operation_id == "telemetry_top_consumers":
+        args["limit"] = int(context.get("limit") or 5)
+    elif operation_id == "alarm_frequency_summary":
+        args["limit"] = int(context.get("limit") or 10)
+    elif operation_id == "site_energy_summary":
+        args["bucket"] = str(context.get("bucket") or "day")
+    return args
+
+
+def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, request_id: str) -> dict:
+    if not DAXVIEW_CALLBACK_BASE_URL or not DAXVIEW_CALLBACK_KEY:
+        raise RuntimeError("DAXVIEW_CALLBACK_BASE_URL and DAXVIEW_CALLBACK_KEY are required for historical data")
+    payload = {
+        "turn_id": turn_id,
+        "continuation_id": str(uuid.uuid4()),
+        "operation_id": operation_id,
+        "arguments": arguments,
+    }
+    request = Request(
+        f"{DAXVIEW_CALLBACK_BASE_URL}/api/ai/integration/data-request-plans",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {DAXVIEW_CALLBACK_KEY}",
+        },
+        method="POST",
+    )
+    log_event("daxview_data_plan_request", request_id=request_id, operation_id=operation_id)
+    with urlopen(request, timeout=DAXVIEW_MCP_TIMEOUT) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def call_authorized_historical_tool(operation_id: str, authorization_id: str, arguments: dict, request_id: str) -> dict:
+    if operation_id not in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
+        raise ValueError("historical operation is not allowlisted")
+    return call_daxview_mcp_tool(operation_id, {"authorization_id": authorization_id, **arguments}, request_id)
+
+
+def summarize_historical_answer(message: str, operation_id: str, mcp_result: dict, request_id: str) -> str:
+    context = {
+        "enabled": True,
+        "tools": [operation_id],
+        "results": [{"tool": operation_id, "result": mcp_result}],
+        "errors": [],
+    }
+    return ask_ollama(message, retrieve_context(message), request_id, context)
+
+
+def run_daxview_integration_turn(turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> dict:
+    operation_id = select_historical_operation(message)
+    if not operation_id:
+        return langchain_chat_response(message, request_id, session_id)
+    try:
+        arguments = build_historical_arguments(operation_id, context)
+    except ValueError:
+        return {
+            "provider": "daxview-question-filter",
+            "reply": "Choose a site and time range before I access Daxview historical data.",
+        }
+    plan = request_daxview_data_plan(turn_id, operation_id, arguments, request_id)
+    authorization_id = plan.get("authorization_id")
+    normalized_arguments = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else arguments
+    if not authorization_id:
+        raise RuntimeError("Daxview did not return a data authorization")
+    result = call_authorized_historical_tool(operation_id, str(authorization_id), normalized_arguments, request_id)
+    return {
+        "provider": "daxview-historical-mcp",
+        "reply": summarize_historical_answer(message, operation_id, result, request_id),
+    }
+
+
+def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> None:
+    try:
+        update_job_status(job_id, "running")
+        add_job_event(job_id, "status", {"text": "Preparing response"})
+        if is_job_cancelled(job_id):
+            return
+        result = run_daxview_integration_turn(turn_id, message, context, request_id, session_id)
+        if is_job_cancelled(job_id):
+            return
+        if result.get("provider") == "daxview-question-filter":
+            add_job_event(
+                job_id,
+                "waiting_for_user",
+                {"prompt": result["reply"], "fields": ["site_id", "building_id", "time_range"]},
+            )
+            update_job_status(job_id, "completed")
+            add_job_event(job_id, "completed", {"status": "completed"})
+            return
+        add_job_event(job_id, "message", {"text": result["reply"]})
+        update_job_status(job_id, "completed")
+        add_job_event(job_id, "completed", {"status": "completed"})
+    except Exception as error:
+        log_event("daxview_job_failed", request_id=request_id, job_id=job_id, error=str(error))
+        update_job_status(job_id, "failed")
+        add_job_event(job_id, "failed", {"status": "failed", "text": "AI response generation failed."})
 
 
 def is_ems_related(message: str) -> bool:
@@ -1529,16 +1794,409 @@ class ChatHandler(BaseHTTPRequestHandler):
         origin = self.headers.get("Origin")
         if origin in ALLOWED_ORIGINS:
             self.send_header("Access-Control-Allow-Origin", origin)
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-DaxView-Assertion")
         self.end_headers()
         self.wfile.write(body)
+
+    def _read_json(self) -> dict:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length <= 0:
+            return {}
+        return json.loads(self.rfile.read(content_length))
+
+    def _daxview_auth(self) -> dict | None:
+        try:
+            return daxview_identity(self.headers)
+        except PermissionError as error:
+            self._send_json(401, json_error("unauthorized", str(error), False))
+        except (ValueError, json.JSONDecodeError) as error:
+            self._send_json(401, json_error("invalid_assertion", str(error), False))
+        return None
+
+    def _send_db_error(self, error: Exception) -> None:
+        status = 503 if isinstance(error, RuntimeError) else 500
+        self._send_json(status, json_error("ai_store_unavailable", str(error), True))
+
+    def handle_daxview_get(self, path: str, query: dict[str, list[str]]) -> bool:
+        if not path.startswith("/v1/integrations/daxview/"):
+            return False
+        if path == "/v1/integrations/daxview/health":
+            identity = self._daxview_auth()
+            if not identity:
+                return True
+            self._send_json(
+                200,
+                {
+                    "status": "ok",
+                    "service": "daxview-ai",
+                    "schema_version": "1.0",
+                    "conversation_store": bool(DATABASE_URL),
+                    "job_queue": True,
+                    "mcp_client": DAXVIEW_MCP_ENABLED,
+                    "supported_manifest_versions": ["2026-09-14"],
+                },
+            )
+            return True
+        identity = self._daxview_auth()
+        if not identity:
+            return True
+        try:
+            require_database()
+            if path == "/v1/integrations/daxview/conversations":
+                limit = min(max(int((query.get("limit") or ["20"])[0]), 1), 50)
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT id, title, created_at, updated_at
+                            FROM daxview_conversations
+                            WHERE deployment_id = %s AND company_id = %s AND user_id = %s AND status = 'active'
+                            ORDER BY updated_at DESC
+                            LIMIT %s
+                            """,
+                            (identity["deployment_id"], identity["company_id"], identity["user_id"], limit),
+                        )
+                        rows = cur.fetchall()
+                self._send_json(
+                    200,
+                    {
+                        "items": [
+                            {
+                                "conversation_id": str(row["id"]),
+                                "title": row["title"],
+                                "created_at": row["created_at"].isoformat(),
+                                "updated_at": row["updated_at"].isoformat(),
+                            }
+                            for row in rows
+                        ],
+                        "next_cursor": None,
+                    },
+                )
+                return True
+            match = re.fullmatch(r"/v1/integrations/daxview/conversations/([^/]+)/turns", path)
+            if match:
+                conversation_id = match.group(1)
+                limit = min(max(int((query.get("limit") or ["5"])[0]), 1), 20)
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT id FROM daxview_conversations
+                            WHERE id = %s AND deployment_id = %s AND company_id = %s AND user_id = %s AND status = 'active'
+                            """,
+                            (conversation_id, identity["deployment_id"], identity["company_id"], identity["user_id"]),
+                        )
+                        if not cur.fetchone():
+                            self._send_json(404, json_error("conversation_not_found", "The conversation is unavailable."))
+                            return True
+                        cur.execute(
+                            """
+                            SELECT t.id, t.created_at, t.user_message, j.id AS job_id
+                            FROM daxview_turns t
+                            LEFT JOIN daxview_jobs j ON j.turn_id = t.id
+                            WHERE t.conversation_id = %s
+                            ORDER BY t.created_at DESC
+                            LIMIT %s
+                            """,
+                            (conversation_id, limit),
+                        )
+                        turns = cur.fetchall()
+                        items = []
+                        for turn in reversed(turns):
+                            cur.execute(
+                                """
+                                SELECT event_type, event_data
+                                FROM daxview_job_events
+                                WHERE job_id = %s AND event_type IN ('message', 'waiting_for_user', 'failed', 'cancelled')
+                                ORDER BY event_id ASC
+                                """,
+                                (turn["job_id"],),
+                            )
+                            events = cur.fetchall() if turn["job_id"] else []
+                            items.append(
+                                {
+                                    "turn_id": str(turn["id"]),
+                                    "created_at": turn["created_at"].isoformat(),
+                                    "user_message": {"text": turn["user_message"]},
+                                    "assistant_events": [
+                                        {
+                                            "type": event["event_type"],
+                                            "text": (event["event_data"] or {}).get("text") or (event["event_data"] or {}).get("prompt") or "",
+                                        }
+                                        for event in events
+                                    ],
+                                }
+                            )
+                self._send_json(200, {"conversation_id": conversation_id, "items": items, "previous_cursor": None})
+                return True
+            match = re.fullmatch(r"/v1/integrations/daxview/jobs/([^/]+)/events", path)
+            if match:
+                job_id = match.group(1)
+                after = max(int((query.get("after") or ["0"])[0]), 0)
+                limit = min(max(int((query.get("limit") or ["100"])[0]), 1), 100)
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT id FROM daxview_jobs
+                            WHERE id = %s AND deployment_id = %s AND company_id = %s AND user_id = %s
+                            """,
+                            (job_id, identity["deployment_id"], identity["company_id"], identity["user_id"]),
+                        )
+                        if not cur.fetchone():
+                            self._send_json(404, json_error("job_not_found", "The job is unavailable."))
+                            return True
+                        cur.execute(
+                            """
+                            SELECT event_id, event_type, event_data
+                            FROM daxview_job_events
+                            WHERE job_id = %s AND event_id > %s
+                            ORDER BY event_id ASC
+                            LIMIT %s
+                            """,
+                            (job_id, after, limit),
+                        )
+                        rows = cur.fetchall()
+                self._send_json(
+                    200,
+                    {
+                        "events": [
+                            {"id": row["event_id"], "type": row["event_type"], "data": row["event_data"]}
+                            for row in rows
+                        ]
+                    },
+                )
+                return True
+        except Exception as error:
+            self._send_db_error(error)
+            return True
+        self._send_json(404, json_error("not_found", "Not found."))
+        return True
+
+    def handle_daxview_post(self, path: str, request: dict) -> bool:
+        if not path.startswith("/v1/integrations/daxview/"):
+            return False
+        identity = self._daxview_auth()
+        if not identity:
+            return True
+        try:
+            require_database()
+            if path == "/v1/integrations/daxview/conversations":
+                title = str(request.get("title") or "New conversation").strip()[:120] or "New conversation"
+                conversation_id = str(uuid.uuid4())
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            INSERT INTO daxview_conversations (id, deployment_id, company_id, user_id, title)
+                            VALUES (%s, %s, %s, %s, %s)
+                            RETURNING id, title, created_at, updated_at
+                            """,
+                            (conversation_id, identity["deployment_id"], identity["company_id"], identity["user_id"], title),
+                        )
+                        row = cur.fetchone()
+                    conn.commit()
+                self._send_json(
+                    201,
+                    {
+                        "conversation_id": str(row["id"]),
+                        "title": row["title"],
+                        "created_at": row["created_at"].isoformat(),
+                        "updated_at": row["updated_at"].isoformat(),
+                    },
+                )
+                return True
+            match = re.fullmatch(r"/v1/integrations/daxview/conversations/([^/]+)/turns", path)
+            if match:
+                conversation_id = match.group(1)
+                turn_id = str(request.get("turn_id") or "").strip()
+                message = str(request.get("message") or "").strip()
+                request_id = str(request.get("request_id") or uuid.uuid4())
+                context = request.get("context") if isinstance(request.get("context"), dict) else {}
+                if not turn_id:
+                    self._send_json(400, json_error("invalid_turn", "turn_id is required.", False, request_id))
+                    return True
+                if not message:
+                    self._send_json(400, json_error("invalid_turn", "message is required.", False, request_id))
+                    return True
+                job_id = safe_job_id(turn_id)
+                created = False
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT id FROM daxview_conversations
+                            WHERE id = %s AND deployment_id = %s AND company_id = %s AND user_id = %s AND status = 'active'
+                            """,
+                            (conversation_id, identity["deployment_id"], identity["company_id"], identity["user_id"]),
+                        )
+                        if not cur.fetchone():
+                            self._send_json(404, json_error("conversation_not_found", "The conversation is unavailable.", False, request_id))
+                            return True
+                        cur.execute(
+                            """
+                            INSERT INTO daxview_turns (id, conversation_id, deployment_id, company_id, user_id, user_message, request_id, context)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT DO NOTHING
+                            """,
+                            (
+                                turn_id,
+                                conversation_id,
+                                identity["deployment_id"],
+                                identity["company_id"],
+                                identity["user_id"],
+                                message,
+                                request_id,
+                                json.dumps(context),
+                            ),
+                        )
+                        created = cur.rowcount > 0
+                        cur.execute(
+                            """
+                            INSERT INTO daxview_jobs (id, turn_id, conversation_id, deployment_id, company_id, user_id)
+                            VALUES (%s, %s, %s, %s, %s, %s)
+                            ON CONFLICT DO NOTHING
+                            """,
+                            (job_id, turn_id, conversation_id, identity["deployment_id"], identity["company_id"], identity["user_id"]),
+                        )
+                        cur.execute("UPDATE daxview_conversations SET updated_at = now() WHERE id = %s", (conversation_id,))
+                    conn.commit()
+                if created:
+                    add_job_event(job_id, "status", {"text": "Accepted turn"})
+                    DAXVIEW_JOB_EXECUTOR.submit(process_daxview_turn, job_id, turn_id, message, context, request_id, conversation_id)
+                self._send_json(202, {"job_id": job_id})
+                return True
+            match = re.fullmatch(r"/v1/integrations/daxview/jobs/([^/]+)/cancel", path)
+            if match:
+                job_id = match.group(1)
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE daxview_jobs
+                            SET status = 'cancelled', cancelled_at = COALESCE(cancelled_at, now()), updated_at = now()
+                            WHERE id = %s AND deployment_id = %s AND company_id = %s AND user_id = %s
+                            RETURNING id
+                            """,
+                            (job_id, identity["deployment_id"], identity["company_id"], identity["user_id"]),
+                        )
+                        row = cur.fetchone()
+                    conn.commit()
+                if not row:
+                    self._send_json(404, json_error("job_not_found", "The job is unavailable."))
+                    return True
+                add_job_event(job_id, "cancelled", {"status": "cancelled"})
+                self._send_json(200, {"status": "cancelled"})
+                return True
+        except Exception as error:
+            self._send_db_error(error)
+            return True
+        self._send_json(404, json_error("not_found", "Not found."))
+        return True
+
+    def handle_daxview_patch(self, path: str, request: dict) -> bool:
+        if not path.startswith("/v1/integrations/daxview/"):
+            return False
+        identity = self._daxview_auth()
+        if not identity:
+            return True
+        match = re.fullmatch(r"/v1/integrations/daxview/conversations/([^/]+)", path)
+        if not match:
+            self._send_json(404, json_error("not_found", "Not found."))
+            return True
+        title = str(request.get("title") or "").strip()[:120]
+        if not title:
+            self._send_json(400, json_error("invalid_title", "title is required."))
+            return True
+        try:
+            require_database()
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE daxview_conversations
+                        SET title = %s, updated_at = now()
+                        WHERE id = %s AND deployment_id = %s AND company_id = %s AND user_id = %s AND status = 'active'
+                        RETURNING id, title, created_at, updated_at
+                        """,
+                        (title, match.group(1), identity["deployment_id"], identity["company_id"], identity["user_id"]),
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+            if not row:
+                self._send_json(404, json_error("conversation_not_found", "The conversation is unavailable."))
+                return True
+            self._send_json(
+                200,
+                {
+                    "conversation_id": str(row["id"]),
+                    "title": row["title"],
+                    "created_at": row["created_at"].isoformat(),
+                    "updated_at": row["updated_at"].isoformat(),
+                },
+            )
+        except Exception as error:
+            self._send_db_error(error)
+        return True
+
+    def handle_daxview_delete(self, path: str) -> bool:
+        if not path.startswith("/v1/integrations/daxview/"):
+            return False
+        identity = self._daxview_auth()
+        if not identity:
+            return True
+        try:
+            require_database()
+            conversation_match = re.fullmatch(r"/v1/integrations/daxview/conversations/([^/]+)", path)
+            user_match = re.fullmatch(r"/v1/integrations/daxview/lifecycle/user/([^/]+)", path)
+            company_match = re.fullmatch(r"/v1/integrations/daxview/lifecycle/company/([^/]+)", path)
+            with db() as conn:
+                with conn.cursor() as cur:
+                    if conversation_match:
+                        cur.execute(
+                            """
+                            UPDATE daxview_conversations
+                            SET status = 'deleted', deleted_at = COALESCE(deleted_at, now()), updated_at = now()
+                            WHERE id = %s AND deployment_id = %s AND company_id = %s AND user_id = %s
+                            """,
+                            (conversation_match.group(1), identity["deployment_id"], identity["company_id"], identity["user_id"]),
+                        )
+                    elif user_match:
+                        cur.execute(
+                            """
+                            UPDATE daxview_conversations
+                            SET status = 'deleted', deleted_at = COALESCE(deleted_at, now()), updated_at = now()
+                            WHERE deployment_id = %s AND user_id = %s
+                            """,
+                            (identity["deployment_id"], user_match.group(1)),
+                        )
+                    elif company_match:
+                        cur.execute(
+                            """
+                            UPDATE daxview_conversations
+                            SET status = 'deleted', deleted_at = COALESCE(deleted_at, now()), updated_at = now()
+                            WHERE deployment_id = %s AND company_id = %s
+                            """,
+                            (identity["deployment_id"], company_match.group(1)),
+                        )
+                    else:
+                        self._send_json(404, json_error("not_found", "Not found."))
+                        return True
+                conn.commit()
+            self._send_json(200, {})
+        except Exception as error:
+            self._send_db_error(error)
+        return True
 
     def do_OPTIONS(self) -> None:
         self._send_json(204, {})
 
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if self.handle_daxview_get(path, parse_qs(parsed.query)):
+            return
         if path == "/":
             self._send_html(200, POC_PAGE)
             return
@@ -1561,10 +2219,12 @@ class ChatHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         try:
-            content_length = int(self.headers.get("Content-Length", "0"))
-            request = json.loads(self.rfile.read(content_length))
+            request = self._read_json()
         except (ValueError, json.JSONDecodeError):
             self._send_json(400, {"error": "Request body must be valid JSON"})
+            return
+
+        if self.handle_daxview_post(path, request):
             return
 
         if path == "/knowledge":
@@ -1626,6 +2286,23 @@ class ChatHandler(BaseHTTPRequestHandler):
         }
         TRACES.appendleft(trace)
         self._send_json(200, response_payload)
+
+    def do_PATCH(self) -> None:
+        path = urlparse(self.path).path
+        try:
+            request = self._read_json()
+        except (ValueError, json.JSONDecodeError):
+            self._send_json(400, json_error("invalid_json", "Request body must be valid JSON."))
+            return
+        if self.handle_daxview_patch(path, request):
+            return
+        self._send_json(404, {"error": "Not found"})
+
+    def do_DELETE(self) -> None:
+        path = urlparse(self.path).path
+        if self.handle_daxview_delete(path):
+            return
+        self._send_json(404, {"error": "Not found"})
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"{self.address_string()} - {format % args}")

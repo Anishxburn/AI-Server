@@ -67,3 +67,58 @@ CREATE TABLE IF NOT EXISTS feedback (
     comment TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS daxview_conversations (
+    id UUID PRIMARY KEY,
+    deployment_id TEXT NOT NULL,
+    company_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS daxview_conversations_owner_idx
+ON daxview_conversations (deployment_id, company_id, user_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS daxview_turns (
+    id UUID PRIMARY KEY,
+    conversation_id UUID NOT NULL REFERENCES daxview_conversations(id) ON DELETE CASCADE,
+    deployment_id TEXT NOT NULL,
+    company_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    user_message TEXT NOT NULL,
+    request_id TEXT,
+    context JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS daxview_turns_unique_turn_idx
+ON daxview_turns (deployment_id, conversation_id, id);
+
+CREATE TABLE IF NOT EXISTS daxview_jobs (
+    id TEXT PRIMARY KEY,
+    turn_id UUID NOT NULL REFERENCES daxview_turns(id) ON DELETE CASCADE,
+    conversation_id UUID NOT NULL REFERENCES daxview_conversations(id) ON DELETE CASCADE,
+    deployment_id TEXT NOT NULL,
+    company_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    cancelled_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS daxview_jobs_unique_turn_idx
+ON daxview_jobs (deployment_id, conversation_id, turn_id);
+
+CREATE TABLE IF NOT EXISTS daxview_job_events (
+    job_id TEXT NOT NULL REFERENCES daxview_jobs(id) ON DELETE CASCADE,
+    event_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    event_data JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (job_id, event_id)
+);
