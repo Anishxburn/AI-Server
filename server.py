@@ -586,6 +586,7 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
         f"{DAXVIEW_CALLBACK_BASE_URL}/api/ai/integration/data-request-plans",
         data=json.dumps(payload).encode("utf-8"),
         headers={
+            "User-Agent": "DaxView-AI-Server/1.0",
             "Accept": "application/json",
             "Content-Type": "application/json",
             "Authorization": f"Bearer {DAXVIEW_CALLBACK_KEY}",
