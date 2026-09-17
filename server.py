@@ -39,6 +39,8 @@ DAXVIEW_MCP_URL = os.getenv("DAXVIEW_MCP_URL", "").strip()
 DAXVIEW_MCP_AUTH_TOKEN = os.getenv("DAXVIEW_MCP_AUTH_TOKEN", "").strip()
 DAXVIEW_MCP_TIMEOUT = int(os.getenv("DAXVIEW_MCP_TIMEOUT", "20"))
 DAXVIEW_MCP_PROTOCOL_VERSION = os.getenv("DAXVIEW_MCP_PROTOCOL_VERSION", "2025-06-18")
+DAXVIEW_MCP_DEBUG_RESPONSE = os.getenv("DAXVIEW_MCP_DEBUG_RESPONSE", "false").lower() in {"1", "true", "yes", "on"}
+DAXVIEW_MCP_DEBUG_RESPONSE_LIMIT = int(os.getenv("DAXVIEW_MCP_DEBUG_RESPONSE_LIMIT", "4000"))
 DAXVIEW_MCP_SESSION_ID = None
 DAXVIEW_DEPLOYMENT_ID = os.getenv("DAXVIEW_DEPLOYMENT_ID", "v2-dev")
 AI_SERVER_API_KEY = os.getenv("AI_SERVER_API_KEY", "").strip()
@@ -412,6 +414,49 @@ def log_event(event: str, **fields: object) -> None:
 def preview(text: str, limit: int = 240) -> str:
     normalized = " ".join(text.split())
     return normalized if len(normalized) <= limit else f"{normalized[:limit]}..."
+
+
+def redact_debug_value(value):
+    sensitive_markers = ("key", "token", "secret", "assertion", "authorization", "authorization_id")
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if any(marker in str(key).lower() for marker in sensitive_markers):
+                redacted[key] = "[redacted]"
+            else:
+                redacted[key] = redact_debug_value(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_debug_value(item) for item in value[:20]]
+    return value
+
+
+def debug_json_sample(value, limit: int) -> str:
+    text = json.dumps(redact_debug_value(value), ensure_ascii=False, default=str)
+    if len(text) > limit:
+        return f"{text[:limit]}...[truncated]"
+    return text
+
+
+def mcp_result_shape(value: object) -> dict:
+    if not isinstance(value, dict):
+        return {"type": type(value).__name__}
+    shape = {"top_keys": sorted(str(key) for key in value.keys())}
+    structured = value.get("structuredContent")
+    if isinstance(structured, dict):
+        shape["structured_keys"] = sorted(str(key) for key in structured.keys())
+        backend = structured.get("backend_response")
+        if isinstance(backend, dict):
+            shape["backend_keys"] = sorted(str(key) for key in backend.keys())
+            for list_key in ("items", "devices", "rows", "results", "data", "buckets", "alarms"):
+                items = backend.get(list_key)
+                if isinstance(items, list):
+                    shape["list_key"] = list_key
+                    shape["item_count"] = len(items)
+                    if items and isinstance(items[0], dict):
+                        shape["sample_item_keys"] = sorted(str(key) for key in items[0].keys())
+                    break
+    return shape
 
 
 def db() -> psycopg.Connection:
@@ -838,6 +883,14 @@ def call_daxview_mcp_tool(tool_name: str, arguments: dict | None, request_id: st
         tool=tool_name,
         duration_ms=round((time.perf_counter() - started_at) * 1000),
     )
+    if DAXVIEW_MCP_DEBUG_RESPONSE:
+        log_event(
+            "mcp_tool_response_debug",
+            request_id=request_id,
+            tool=tool_name,
+            shape=mcp_result_shape(result),
+            sample=debug_json_sample(result, DAXVIEW_MCP_DEBUG_RESPONSE_LIMIT),
+        )
     return result
 
 
