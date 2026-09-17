@@ -12,7 +12,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
@@ -592,9 +592,42 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
         },
         method="POST",
     )
-    log_event("daxview_data_plan_request", request_id=request_id, operation_id=operation_id)
-    with urlopen(request, timeout=DAXVIEW_MCP_TIMEOUT) as response:
-        return json.loads(response.read().decode("utf-8"))
+    safe_arguments = {
+        key: value
+        for key, value in arguments.items()
+        if key in {"site_id", "building_id", "start", "end", "timezone", "bucket", "limit"}
+    }
+    log_event(
+        "daxview_data_plan_request",
+        request_id=request_id,
+        turn_id=turn_id,
+        operation_id=operation_id,
+        arguments=safe_arguments,
+    )
+    try:
+        with urlopen(request, timeout=DAXVIEW_MCP_TIMEOUT) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")[:1000]
+        safe_body = body
+        try:
+            parsed = json.loads(body)
+            safe_body = {
+                key: parsed.get(key)
+                for key in ("detail", "error", "error_code", "code", "message", "retryable", "request_id")
+                if key in parsed
+            }
+        except json.JSONDecodeError:
+            pass
+        log_event(
+            "daxview_data_plan_error",
+            request_id=request_id,
+            turn_id=turn_id,
+            operation_id=operation_id,
+            status=error.code,
+            response=safe_body,
+        )
+        raise
 
 
 def call_authorized_historical_tool(operation_id: str, authorization_id: str, arguments: dict, request_id: str) -> dict:
