@@ -682,7 +682,125 @@ def call_authorized_historical_tool(operation_id: str, authorization_id: str, ar
     return call_daxview_mcp_tool(operation_id, {"authorization_id": authorization_id, **arguments}, request_id)
 
 
+def historical_result_data(mcp_result: dict) -> dict:
+    structured = mcp_structured_result(mcp_result)
+    data = structured.get("data")
+    return data if isinstance(data, dict) else {}
+
+
+def format_number(value, precision: int = 2) -> str:
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return f"{value:.{precision}f}"
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return "not available"
+    return str(value)
+
+
+def format_coverage_note(data: dict) -> str | None:
+    coverage = data.get("coverage")
+    if not isinstance(coverage, dict):
+        return None
+    candidate_devices = coverage.get("candidate_devices")
+    devices_with_data = coverage.get("devices_with_data")
+    if candidate_devices is None and devices_with_data is None:
+        return None
+    return (
+        "Coverage note: "
+        f"{candidate_devices if candidate_devices is not None else 'unknown'} candidate device(s), "
+        f"{devices_with_data if devices_with_data is not None else 'unknown'} device(s) with historical data."
+    )
+
+
+def summarize_top_consumers(data: dict) -> str:
+    rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+    unit = data.get("unit") or "kWh"
+    lines = ["Top energy consumers returned by Daxview MCP:"]
+    if not rows:
+        lines.append("No consuming devices were returned for this site and time range.")
+    for index, row in enumerate(rows[:10], 1):
+        if not isinstance(row, dict):
+            continue
+        name = row.get("device_name") or f"Device {row.get('device_id', 'unknown')}"
+        precision = int(row.get("precision") if isinstance(row.get("precision"), int) else 2)
+        value = format_number(row.get("value"), precision)
+        row_unit = row.get("unit") or unit
+        details = [f"{index}. {name} - {value} {row_unit}"]
+        if row.get("device_id") is not None:
+            details.append(f"device_id={row.get('device_id')}")
+        if row.get("source_count") is not None:
+            details.append(f"source_count={row.get('source_count')}")
+        if row.get("last_updated"):
+            details.append(f"last_updated={row.get('last_updated')}")
+        lines.append(" | ".join(details))
+    if data.get("row_count") is not None:
+        lines.append(f"Rows returned: {data.get('row_count')}.")
+    coverage_note = format_coverage_note(data)
+    if coverage_note:
+        lines.append(coverage_note)
+    if data.get("value_mode") or data.get("aggregation"):
+        lines.append(
+            "Calculation: "
+            f"{data.get('value_mode') or 'unknown mode'}"
+            f" using {data.get('aggregation') or 'unknown aggregation'}."
+        )
+    return "\n".join(lines)
+
+
+def summarize_site_energy(data: dict) -> str:
+    unit = data.get("unit") or "kWh"
+    lines = ["Site energy summary returned by Daxview MCP:"]
+    summary_keys = ("total", "total_value", "value", "total_kwh", "consumption", "energy")
+    total_value = next((data.get(key) for key in summary_keys if data.get(key) is not None), None)
+    if total_value is not None:
+        lines.append(f"Total: {format_number(total_value)} {unit}.")
+    buckets = data.get("buckets") or data.get("rows") or data.get("data")
+    if isinstance(buckets, list) and buckets:
+        lines.append("Buckets:")
+        for item in buckets[:10]:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("bucket") or item.get("timestamp") or item.get("start") or item.get("date") or "period"
+            value = item.get("value") if item.get("value") is not None else item.get("kwh")
+            lines.append(f"- {label}: {format_number(value)} {item.get('unit') or unit}")
+    elif total_value is None:
+        lines.append("No energy values were returned for this site and time range.")
+    coverage_note = format_coverage_note(data)
+    if coverage_note:
+        lines.append(coverage_note)
+    return "\n".join(lines)
+
+
+def summarize_alarm_frequency(data: dict) -> str:
+    rows = data.get("rows") or data.get("alarms") or data.get("items")
+    rows = rows if isinstance(rows, list) else []
+    lines = ["Alarm frequency summary returned by Daxview MCP:"]
+    if not rows:
+        lines.append("No alarm-frequency rows were returned for this site and time range.")
+    for index, row in enumerate(rows[:10], 1):
+        if not isinstance(row, dict):
+            continue
+        name = row.get("alarm_name") or row.get("name") or row.get("type") or row.get("severity") or "Alarm"
+        count = row.get("count") or row.get("frequency") or row.get("total") or row.get("value")
+        lines.append(f"{index}. {name} - {format_number(count, 0)} occurrence(s)")
+    if data.get("row_count") is not None:
+        lines.append(f"Rows returned: {data.get('row_count')}.")
+    return "\n".join(lines)
+
+
 def summarize_historical_answer(message: str, operation_id: str, mcp_result: dict, request_id: str) -> str:
+    data = historical_result_data(mcp_result)
+    if operation_id == "telemetry_top_consumers":
+        return summarize_top_consumers(data)
+    if operation_id == "site_energy_summary":
+        return summarize_site_energy(data)
+    if operation_id == "alarm_frequency_summary":
+        return summarize_alarm_frequency(data)
     context = {
         "enabled": True,
         "tools": [operation_id],
