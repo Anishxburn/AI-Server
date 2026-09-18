@@ -987,6 +987,13 @@ def mcp_json_rpc(method: str, params: dict | None = None, request_id: str | int 
 def call_daxview_mcp_tool(tool_name: str, arguments: dict | None, request_id: str) -> dict:
     started_at = time.perf_counter()
     log_event("mcp_tool_request", request_id=request_id, tool=tool_name, url=DAXVIEW_MCP_URL)
+    if DAXVIEW_MCP_DEBUG_RESPONSE:
+        log_event(
+            "mcp_tool_request_debug",
+            request_id=request_id,
+            tool=tool_name,
+            arguments=redact_debug_value(arguments or {}),
+        )
     response = mcp_json_rpc(
         "tools/call",
         {"name": tool_name, "arguments": arguments or {}},
