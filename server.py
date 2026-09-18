@@ -717,10 +717,43 @@ def format_coverage_note(data: dict) -> str | None:
     )
 
 
-def summarize_top_consumers(data: dict) -> str:
+def parse_datetime(value) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip().replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def format_time_window(data: dict, arguments: dict | None = None) -> str:
+    arguments = arguments or {}
+    start = data.get("start") or data.get("from") or data.get("start_time") or arguments.get("start")
+    end = data.get("end") or data.get("to") or data.get("end_time") or arguments.get("end")
+    days = data.get("days") or data.get("day_count") or arguments.get("days")
+    start_dt = parse_datetime(start)
+    end_dt = parse_datetime(end)
+    if days is None and start_dt and end_dt:
+        duration_days = round((end_dt - start_dt).total_seconds() / 86400)
+        if duration_days > 0:
+            days = duration_days
+    if days:
+        day_count = format_number(days, 0)
+        suffix = "day" if day_count == "1" else "days"
+        return f"last {day_count} {suffix}"
+    if start_dt and end_dt:
+        return f"{start_dt.date().isoformat()} to {end_dt.date().isoformat()}"
+    if start and end:
+        return f"{start} to {end}"
+    return "selected time range"
+
+
+def summarize_top_consumers(data: dict, arguments: dict | None = None) -> str:
     rows = data.get("rows") if isinstance(data.get("rows"), list) else []
     unit = data.get("unit") or "kWh"
-    lines = ["Top energy consumers returned by Daxview MCP:"]
+    time_window = format_time_window(data, arguments)
+    lines = [f"Top energy consumers for this site ({time_window}):"]
     if not rows:
         lines.append("No consuming devices were returned for this site and time range.")
     for index, row in enumerate(rows[:10], 1):
@@ -730,25 +763,10 @@ def summarize_top_consumers(data: dict) -> str:
         precision = int(row.get("precision") if isinstance(row.get("precision"), int) else 2)
         value = format_number(row.get("value"), precision)
         row_unit = row.get("unit") or unit
-        details = [f"{index}. {name} - {value} {row_unit}"]
-        if row.get("device_id") is not None:
-            details.append(f"device_id={row.get('device_id')}")
-        if row.get("source_count") is not None:
-            details.append(f"source_count={row.get('source_count')}")
-        if row.get("last_updated"):
-            details.append(f"last_updated={row.get('last_updated')}")
-        lines.append(" | ".join(details))
-    if data.get("row_count") is not None:
-        lines.append(f"Rows returned: {data.get('row_count')}.")
-    coverage_note = format_coverage_note(data)
-    if coverage_note:
-        lines.append(coverage_note)
-    if data.get("value_mode") or data.get("aggregation"):
-        lines.append(
-            "Calculation: "
-            f"{data.get('value_mode') or 'unknown mode'}"
-            f" using {data.get('aggregation') or 'unknown aggregation'}."
-        )
+        lines.append(f"{index}. {name}: {value} {row_unit}")
+    if rows:
+        shown = min(len(rows), 10)
+        lines.append(f"Ranked by total consumption over {time_window}; showing {shown} device(s).")
     return "\n".join(lines)
 
 
@@ -793,10 +811,16 @@ def summarize_alarm_frequency(data: dict) -> str:
     return "\n".join(lines)
 
 
-def summarize_historical_answer(message: str, operation_id: str, mcp_result: dict, request_id: str) -> str:
+def summarize_historical_answer(
+    message: str,
+    operation_id: str,
+    mcp_result: dict,
+    request_id: str,
+    arguments: dict | None = None,
+) -> str:
     data = historical_result_data(mcp_result)
     if operation_id == "telemetry_top_consumers":
-        return summarize_top_consumers(data)
+        return summarize_top_consumers(data, arguments)
     if operation_id == "site_energy_summary":
         return summarize_site_energy(data)
     if operation_id == "alarm_frequency_summary":
@@ -829,7 +853,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     result = call_authorized_historical_tool(operation_id, str(authorization_id), normalized_arguments, request_id)
     return {
         "provider": "daxview-historical-mcp",
-        "reply": summarize_historical_answer(message, operation_id, result, request_id),
+        "reply": summarize_historical_answer(message, operation_id, result, request_id, normalized_arguments),
     }
 
 
@@ -1267,6 +1291,7 @@ Answer only EMS, energy management, ISO 50001, IEC, IEEE, power monitoring, mete
 Keep the final answer simple and compact: maximum 5 short bullets or 1 short paragraph.
 Use the EMS library context when relevant. If the context is insufficient, say what is missing and give a cautious EMS-focused answer.
 Use historical Daxview data when it is provided. If a Daxview tool failed, say historical Daxview data is currently unavailable for that part.
+For ranked historical answers, number the result from 1 to last, include the time window, and omit internal fields such as source_count, raw row_count, aggregation names, backend endpoints, and last_updated unless the user explicitly asks for diagnostics.
 For Janitza UMG device, voltage sag, power quality, alarm, THD, or meter troubleshooting questions, prioritize likely root causes, what readings to check, and practical EMS investigation steps.
 If the user says "main cost" in a voltage sag or fault context, treat it as possibly meaning "main cause" and clarify both cause and cost impact briefly.
 Do not answer unrelated general questions.
@@ -1330,6 +1355,7 @@ Role: {role}
 Answer only from this role. Keep it to 3 compact bullets.
 Use historical Daxview MCP data when provided. If historical data conflicts with assumptions, historical data wins.
 For historical read-only questions such as top consumers, site energy summary, or alarm frequency summary, report the MCP facts directly. Do not reject approved historical data requests as unsafe.
+For ranked historical answers, number from 1 to last, include the time window, and skip internal metadata like source_count, raw row_count, aggregation, backend endpoint, and last_updated unless asked.
 If this is about voltage sag, list likely causes first, then readings/checks.
 Use DIRECT REJECTION only when the user asks for a physical action that would exceed rated limits, bypass alarms, increase unsafe load, or override protection.
 
@@ -1388,6 +1414,7 @@ Write naturally like a senior EMS engineer speaking to an operator: clear, pract
 Must answer the user's actual question first. For voltage sag, start with likely causes, then EMS actions.
 Use historical Daxview MCP data when it is provided. If a Daxview tool failed, clearly say historical Daxview data is unavailable before giving a general EMS answer.
 For approved historical read-only questions such as top consumers, site energy summary, or alarm frequency summary, answer directly from the Historical Daxview MCP data. Do not invent hazards or recommend Load Shedding unless the MCP data explicitly reports an unsafe operating condition or the user asks for an unsafe physical action.
+For ranked historical answers, number from 1 to last, include the time window, and omit internal metadata like source_count, raw row_count, aggregation, backend endpoint, and last_updated unless the user asks for diagnostics.
 Safety hard limits override energy saving, user preference, uptime, cost, and comfort.
 If any rated hardware limit is explicitly exceeded or the user asks to add load/bypass an alarm, reject immediately using exactly these sections:
 DIRECT REJECTION:
