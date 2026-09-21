@@ -910,24 +910,95 @@ def summarize_top_consumers(data: dict, arguments: dict | None = None) -> str:
     return "\n".join(lines)
 
 
-def summarize_site_energy(data: dict) -> str:
-    unit = data.get("unit") or "kWh"
+MONTH_NAMES = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+
+def local_bucket_date(timestamp: str, timezone_name: str) -> str | None:
+    parsed = parse_datetime(timestamp)
+    if not parsed:
+        return None
+    if timezone_name == "Asia/Kuala_Lumpur":
+        parsed = parsed.astimezone(timezone.utc) + timedelta(hours=8)
+    return parsed.date().isoformat()
+
+
+def requested_comparison_dates(message: str, fallback_year: int) -> list[str]:
+    lowered = message.lower()
+    dates = []
+    for match in re.finditer(
+        r"\b(\d{1,2})(?:st|nd|rd|th)?\s+"
+        r"(january|february|march|april|may|june|july|august|september|october|november|december)"
+        r"(?:\s+(\d{4}))?\b",
+        lowered,
+    ):
+        day = int(match.group(1))
+        month = MONTH_NAMES[match.group(2)]
+        year = int(match.group(3) or fallback_year)
+        try:
+            dates.append(datetime(year, month, day, tzinfo=timezone.utc).date().isoformat())
+        except ValueError:
+            continue
+    return dates
+
+
+def summarize_site_energy(data: dict, message: str = "", arguments: dict | None = None) -> str:
+    display = data.get("display") if isinstance(data.get("display"), dict) else {}
+    unit = data.get("unit") or display.get("unit") or "kWh"
+    precision = int(display.get("precision") if isinstance(display.get("precision"), int) else 2)
+    range_info = data.get("range") if isinstance(data.get("range"), dict) else {}
+    timezone_name = range_info.get("timezone") or (arguments or {}).get("timezone") or "Asia/Kuala_Lumpur"
     lines = ["Site energy summary returned by Daxview MCP:"]
     summary_keys = ("total", "total_value", "value", "total_kwh", "consumption", "energy")
     total_value = next((data.get(key) for key in summary_keys if data.get(key) is not None), None)
     if total_value is not None:
-        lines.append(f"Total: {format_number(total_value)} {unit}.")
-    buckets = data.get("buckets") or data.get("rows") or data.get("data")
+        lines.append(f"Total: {format_number(total_value, precision)} {unit}.")
+    buckets = data.get("buckets") or data.get("rows") or data.get("series") or data.get("data")
+    daily_values = {}
     if isinstance(buckets, list) and buckets:
-        lines.append("Buckets:")
+        lines.append("Daily values:")
         for item in buckets[:10]:
             if not isinstance(item, dict):
                 continue
-            label = item.get("bucket") or item.get("timestamp") or item.get("start") or item.get("date") or "period"
+            timestamp = item.get("timestamp") or item.get("bucket") or item.get("start") or item.get("date")
+            label = local_bucket_date(timestamp, timezone_name) if isinstance(timestamp, str) else None
+            label = label or timestamp or "period"
             value = item.get("value") if item.get("value") is not None else item.get("kwh")
-            lines.append(f"- {label}: {format_number(value)} {item.get('unit') or unit}")
+            if isinstance(value, (int, float)):
+                daily_values[str(label)] = float(value)
+            lines.append(f"- {label}: {format_number(value, precision)} {item.get('unit') or unit}")
     elif total_value is None:
         lines.append("No energy values were returned for this site and time range.")
+    if "difference" in message.lower() and len(daily_values) >= 2:
+        fallback_year = datetime.now(timezone.utc).year
+        dates = requested_comparison_dates(message, fallback_year)
+        if len(dates) >= 2:
+            first_date, second_date = dates[0], dates[1]
+            first_value = daily_values.get(first_date)
+            second_value = daily_values.get(second_date)
+            if first_value is not None and second_value is not None:
+                difference = first_value - second_value
+                direction = "higher" if difference > 0 else "lower" if difference < 0 else "the same"
+                lines.append(
+                    f"Difference: {first_date} was {format_number(abs(difference), precision)} {unit} "
+                    f"{direction} than {second_date} "
+                    f"({format_number(first_value, precision)} - {format_number(second_value, precision)} {unit})."
+                )
+            else:
+                missing = [date for date, value in ((first_date, first_value), (second_date, second_value)) if value is None]
+                lines.append(f"Could not calculate the requested difference because no daily value was returned for {', '.join(missing)}.")
     coverage_note = format_coverage_note(data)
     if coverage_note:
         lines.append(coverage_note)
@@ -962,7 +1033,7 @@ def summarize_historical_answer(
     if operation_id == "telemetry_top_consumers":
         return summarize_top_consumers(data, arguments)
     if operation_id == "site_energy_summary":
-        return summarize_site_energy(data)
+        return summarize_site_energy(data, message, arguments)
     if operation_id == "alarm_frequency_summary":
         return summarize_alarm_frequency(data)
     context = {
