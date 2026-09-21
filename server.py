@@ -631,8 +631,8 @@ def requested_historical_range(message: str) -> dict:
     if requested_dates:
         parsed_dates = [datetime.fromisoformat(date).date() for date in requested_dates]
         start_date = min(parsed_dates)
-        end_date = max(parsed_dates) + timedelta(days=1)
-        start = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc) - timedelta(hours=8)
+        end_date = max(parsed_dates)
+        start = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc) - timedelta(days=1, hours=8)
         end = datetime(end_date.year, end_date.month, end_date.day, tzinfo=timezone.utc) - timedelta(hours=8)
     elif "today" in lowered:
         start = end.replace(hour=0, minute=0, second=0, microsecond=0)
