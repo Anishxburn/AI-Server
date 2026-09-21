@@ -579,14 +579,20 @@ def update_job_status(job_id: str, status: str) -> None:
 
 
 def select_historical_operation(message: str) -> str | None:
+    operations = select_historical_operations(message)
+    return operations[0] if operations else None
+
+
+def select_historical_operations(message: str) -> list[str]:
     lowered = message.lower()
+    operations = []
     if any(phrase in lowered for phrase in ("top consumer", "top consumers", "most energy", "highest usage", "highest consumption")):
-        return "telemetry_top_consumers"
+        operations.append("telemetry_top_consumers")
     if any(phrase in lowered for phrase in ("energy summary", "site energy", "usage trend", "consumption trend", "kwh summary")):
-        return "site_energy_summary"
+        operations.append("site_energy_summary")
     if any(phrase in lowered for phrase in ("alarm frequency", "frequent alarm", "most alarms", "alarm summary")):
-        return "alarm_frequency_summary"
-    return None
+        operations.append("alarm_frequency_summary")
+    return operations
 
 
 def default_historical_range() -> dict:
@@ -920,26 +926,71 @@ def summarize_historical_answer(
     return ask_ollama(message, retrieve_context(message), request_id, context)
 
 
+def summarize_historical_answers(
+    message: str,
+    results: list[dict],
+    request_id: str,
+) -> str:
+    if not results:
+        return ask_ollama(message, retrieve_context(message), request_id)
+    if len(results) == 1:
+        item = results[0]
+        return summarize_historical_answer(
+            message,
+            item["operation_id"],
+            item["result"],
+            request_id,
+            item.get("arguments"),
+        )
+
+    sections = []
+    for item in results:
+        operation_id = item["operation_id"]
+        title = {
+            "telemetry_top_consumers": "Top energy-consuming devices",
+            "site_energy_summary": "Site energy summary",
+            "alarm_frequency_summary": "Alarm frequency summary",
+        }.get(operation_id, operation_id)
+        summary = summarize_historical_answer(
+            message,
+            operation_id,
+            item["result"],
+            request_id,
+            item.get("arguments"),
+        )
+        sections.append(f"{title}\n{summary}")
+    return "\n\n".join(sections)
+
+
 def run_daxview_integration_turn(turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> dict:
-    operation_id = select_historical_operation(message)
-    if not operation_id:
+    operation_ids = select_historical_operations(message)
+    if not operation_ids:
         return langchain_chat_response(message, request_id, session_id)
-    try:
-        arguments = build_historical_arguments(operation_id, context)
-    except ValueError:
-        return {
-            "provider": "daxview-question-filter",
-            "reply": "Choose a site and time range before I access Daxview historical data.",
-        }
-    plan = request_daxview_data_plan(turn_id, operation_id, arguments, request_id)
-    authorization_id = plan.get("authorization_id")
-    normalized_arguments = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else arguments
-    if not authorization_id:
-        raise RuntimeError("Daxview did not return a data authorization")
-    result = call_authorized_historical_tool(operation_id, str(authorization_id), normalized_arguments, request_id)
+    results = []
+    for operation_id in operation_ids:
+        try:
+            arguments = build_historical_arguments(operation_id, context)
+        except ValueError:
+            return {
+                "provider": "daxview-question-filter",
+                "reply": "Choose a site and time range before I access Daxview historical data.",
+            }
+        plan = request_daxview_data_plan(turn_id, operation_id, arguments, request_id)
+        authorization_id = plan.get("authorization_id")
+        normalized_arguments = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else arguments
+        if not authorization_id:
+            raise RuntimeError(f"Daxview did not return a data authorization for {operation_id}")
+        result = call_authorized_historical_tool(operation_id, str(authorization_id), normalized_arguments, request_id)
+        results.append(
+            {
+                "operation_id": operation_id,
+                "arguments": normalized_arguments,
+                "result": result,
+            }
+        )
     return {
         "provider": "daxview-historical-mcp",
-        "reply": summarize_historical_answer(message, operation_id, result, request_id, normalized_arguments),
+        "reply": summarize_historical_answers(message, results, request_id),
     }
 
 
