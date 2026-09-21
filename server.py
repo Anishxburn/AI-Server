@@ -624,13 +624,42 @@ def default_historical_range() -> dict:
     }
 
 
-def build_historical_arguments(operation_id: str, context: dict) -> dict:
+def requested_historical_range(message: str) -> dict:
+    lowered = message.lower()
+    end = datetime.now(timezone.utc)
+    if "today" in lowered:
+        start = end.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif "yesterday" in lowered:
+        today_start = end.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = today_start - timedelta(days=1)
+        end = today_start
+    else:
+        match = re.search(r"\blast\s+(\d{1,3})\s*(day|days|week|weeks|month|months)\b", lowered)
+        if not match:
+            return default_historical_range()
+        amount = int(match.group(1))
+        unit = match.group(2)
+        if unit.startswith("week"):
+            days = amount * 7
+        elif unit.startswith("month"):
+            days = amount * 30
+        else:
+            days = amount
+        start = end - timedelta(days=max(days, 1))
+    return {
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "timezone": "Asia/Kuala_Lumpur",
+    }
+
+
+def build_historical_arguments(operation_id: str, context: dict, message: str = "") -> dict:
     site_id = context.get("site_id")
     if not site_id:
         raise ValueError("site_id is required for Daxview historical data")
     args = {
         "site_id": int(site_id),
-        **default_historical_range(),
+        **requested_historical_range(message),
     }
     if context.get("building_id"):
         args["building_id"] = int(context["building_id"])
@@ -988,7 +1017,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     results = []
     for operation_id in operation_ids:
         try:
-            arguments = build_historical_arguments(operation_id, context)
+            arguments = build_historical_arguments(operation_id, context, message)
         except ValueError:
             return {
                 "provider": "daxview-question-filter",
