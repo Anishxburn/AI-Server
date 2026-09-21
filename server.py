@@ -627,7 +627,14 @@ def default_historical_range() -> dict:
 def requested_historical_range(message: str) -> dict:
     lowered = message.lower()
     end = datetime.now(timezone.utc)
-    if "today" in lowered:
+    requested_dates = requested_comparison_dates(message, end.year)
+    if requested_dates:
+        parsed_dates = [datetime.fromisoformat(date).date() for date in requested_dates]
+        start_date = min(parsed_dates)
+        end_date = max(parsed_dates) + timedelta(days=1)
+        start = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc) - timedelta(hours=8)
+        end = datetime(end_date.year, end_date.month, end_date.day, tzinfo=timezone.utc) - timedelta(hours=8)
+    elif "today" in lowered:
         start = end.replace(hour=0, minute=0, second=0, microsecond=0)
     elif "yesterday" in lowered:
         today_start = end.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -960,15 +967,19 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
     precision = int(display.get("precision") if isinstance(display.get("precision"), int) else 2)
     range_info = data.get("range") if isinstance(data.get("range"), dict) else {}
     timezone_name = range_info.get("timezone") or (arguments or {}).get("timezone") or "Asia/Kuala_Lumpur"
+    fallback_year = datetime.now(timezone.utc).year
+    requested_dates = requested_comparison_dates(message, fallback_year)
+    requested_date_set = set(requested_dates)
+    has_specific_dates = bool(requested_date_set)
     lines = ["Site energy summary returned by Daxview MCP:"]
     summary_keys = ("total", "total_value", "value", "total_kwh", "consumption", "energy")
     total_value = next((data.get(key) for key in summary_keys if data.get(key) is not None), None)
-    if total_value is not None:
+    if total_value is not None and not has_specific_dates:
         lines.append(f"Total: {format_number(total_value, precision)} {unit}.")
     buckets = data.get("buckets") or data.get("rows") or data.get("series") or data.get("data")
     daily_values = {}
     if isinstance(buckets, list) and buckets:
-        lines.append("Daily values:")
+        lines.append("Requested daily values:" if has_specific_dates else "Daily values:")
         for item in buckets[:10]:
             if not isinstance(item, dict):
                 continue
@@ -978,26 +989,27 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
             value = item.get("value") if item.get("value") is not None else item.get("kwh")
             if isinstance(value, (int, float)):
                 daily_values[str(label)] = float(value)
+            if has_specific_dates and str(label) not in requested_date_set:
+                continue
             lines.append(f"- {label}: {format_number(value, precision)} {item.get('unit') or unit}")
     elif total_value is None:
         lines.append("No energy values were returned for this site and time range.")
     if "difference" in message.lower() and len(daily_values) >= 2:
-        fallback_year = datetime.now(timezone.utc).year
-        dates = requested_comparison_dates(message, fallback_year)
+        dates = requested_dates
         if len(dates) >= 2:
-            first_date, second_date = dates[0], dates[1]
-            first_value = daily_values.get(first_date)
-            second_value = daily_values.get(second_date)
-            if first_value is not None and second_value is not None:
-                difference = first_value - second_value
+            earlier_date, later_date = sorted(dates[:2])
+            earlier_value = daily_values.get(earlier_date)
+            later_value = daily_values.get(later_date)
+            if earlier_value is not None and later_value is not None:
+                difference = later_value - earlier_value
                 direction = "higher" if difference > 0 else "lower" if difference < 0 else "the same"
                 lines.append(
-                    f"Difference: {first_date} was {format_number(abs(difference), precision)} {unit} "
-                    f"{direction} than {second_date} "
-                    f"({format_number(first_value, precision)} - {format_number(second_value, precision)} {unit})."
+                    f"Difference: {later_date} was {format_number(abs(difference), precision)} {unit} "
+                    f"{direction} than {earlier_date} "
+                    f"({format_number(later_value, precision)} - {format_number(earlier_value, precision)} {unit})."
                 )
             else:
-                missing = [date for date, value in ((first_date, first_value), (second_date, second_value)) if value is None]
+                missing = [date for date, value in ((earlier_date, earlier_value), (later_date, later_value)) if value is None]
                 lines.append(f"Could not calculate the requested difference because no daily value was returned for {', '.join(missing)}.")
     coverage_note = format_coverage_note(data)
     if coverage_note:
