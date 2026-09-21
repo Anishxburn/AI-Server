@@ -682,10 +682,27 @@ def call_authorized_historical_tool(operation_id: str, authorization_id: str, ar
     return call_daxview_mcp_tool(operation_id, {"authorization_id": authorization_id, **arguments}, request_id)
 
 
-def historical_result_data(mcp_result: dict) -> dict:
+def first_dict_with_list(value, list_keys: tuple[str, ...]) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    if any(isinstance(value.get(key), list) for key in list_keys):
+        return value
+    for key in ("data", "backend_response", "result", "results", "payload"):
+        nested = value.get(key)
+        if isinstance(nested, dict):
+            found = first_dict_with_list(nested, list_keys)
+            if found:
+                return found
+    return None
+
+
+def historical_result_data(mcp_result: dict, list_keys: tuple[str, ...] = ("rows", "items", "results", "data")) -> dict:
     structured = mcp_structured_result(mcp_result)
     data = structured.get("data")
-    return data if isinstance(data, dict) else {}
+    if isinstance(data, dict) and (data or any(isinstance(data.get(key), list) for key in list_keys)):
+        return data
+    found = first_dict_with_list(structured, list_keys)
+    return found if found else {}
 
 
 def format_number(value, precision: int = 2) -> str:
@@ -749,24 +766,93 @@ def format_time_window(data: dict, arguments: dict | None = None) -> str:
     return "selected time range"
 
 
+def first_list(data: dict, keys: tuple[str, ...]) -> list:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def first_value(row: dict, keys: tuple[str, ...]):
+    for key in keys:
+        if row.get(key) is not None:
+            return row.get(key)
+    return None
+
+
+def reading_detail(row: dict, value_keys: tuple[str, ...], time_keys: tuple[str, ...], unit: str, precision: int) -> str | None:
+    value = first_value(row, value_keys)
+    if value is None:
+        return None
+    detail = format_number(value, precision)
+    row_unit = row.get("reading_unit") or row.get("unit") or unit
+    timestamp = first_value(row, time_keys)
+    if timestamp:
+        return f"{detail} {row_unit} at {timestamp}"
+    return f"{detail} {row_unit}"
+
+
 def summarize_top_consumers(data: dict, arguments: dict | None = None) -> str:
-    rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+    rows = first_list(data, ("rows", "items", "results", "top_consumers", "consumers", "devices"))
     unit = data.get("unit") or "kWh"
     time_window = format_time_window(data, arguments)
-    lines = [f"Top energy consumers for this site ({time_window}):"]
+    lines = [
+        f"These are the top energy-consuming devices for this site over the {time_window}, ranked by total consumption:",
+        "",
+    ]
     if not rows:
         lines.append("No consuming devices were returned for this site and time range.")
     for index, row in enumerate(rows[:10], 1):
         if not isinstance(row, dict):
             continue
-        name = row.get("device_name") or f"Device {row.get('device_id', 'unknown')}"
+        name = (
+            row.get("device_name")
+            or row.get("name")
+            or row.get("label")
+            or f"Device {row.get('device_id', 'unknown')}"
+        )
         precision = int(row.get("precision") if isinstance(row.get("precision"), int) else 2)
-        value = format_number(row.get("value"), precision)
+        value = format_number(
+            first_value(
+                row,
+                (
+                    "value",
+                    "kwh",
+                    "total_kwh",
+                    "consumption",
+                    "energy",
+                    "consumption_delta",
+                    "stored_consumption_delta_sum",
+                ),
+            ),
+            precision,
+        )
         row_unit = row.get("unit") or unit
-        lines.append(f"{index}. {name}: {value} {row_unit}")
+        highest = reading_detail(
+            row,
+            ("highest_reading", "highest", "max_reading", "max", "peak_reading", "peak", "maximum"),
+            ("highest_time", "highest_at", "max_time", "max_at", "peak_time", "peak_at"),
+            row_unit,
+            precision,
+        )
+        lowest = reading_detail(
+            row,
+            ("lowest_reading", "lowest", "min_reading", "min", "minimum"),
+            ("lowest_time", "lowest_at", "min_time", "min_at"),
+            row_unit,
+            precision,
+        )
+        lines.append(f"{index}. {name}")
+        lines.append(f"   Total consumption: {value} {row_unit}")
+        if highest:
+            lines.append(f"   Highest reading: {highest}")
+        if lowest:
+            lines.append(f"   Lowest reading: {lowest}")
+        lines.append("")
     if rows:
         shown = min(len(rows), 10)
-        lines.append(f"Ranked by total consumption over {time_window}; showing {shown} device(s).")
+        lines.append(f"Showing {shown} device(s). Ranking is based on total consumption over the {time_window}.")
     return "\n".join(lines)
 
 
