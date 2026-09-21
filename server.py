@@ -86,6 +86,8 @@ DAXVIEW_TOOL_KEYWORDS = {
     "telemetry_top_consumers": {
         "top consumer", "top consumers", "most energy", "highest usage",
         "highest consumption", "largest load", "biggest consumer",
+        "top consuming", "energy-consuming", "energy consuming",
+        "top 5", "top five", "top devices",
     },
     "site_energy_summary": {
         "energy summary", "site energy", "usage trend", "consumption trend",
@@ -586,7 +588,24 @@ def select_historical_operation(message: str) -> str | None:
 def select_historical_operations(message: str) -> list[str]:
     lowered = message.lower()
     operations = []
-    if any(phrase in lowered for phrase in ("top consumer", "top consumers", "most energy", "highest usage", "highest consumption")):
+    if any(
+        phrase in lowered
+        for phrase in (
+            "top consumer",
+            "top consumers",
+            "top consuming",
+            "energy-consuming",
+            "energy consuming",
+            "top 5",
+            "top five",
+            "top devices",
+            "most energy",
+            "highest usage",
+            "highest consumption",
+            "largest load",
+            "biggest consumer",
+        )
+    ):
         operations.append("telemetry_top_consumers")
     if any(phrase in lowered for phrase in ("energy summary", "site energy", "usage trend", "consumption trend", "kwh summary")):
         operations.append("site_energy_summary")
