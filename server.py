@@ -11,7 +11,7 @@ import re
 import time
 import uuid
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
@@ -92,6 +92,8 @@ DAXVIEW_TOOL_KEYWORDS = {
     "site_energy_summary": {
         "energy summary", "site energy", "usage trend", "consumption trend",
         "kwh summary", "last 7 days", "weekly energy", "daily energy",
+        "energy consumption", "consumption", "usage", "difference in energy",
+        "energy difference",
     },
     "alarm_frequency_summary": {
         "alarm frequency", "frequent alarm", "most alarms", "alarm summary",
@@ -607,7 +609,25 @@ def select_historical_operations(message: str) -> list[str]:
         )
     ):
         operations.append("telemetry_top_consumers")
-    if any(phrase in lowered for phrase in ("energy summary", "site energy", "usage trend", "consumption trend", "kwh summary")):
+    if any(
+        phrase in lowered
+        for phrase in (
+            "energy summary",
+            "site energy",
+            "usage trend",
+            "consumption trend",
+            "kwh summary",
+            "energy consumption",
+            "consumption",
+            "usage",
+            "difference in energy",
+            "energy difference",
+        )
+    ) or (
+        any(word in lowered for word in ("energy", "kwh", "consumption", "usage"))
+        and any(word in lowered for word in ("compare", "comparison", "difference", "between"))
+        and any(month in lowered for month in MONTH_NAMES)
+    ):
         operations.append("site_energy_summary")
     if any(phrase in lowered for phrase in ("alarm frequency", "frequent alarm", "most alarms", "alarm summary")):
         operations.append("alarm_frequency_summary")
@@ -624,15 +644,45 @@ def default_historical_range() -> dict:
     }
 
 
+def requested_month_ranges(message: str, fallback_year: int) -> list[tuple[date, date]]:
+    lowered = message.lower()
+    ranges = []
+    seen = set()
+    for match in re.finditer(
+        r"\b(january|february|march|april|may|june|july|august|september|october|november|december)"
+        r"(?:\s+(\d{4}))?\b",
+        lowered,
+    ):
+        month = MONTH_NAMES[match.group(1)]
+        year = int(match.group(2) or fallback_year)
+        key = (year, month)
+        if key in seen:
+            continue
+        seen.add(key)
+        start_date = date(year, month, 1)
+        if month == 12:
+            next_month = date(year + 1, 1, 1)
+        else:
+            next_month = date(year, month + 1, 1)
+        ranges.append((start_date, next_month))
+    return ranges
+
+
 def requested_historical_range(message: str) -> dict:
     lowered = message.lower()
     end = datetime.now(timezone.utc)
     requested_dates = requested_comparison_dates(message, end.year)
+    requested_months = requested_month_ranges(message, end.year)
     if requested_dates:
         parsed_dates = [datetime.fromisoformat(date).date() for date in requested_dates]
         start_date = min(parsed_dates)
         end_date = max(parsed_dates)
         start = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc) - timedelta(days=1, hours=8)
+        end = datetime(end_date.year, end_date.month, end_date.day, tzinfo=timezone.utc) - timedelta(hours=8)
+    elif requested_months:
+        start_date = min(month_start for month_start, _ in requested_months)
+        end_date = max(month_end for _, month_end in requested_months)
+        start = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc) - timedelta(hours=8)
         end = datetime(end_date.year, end_date.month, end_date.day, tzinfo=timezone.utc) - timedelta(hours=8)
     elif "today" in lowered:
         start = end.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -641,7 +691,7 @@ def requested_historical_range(message: str) -> dict:
         start = today_start - timedelta(days=1)
         end = today_start
     else:
-        match = re.search(r"\blast\s+(\d{1,3})\s*(day|days|week|weeks|month|months)\b", lowered)
+        match = re.search(r"\b(?:last\s+|for\s+)?(\d{1,3})\s*(day|days|week|weeks|month|months)\b", lowered)
         if not match:
             return default_historical_range()
         amount = int(match.group(1))
@@ -961,6 +1011,14 @@ def requested_comparison_dates(message: str, fallback_year: int) -> list[str]:
     return dates
 
 
+def month_label(value: date) -> str:
+    return value.strftime("%B %Y")
+
+
+def requested_comparison_months(message: str, fallback_year: int) -> list[tuple[str, date, date]]:
+    return [(month_label(month_start), month_start, month_end) for month_start, month_end in requested_month_ranges(message, fallback_year)]
+
+
 def summarize_site_energy(data: dict, message: str = "", arguments: dict | None = None) -> str:
     display = data.get("display") if isinstance(data.get("display"), dict) else {}
     unit = data.get("unit") or display.get("unit") or "kWh"
@@ -969,18 +1027,23 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
     timezone_name = range_info.get("timezone") or (arguments or {}).get("timezone") or "Asia/Kuala_Lumpur"
     fallback_year = datetime.now(timezone.utc).year
     requested_dates = requested_comparison_dates(message, fallback_year)
+    requested_months = requested_comparison_months(message, fallback_year)
     requested_date_set = set(requested_dates)
     has_specific_dates = bool(requested_date_set)
+    has_specific_months = bool(requested_months)
     lines = ["Site energy summary returned by Daxview MCP:"]
     summary_keys = ("total", "total_value", "value", "total_kwh", "consumption", "energy")
     total_value = next((data.get(key) for key in summary_keys if data.get(key) is not None), None)
-    if total_value is not None and not has_specific_dates:
+    if total_value is not None and not has_specific_dates and not has_specific_months:
         lines.append(f"Total: {format_number(total_value, precision)} {unit}.")
     buckets = data.get("buckets") or data.get("rows") or data.get("series") or data.get("data")
     daily_values = {}
     if isinstance(buckets, list) and buckets:
-        lines.append("Requested daily values:" if has_specific_dates else "Daily values:")
-        for item in buckets[:10]:
+        if has_specific_months:
+            lines.append("Requested monthly values:")
+        else:
+            lines.append("Requested daily values:" if has_specific_dates else "Daily values:")
+        for index, item in enumerate(buckets):
             if not isinstance(item, dict):
                 continue
             timestamp = item.get("timestamp") or item.get("bucket") or item.get("start") or item.get("date")
@@ -989,9 +1052,12 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
             value = item.get("value") if item.get("value") is not None else item.get("kwh")
             if isinstance(value, (int, float)):
                 daily_values[str(label)] = float(value)
+            if has_specific_months:
+                continue
             if has_specific_dates and str(label) not in requested_date_set:
                 continue
-            lines.append(f"- {label}: {format_number(value, precision)} {item.get('unit') or unit}")
+            if index < 10:
+                lines.append(f"- {label}: {format_number(value, precision)} {item.get('unit') or unit}")
     elif total_value is None:
         lines.append("No energy values were returned for this site and time range.")
     if "difference" in message.lower() and len(daily_values) >= 2:
@@ -1011,6 +1077,39 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
             else:
                 missing = [date for date, value in ((earlier_date, earlier_value), (later_date, later_value)) if value is None]
                 lines.append(f"Could not calculate the requested difference because no daily value was returned for {', '.join(missing)}.")
+    if has_specific_months and daily_values:
+        monthly_totals = {}
+        for label, value in daily_values.items():
+            try:
+                bucket_date = datetime.fromisoformat(label).date()
+            except ValueError:
+                continue
+            for month_name, month_start, month_end in requested_months:
+                if month_start <= bucket_date < month_end:
+                    monthly_totals[month_name] = monthly_totals.get(month_name, 0.0) + value
+        for month_name, _, _ in requested_months:
+            if month_name in monthly_totals:
+                lines.append(f"- {month_name}: {format_number(monthly_totals[month_name], precision)} {unit}")
+        if "difference" in message.lower() or "compare" in message.lower() or "between" in message.lower():
+            available = [(month_name, monthly_totals.get(month_name)) for month_name, _, _ in requested_months]
+            available = [(month_name, value) for month_name, value in available if value is not None]
+            if len(available) >= 2:
+                earlier_name, earlier_value = available[0]
+                later_name, later_value = available[1]
+                difference = later_value - earlier_value
+                direction = "higher" if difference > 0 else "lower" if difference < 0 else "the same"
+                percent = (difference / earlier_value * 100) if earlier_value else None
+                detail = (
+                    f"Difference: {later_name} was {format_number(abs(difference), precision)} {unit} "
+                    f"{direction} than {earlier_name}"
+                )
+                if percent is not None:
+                    detail += f" ({format_number(abs(percent), 2)}%)."
+                else:
+                    detail += "."
+                lines.append(detail)
+            else:
+                lines.append("Could not calculate the requested monthly difference because one of the month totals was not returned.")
     coverage_note = format_coverage_note(data)
     if coverage_note:
         lines.append(coverage_note)
@@ -1164,6 +1263,15 @@ def has_daxview_scope(message: str) -> bool:
     return any(re.search(pattern, lowered) for pattern in DAXVIEW_TARGET_SCOPE_PATTERNS)
 
 
+def needs_device_choice(message: str) -> bool:
+    lowered = message.lower()
+    if "device" not in lowered:
+        return False
+    if any(phrase in lowered for phrase in ("all devices", "every device", "top devices")):
+        return False
+    return not any(re.search(pattern, lowered) for pattern in (r"\bdevice\s*[:#-]\s*[\w.-]+", r"\bumg[\s-]?\d+\b"))
+
+
 def daxview_clarification_needed(message: str, tools: list[str]) -> bool:
     if not tools:
         return False
@@ -1172,10 +1280,14 @@ def daxview_clarification_needed(message: str, tools: list[str]) -> bool:
     lowered = message.lower()
     if any(phrase in lowered for phrase in ("how many", "count", "list", "show all", "all daxview")):
         return False
+    if needs_device_choice(message):
+        return True
     return not has_daxview_scope(message)
 
 
 def build_daxview_clarification(message: str, tools: list[str]) -> str:
+    if needs_device_choice(message):
+        return "Which device should I use for this energy consumption request? Choose a specific device, or say all devices if you want the whole site."
     if "telemetry_top_consumers" in tools:
         return "Choose a Daxview site and time range before I check top energy consumers."
     if "site_energy_summary" in tools:
