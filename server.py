@@ -846,6 +846,21 @@ def format_number(value, precision: int = 2) -> str:
     return str(value)
 
 
+def requested_energy_unit(message: str, source_unit: str) -> tuple[float, str, int]:
+    lowered = message.lower()
+    if "mwh" in lowered or "megawatt-hour" in lowered or "megawatt hour" in lowered or "mkh" in lowered:
+        return 1000.0, "MWh", 2
+    if "million" in lowered:
+        return 1_000_000.0, f"million {source_unit}", 4
+    return 1.0, source_unit, 2
+
+
+def format_energy_value(value, factor: float, unit: str, precision: int) -> str:
+    if not isinstance(value, (int, float)):
+        return f"{format_number(value, precision)} {unit}"
+    return f"{format_number(value / factor, precision)} {unit}"
+
+
 def format_coverage_note(data: dict) -> str | None:
     coverage = data.get("coverage")
     if not isinstance(coverage, dict):
@@ -1039,6 +1054,8 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
     display = data.get("display") if isinstance(data.get("display"), dict) else {}
     unit = data.get("unit") or display.get("unit") or "kWh"
     precision = int(display.get("precision") if isinstance(display.get("precision"), int) else 2)
+    conversion_factor, display_unit, display_precision = requested_energy_unit(message, unit)
+    precision = display_precision if conversion_factor != 1.0 else precision
     range_info = data.get("range") if isinstance(data.get("range"), dict) else {}
     timezone_name = range_info.get("timezone") or (arguments or {}).get("timezone") or "Asia/Kuala_Lumpur"
     fallback_year = datetime.now(timezone.utc).year
@@ -1052,7 +1069,7 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
     summary_keys = ("total", "total_value", "value", "total_kwh", "consumption", "energy")
     total_value = next((data.get(key) for key in summary_keys if data.get(key) is not None), None)
     if total_value is not None and not has_specific_dates and not has_specific_months:
-        lines.append(f"Total: {format_number(total_value, precision)} {unit}.")
+        lines.append(f"Total: {format_energy_value(total_value, conversion_factor, display_unit, precision)}.")
     buckets = data.get("buckets") or data.get("rows") or data.get("series") or data.get("data")
     daily_values = {}
     if isinstance(buckets, list) and buckets:
@@ -1074,7 +1091,9 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
             if has_specific_dates and not include_range_summary and str(label) not in requested_date_set:
                 continue
             if index < 10:
-                lines.append(f"- {label}: {format_number(value, precision)} {item.get('unit') or unit}")
+                row_unit = item.get("unit") or unit
+                row_factor, row_display_unit, row_precision = requested_energy_unit(message, row_unit)
+                lines.append(f"- {label}: {format_energy_value(value, row_factor, row_display_unit, row_precision if row_factor != 1.0 else precision)}")
     elif total_value is None:
         lines.append("No energy values were returned for this site and time range.")
     wants_difference = any(phrase in message.lower() for phrase in ("difference", "compare", "comparison", "between"))
@@ -1088,9 +1107,10 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
                 difference = later_value - earlier_value
                 direction = "higher" if difference > 0 else "lower" if difference < 0 else "the same"
                 lines.append(
-                    f"Difference: {later_date} was {format_number(abs(difference), precision)} {unit} "
+                    f"Difference: {later_date} was {format_energy_value(abs(difference), conversion_factor, display_unit, precision)} "
                     f"{direction} than {earlier_date} "
-                    f"({format_number(later_value, precision)} - {format_number(earlier_value, precision)} {unit})."
+                    f"({format_energy_value(later_value, conversion_factor, display_unit, precision)} - "
+                    f"{format_energy_value(earlier_value, conversion_factor, display_unit, precision)})."
                 )
             else:
                 missing = [date for date, value in ((earlier_date, earlier_value), (later_date, later_value)) if value is None]
@@ -1107,7 +1127,7 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
                     monthly_totals[month_name] = monthly_totals.get(month_name, 0.0) + value
         for month_name, _, _ in requested_months:
             if month_name in monthly_totals:
-                lines.append(f"- {month_name}: {format_number(monthly_totals[month_name], precision)} {unit}")
+                lines.append(f"- {month_name}: {format_energy_value(monthly_totals[month_name], conversion_factor, display_unit, precision)}")
         if "difference" in message.lower() or "compare" in message.lower() or "between" in message.lower():
             available = [(month_name, monthly_totals.get(month_name)) for month_name, _, _ in requested_months]
             available = [(month_name, value) for month_name, value in available if value is not None]
@@ -1118,7 +1138,7 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
                 direction = "higher" if difference > 0 else "lower" if difference < 0 else "the same"
                 percent = (difference / earlier_value * 100) if earlier_value else None
                 detail = (
-                    f"Difference: {later_name} was {format_number(abs(difference), precision)} {unit} "
+                    f"Difference: {later_name} was {format_energy_value(abs(difference), conversion_factor, display_unit, precision)} "
                     f"{direction} than {earlier_name}"
                 )
                 if percent is not None:
@@ -1219,6 +1239,10 @@ FOLLOW_UP_PHRASES = (
     "regarding your explanation",
     "regarding ur explanation",
     "continue",
+    "convert",
+    "change the unit",
+    "bigger unit",
+    "larger unit",
     "breakdown",
     "this calculation",
     "breakdown of this calculation",
