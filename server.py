@@ -644,6 +644,27 @@ def default_historical_range() -> dict:
     }
 
 
+def relative_historical_range(message: str) -> tuple[datetime, datetime] | None:
+    lowered = message.lower()
+    end = datetime.now(timezone.utc)
+    match = re.search(r"\b(?:last\s+|for\s+)?(\d{1,3})\s*(day|days|week|weeks|month|months)\b", lowered)
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = match.group(2)
+    if unit.startswith("week"):
+        days = amount * 7
+    elif unit.startswith("month"):
+        days = amount * 30
+    else:
+        days = amount
+    return end - timedelta(days=max(days, 1)), end
+
+
+def wants_relative_summary(message: str) -> bool:
+    return relative_historical_range(message) is not None
+
+
 def requested_month_ranges(message: str, fallback_year: int) -> list[tuple[date, date]]:
     lowered = message.lower()
     ranges = []
@@ -672,8 +693,11 @@ def requested_historical_range(message: str) -> dict:
     lowered = message.lower()
     end = datetime.now(timezone.utc)
     requested_dates = requested_comparison_dates(message, end.year)
-    requested_months = requested_month_ranges(message, end.year)
-    if requested_dates:
+    requested_months = [] if requested_dates else requested_month_ranges(message, end.year)
+    relative_range = relative_historical_range(message)
+    if requested_dates and relative_range:
+        start, end = relative_range
+    elif requested_dates:
         parsed_dates = [datetime.fromisoformat(date).date() for date in requested_dates]
         start_date = min(parsed_dates)
         end_date = max(parsed_dates)
@@ -691,18 +715,10 @@ def requested_historical_range(message: str) -> dict:
         start = today_start - timedelta(days=1)
         end = today_start
     else:
-        match = re.search(r"\b(?:last\s+|for\s+)?(\d{1,3})\s*(day|days|week|weeks|month|months)\b", lowered)
-        if not match:
+        relative_range = relative_historical_range(message)
+        if not relative_range:
             return default_historical_range()
-        amount = int(match.group(1))
-        unit = match.group(2)
-        if unit.startswith("week"):
-            days = amount * 7
-        elif unit.startswith("month"):
-            days = amount * 30
-        else:
-            days = amount
-        start = end - timedelta(days=max(days, 1))
+        start, end = relative_range
     return {
         "start": start.isoformat(),
         "end": end.isoformat(),
@@ -1027,10 +1043,11 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
     timezone_name = range_info.get("timezone") or (arguments or {}).get("timezone") or "Asia/Kuala_Lumpur"
     fallback_year = datetime.now(timezone.utc).year
     requested_dates = requested_comparison_dates(message, fallback_year)
-    requested_months = requested_comparison_months(message, fallback_year)
+    requested_months = [] if requested_dates else requested_comparison_months(message, fallback_year)
     requested_date_set = set(requested_dates)
     has_specific_dates = bool(requested_date_set)
     has_specific_months = bool(requested_months)
+    include_range_summary = wants_relative_summary(message)
     lines = ["Site energy summary returned by Daxview MCP:"]
     summary_keys = ("total", "total_value", "value", "total_kwh", "consumption", "energy")
     total_value = next((data.get(key) for key in summary_keys if data.get(key) is not None), None)
@@ -1042,7 +1059,7 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
         if has_specific_months:
             lines.append("Requested monthly values:")
         else:
-            lines.append("Requested daily values:" if has_specific_dates else "Daily values:")
+            lines.append("Daily values:" if include_range_summary else "Requested daily values:" if has_specific_dates else "Daily values:")
         for index, item in enumerate(buckets):
             if not isinstance(item, dict):
                 continue
@@ -1054,7 +1071,7 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
                 daily_values[str(label)] = float(value)
             if has_specific_months:
                 continue
-            if has_specific_dates and str(label) not in requested_date_set:
+            if has_specific_dates and not include_range_summary and str(label) not in requested_date_set:
                 continue
             if index < 10:
                 lines.append(f"- {label}: {format_number(value, precision)} {item.get('unit') or unit}")
@@ -1202,6 +1219,13 @@ FOLLOW_UP_PHRASES = (
     "regarding ur explanation",
     "continue",
     "breakdown",
+    "this calculation",
+    "breakdown of this calculation",
+    "calculation breakdown",
+    "how did you calculate",
+    "how you calculated",
+    "show calculation",
+    "show me calculation",
     "more explanation",
 )
 
