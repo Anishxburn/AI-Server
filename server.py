@@ -1192,7 +1192,67 @@ def summarize_historical_answers(
     return "\n\n".join(sections)
 
 
+FOLLOW_UP_PHRASES = (
+    "more detail",
+    "more details",
+    "explain more",
+    "why",
+    "what do you mean",
+    "regarding your explanation",
+    "regarding ur explanation",
+    "continue",
+    "breakdown",
+    "more explanation",
+)
+
+
+def is_follow_up_message(message: str) -> bool:
+    lowered = message.lower().strip()
+    return any(phrase in lowered for phrase in FOLLOW_UP_PHRASES)
+
+
+def previous_daxview_turn(conversation_id: str, current_turn_id: str) -> dict | None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, user_message, context
+                FROM daxview_turns
+                WHERE conversation_id = %s AND id <> %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (conversation_id, current_turn_id),
+            )
+            row = cur.fetchone()
+    return row if row else None
+
+
+def resolve_follow_up_message(turn_id: str, message: str, context: dict, conversation_id: str, request_id: str) -> tuple[str, dict]:
+    if not is_follow_up_message(message):
+        return message, context
+    previous = previous_daxview_turn(conversation_id, turn_id)
+    if not previous or not previous.get("user_message"):
+        return message, context
+    previous_message = str(previous["user_message"])
+    previous_context = previous.get("context") if isinstance(previous.get("context"), dict) else {}
+    merged_context = {**previous_context, **context}
+    resolved = (
+        "Provide a more detailed EMS breakdown and explanation for this previous request: "
+        f"{previous_message}. "
+        f"Follow-up request: {message}"
+    )
+    log_event(
+        "daxview_follow_up_resolved",
+        request_id=request_id,
+        turn_id=turn_id,
+        previous_turn_id=str(previous.get("id")),
+    )
+    return resolved, merged_context
+
+
 def run_daxview_integration_turn(turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> dict:
+    message, context = resolve_follow_up_message(turn_id, message, context, session_id, request_id)
     operation_ids = select_historical_operations(message)
     if not operation_ids:
         return langchain_chat_response(message, request_id, session_id)
