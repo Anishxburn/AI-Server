@@ -647,7 +647,7 @@ def default_historical_range() -> dict:
 def relative_historical_range(message: str) -> tuple[datetime, datetime] | None:
     lowered = message.lower()
     end = datetime.now(timezone.utc)
-    match = re.search(r"\b(?:last\s+|for\s+)?(\d{1,3})\s*(day|days|week|weeks|month|months)\b", lowered)
+    match = re.search(r"\b(?:last\s+|for\s+)?(\d{1,3})\s*[- ]?\s*(day|days|week|weeks|month|months)\b", lowered)
     if not match:
         return None
     amount = int(match.group(1))
@@ -1077,7 +1077,8 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
                 lines.append(f"- {label}: {format_number(value, precision)} {item.get('unit') or unit}")
     elif total_value is None:
         lines.append("No energy values were returned for this site and time range.")
-    if "difference" in message.lower() and len(daily_values) >= 2:
+    wants_difference = any(phrase in message.lower() for phrase in ("difference", "compare", "comparison", "between"))
+    if wants_difference and len(daily_values) >= 2:
         dates = requested_dates
         if len(dates) >= 2:
             earlier_date, later_date = sorted(dates[:2])
