@@ -1047,6 +1047,12 @@ def first_dict_with_list(value, list_keys: tuple[str, ...]) -> dict | None:
 def historical_result_data(mcp_result: dict, list_keys: tuple[str, ...] = ("rows", "items", "results", "data")) -> dict:
     structured = mcp_structured_result(mcp_result)
     data = structured.get("data")
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        nested = dict(data["data"])
+        for key in ("site", "building", "device", "success"):
+            if key in data and key not in nested:
+                nested[key] = data[key]
+        return nested
     if isinstance(data, dict) and (data or any(isinstance(data.get(key), list) for key in list_keys)):
         return data
     found = first_dict_with_list(structured, list_keys)
@@ -1433,6 +1439,49 @@ def summarize_alarm_frequency(data: dict) -> str:
     return "\n".join(lines)
 
 
+def summarize_active_alarms(data: dict) -> str:
+    site = data.get("site") if isinstance(data.get("site"), dict) else {}
+    alarms = data.get("alarms") if isinstance(data.get("alarms"), list) else []
+    lines = ["Active alarm summary returned by DaxView MCP:"]
+    if site.get("name"):
+        lines.append(f"Site: {site.get('name')} (ID {site.get('id', 'unknown')})")
+    lines.append(f"Active alarms: {format_number(data.get('active_count'), 0)}")
+    lines.append(f"Critical alarms: {format_number(data.get('critical_count'), 0)}")
+    lines.append(f"Warning alarms: {format_number(data.get('warning_count'), 0)}")
+    if alarms:
+        lines.append("Latest active alarms:")
+        for index, alarm in enumerate(alarms[:10], 1):
+            if not isinstance(alarm, dict):
+                continue
+            lines.append(
+                f"{index}. {alarm.get('alarm_name', 'Alarm')} | "
+                f"{alarm.get('severity', 'unknown')} | "
+                f"{alarm.get('device_name') or 'unknown device'} | "
+                f"started {alarm.get('started_at') or 'unknown time'}"
+            )
+    return "\n".join(lines)
+
+
+def summarize_site_metadata(data: dict) -> str:
+    site = data.get("site") if isinstance(data.get("site"), dict) else data
+    buildings = data.get("buildings") if isinstance(data.get("buildings"), list) else []
+    lines = ["Site metadata summary returned by DaxView MCP:"]
+    if site.get("name"):
+        lines.append(f"Site: {site.get('name')} (ID {site.get('id', site.get('site_id', 'unknown'))})")
+    for key in ("timezone", "country", "currency", "address", "market"):
+        if site.get(key):
+            lines.append(f"{key}: {site.get(key)}")
+    for key in ("building_count", "device_count", "meter_count"):
+        if data.get(key) is not None:
+            lines.append(f"{key}: {data.get(key)}")
+    if buildings:
+        lines.append("Buildings:")
+        for index, building in enumerate(buildings[:10], 1):
+            if isinstance(building, dict):
+                lines.append(f"{index}. {building.get('name') or building.get('building_name')} (ID {building.get('id', building.get('building_id', 'unknown'))})")
+    return "\n".join(lines)
+
+
 def summarize_generic_tool(operation_id: str, data: dict) -> str:
     title = operation_id.replace("_", " ").title()
     lines = [f"{title} returned by DaxView MCP:"]
@@ -1522,6 +1571,10 @@ def summarize_historical_answer(
         return summarize_site_energy(data, message, arguments)
     if operation_id == "alarm_frequency_summary":
         return summarize_alarm_frequency(data)
+    if operation_id == "active_alarm_summary":
+        return summarize_active_alarms(data)
+    if operation_id == "site_metadata_summary":
+        return summarize_site_metadata(data)
     if operation_id in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
         return summarize_generic_tool(operation_id, data)
     context = {
