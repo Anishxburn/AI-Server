@@ -107,6 +107,29 @@ DAXVIEW_SCOPE_REQUIRED_TOOLS = {
     "alarm_frequency_summary",
 }
 
+ENERGY_COMPLIANCE_CONTEXT = [
+    {
+        "label": "Data protocol",
+        "standard": "Janitza UMG / Modbus, BACnet, SNMP",
+        "note": "Janitza UMG devices commonly expose measured values through Modbus RTU/TCP, optional BACnet/IP, SNMP, and related Ethernet services depending on model and license.",
+    },
+    {
+        "label": "Energy management",
+        "standard": "ISO 50001 / ISO 50006",
+        "note": "kWh consumption can be used for an EnMS, energy baseline, and EnPI tracking, but ISO conformity belongs to the management process, not to one isolated reading.",
+    },
+    {
+        "label": "Metering accuracy",
+        "standard": "IEC 62053 series / device active-energy class",
+        "note": "Active-energy accuracy depends on the meter model, CT/PT setup, calibration, and rated class; treat reported kWh as meter data unless calibration evidence is available.",
+    },
+    {
+        "label": "Power quality context",
+        "standard": "IEC 61000-4-30 / IEEE 1159",
+        "note": "These are relevant when the same device data is used for voltage sag, swell, interruption, harmonics, or disturbance analysis rather than simple consumption totals.",
+    },
+]
+
 DAXVIEW_GLOBAL_SCOPE_PHRASES = {
     "all", "overall", "global", "entire", "every", "current", "today",
     "now", "latest", "system wide", "system-wide", "whole site",
@@ -876,6 +899,43 @@ def format_coverage_note(data: dict) -> str | None:
     )
 
 
+def build_compliance_context(message: str = "", operation_ids: list[str] | None = None) -> list[dict]:
+    lowered = message.lower()
+    operation_ids = operation_ids or []
+    wants_energy = (
+        "site_energy_summary" in operation_ids
+        or any(term in lowered for term in ("kwh", "energy", "consumption", "usage", "enpi", "baseline"))
+    )
+    wants_power_quality = any(
+        term in lowered
+        for term in ("sag", "dip", "swell", "transient", "harmonic", "thd", "flicker", "power quality")
+    )
+    wants_protocol = any(term in lowered for term in ("janitza", "umg", "protocol", "modbus", "bacnet", "snmp"))
+    context = []
+    for item in ENERGY_COMPLIANCE_CONTEXT:
+        standard = item["standard"].lower()
+        if "power quality" in item["label"].lower() and not wants_power_quality:
+            continue
+        if "data protocol" in item["label"].lower() and not (wants_protocol or wants_energy):
+            continue
+        if wants_energy or ("iso" in standard and ("iso" in lowered or "enpi" in lowered or "baseline" in lowered)):
+            context.append(item)
+        elif wants_protocol and "janitza" in standard:
+            context.append(item)
+        elif wants_power_quality and ("iec 61000" in standard or "ieee" in standard):
+            context.append(item)
+    return context
+
+
+def format_compliance_context(context: list[dict]) -> str:
+    if not context:
+        return ""
+    lines = ["Applicable protocol / standards context:"]
+    for item in context:
+        lines.append(f"- {item['label']}: {item['standard']} - {item['note']}")
+    return "\n".join(lines)
+
+
 def parse_datetime(value) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -1151,6 +1211,10 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
     coverage_note = format_coverage_note(data)
     if coverage_note:
         lines.append(coverage_note)
+    compliance_note = format_compliance_context(build_compliance_context(message, ["site_energy_summary"]))
+    if compliance_note:
+        lines.append("")
+        lines.append(compliance_note)
     return "\n".join(lines)
 
 
@@ -1781,6 +1845,7 @@ Keep the final answer simple and compact: maximum 5 short bullets or 1 short par
 Use the EMS library context when relevant. If the context is insufficient, say what is missing and give a cautious EMS-focused answer.
 Use historical Daxview data when it is provided. If a Daxview tool failed, say historical Daxview data is currently unavailable for that part.
 For ranked historical answers, number the result from 1 to last, include the time window, and omit internal fields such as source_count, raw row_count, aggregation names, backend endpoints, and last_updated unless the user explicitly asks for diagnostics.
+When explaining kWh or consumption compliance, distinguish data protocols from standards: protocols such as Modbus, BACnet, and SNMP describe data transport; ISO 50001/50006 describe energy-management baselines and EnPIs; IEC meter standards and device active-energy class describe measurement accuracy. Do not claim a reading is certified or in accordance with a standard unless source data proves that certification, calibration, and device configuration.
 For Janitza UMG device, voltage sag, power quality, alarm, THD, or meter troubleshooting questions, prioritize likely root causes, what readings to check, and practical EMS investigation steps.
 If the user says "main cost" in a voltage sag or fault context, treat it as possibly meaning "main cause" and clarify both cause and cost impact briefly.
 Do not answer unrelated general questions.
@@ -1845,6 +1910,7 @@ Answer only from this role. Keep it to 3 compact bullets.
 Use historical Daxview MCP data when provided. If historical data conflicts with assumptions, historical data wins.
 For historical read-only questions such as top consumers, site energy summary, or alarm frequency summary, report the MCP facts directly. Do not reject approved historical data requests as unsafe.
 For ranked historical answers, number from 1 to last, include the time window, and skip internal metadata like source_count, raw row_count, aggregation, backend endpoint, and last_updated unless asked.
+When discussing kWh compliance, say protocols such as Modbus, BACnet, and SNMP are data transport/integration protocols, while ISO 50001/50006 are EnMS baseline/EnPI frameworks and IEC meter standards/device class are measurement-accuracy context. Do not overclaim certification without explicit evidence.
 If this is about voltage sag, list likely causes first, then readings/checks.
 Use DIRECT REJECTION only when the user asks for a physical action that would exceed rated limits, bypass alarms, increase unsafe load, or override protection.
 
@@ -2172,12 +2238,14 @@ def langchain_chat_response(message: str, request_id: str, session_id: str | Non
             "started_at": time.perf_counter(),
         }
     )
+    selected_tools = state.get("selected_tools") or []
     return {
         "reply": state["reply"],
         "provider": state.get("provider"),
         "model": state.get("model"),
         "is_ems_related": state.get("is_ems_related"),
         "sources": state.get("sources") or [],
+        "compliance_context": build_compliance_context(message, selected_tools),
         "agent_trace": state.get("agent_trace") or [],
         "daxview_mcp": state.get("mcp_context"),
         "mcp_summary": format_daxview_context(state.get("mcp_context") or {}),
@@ -2197,6 +2265,7 @@ def langchain_multi_agent_response(message: str, request_id: str) -> dict:
         }
     )
     duration_ms = round((time.perf_counter() - started_at) * 1000)
+    selected_tools = state.get("selected_tools") or []
     return {
         "reply": state["reply"],
         "provider": state.get("provider"),
@@ -2204,6 +2273,7 @@ def langchain_multi_agent_response(message: str, request_id: str) -> dict:
         "decision_model": state.get("decision_model") or state.get("model"),
         "is_ems_related": state.get("is_ems_related"),
         "sources": state.get("sources") or [],
+        "compliance_context": build_compliance_context(message, selected_tools),
         "agent_discussion": state.get("agent_answers") or [],
         "agent_trace": state.get("agent_trace") or [],
         "daxview_mcp": state.get("mcp_context"),
