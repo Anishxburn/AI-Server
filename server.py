@@ -936,24 +936,6 @@ def format_compliance_context(context: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def general_ems_fallback_answer(message: str, operation_ids: list[str] | None = None) -> str | None:
-    compliance_context = build_compliance_context(message, operation_ids)
-    if not compliance_context:
-        return None
-    lowered = message.lower()
-    if not any(term in lowered for term in ("standard", "iso", "iec", "ieee", "protocol", "compliance", "accordance", "janitza", "umg", "kwh")):
-        return None
-    lines = [
-        "General EMS answer: I can explain the applicable protocol and standards context, but I cannot confirm this specific reading is compliant without the device model, CT/PT configuration, calibration record, and source evidence.",
-        "",
-        format_compliance_context(compliance_context),
-    ]
-    if "12500" in lowered or "kwh" in lowered:
-        lines.append("")
-        lines.append("For example, a 12500 kWh value is an energy-consumption reading. The transport protocol may be Modbus/BACnet/SNMP, ISO 50001/50006 can use the value for EnPI or baseline tracking, and IEC meter accuracy depends on the meter class and installation details.")
-    return "\n".join(lines)
-
-
 def parse_datetime(value) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -1860,7 +1842,7 @@ def build_prompt(message: str, contexts: list[dict], mcp_context: dict | None = 
     return f"""You are an Energy Management System specialist.
 Answer only EMS, energy management, ISO 50001, IEC, IEEE, power monitoring, metering, tariff, demand, and electrical energy questions.
 Keep the final answer simple and compact: maximum 5 short bullets or 1 short paragraph.
-Use the EMS library context when relevant. If the context is insufficient, say what is missing and give a cautious EMS-focused answer.
+Use the EMS library context when relevant. If no matching EMS library context is found, still answer the EMS question using general domain knowledge, and clearly state when site-specific proof, device configuration, calibration, or source evidence is missing.
 Use historical Daxview data when it is provided. If a Daxview tool failed, say historical Daxview data is currently unavailable for that part.
 For ranked historical answers, number the result from 1 to last, include the time window, and omit internal fields such as source_count, raw row_count, aggregation names, backend endpoints, and last_updated unless the user explicitly asks for diagnostics.
 When explaining kWh or consumption compliance, distinguish data protocols from standards: protocols such as Modbus, BACnet, and SNMP describe data transport; ISO 50001/50006 describe energy-management baselines and EnPIs; IEC meter standards and device active-energy class describe measurement accuracy. Do not claim a reading is certified or in accordance with a standard unless source data proves that certification, calibration, and device configuration.
@@ -1925,6 +1907,7 @@ Role: {role}
 {MATH_DOCTRINE}
 
 Answer only from this role. Keep it to 3 compact bullets.
+If no matching EMS library context is found, still answer from general EMS domain knowledge and state what cannot be confirmed from site/device evidence.
 Use historical Daxview MCP data when provided. If historical data conflicts with assumptions, historical data wins.
 For historical read-only questions such as top consumers, site energy summary, or alarm frequency summary, report the MCP facts directly. Do not reject approved historical data requests as unsafe.
 For ranked historical answers, number from 1 to last, include the time window, and skip internal metadata like source_count, raw row_count, aggregation, backend endpoint, and last_updated unless asked.
@@ -2126,28 +2109,6 @@ def langchain_direct_mcp_answer(state: dict) -> dict:
     return state
 
 
-def langchain_general_fallback_answer(state: dict) -> dict:
-    if state.get("reply") or not state.get("is_ems_related"):
-        return state
-    if state.get("contexts") or (state.get("mcp_context") or {}).get("results"):
-        return state
-    fallback = general_ems_fallback_answer(state["message"], state.get("selected_tools") or [])
-    if fallback:
-        state["reply"] = fallback
-        state["provider"] = "ems-general-fallback"
-        state["model"] = None
-        state["decision_model"] = "Deterministic EMS general fallback"
-        state["agent_answers"] = [
-            {
-                "agent": "EMS General Fallback",
-                "role": "Answer general EMS standards/protocol questions when no library or Daxview data is available.",
-                "model": "deterministic",
-                "answer": fallback,
-            }
-        ]
-    return state
-
-
 def langchain_generate_chat_answer(state: dict) -> dict:
     if state.get("reply") or not state.get("is_ems_related"):
         return state
@@ -2254,7 +2215,6 @@ CHAT_LANGCHAIN = (
     | RunnableLambda(langchain_classify_and_validate)
     | RunnableLambda(langchain_retrieve_context)
     | RunnableLambda(langchain_direct_mcp_answer)
-    | RunnableLambda(langchain_general_fallback_answer)
     | RunnableLambda(langchain_generate_chat_answer)
     | RunnableLambda(langchain_persist_and_trace)
 )
@@ -2264,7 +2224,6 @@ MULTI_AGENT_LANGCHAIN = (
     | RunnableLambda(langchain_classify_and_validate)
     | RunnableLambda(langchain_retrieve_context)
     | RunnableLambda(langchain_direct_mcp_answer)
-    | RunnableLambda(langchain_general_fallback_answer)
     | RunnableLambda(langchain_generate_multi_agent_answer)
     | RunnableLambda(langchain_persist_and_trace)
 )
