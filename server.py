@@ -936,6 +936,24 @@ def format_compliance_context(context: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def general_ems_fallback_answer(message: str, operation_ids: list[str] | None = None) -> str | None:
+    compliance_context = build_compliance_context(message, operation_ids)
+    if not compliance_context:
+        return None
+    lowered = message.lower()
+    if not any(term in lowered for term in ("standard", "iso", "iec", "ieee", "protocol", "compliance", "accordance", "janitza", "umg", "kwh")):
+        return None
+    lines = [
+        "General EMS answer: I can explain the applicable protocol and standards context, but I cannot confirm this specific reading is compliant without the device model, CT/PT configuration, calibration record, and source evidence.",
+        "",
+        format_compliance_context(compliance_context),
+    ]
+    if "12500" in lowered or "kwh" in lowered:
+        lines.append("")
+        lines.append("For example, a 12500 kWh value is an energy-consumption reading. The transport protocol may be Modbus/BACnet/SNMP, ISO 50001/50006 can use the value for EnPI or baseline tracking, and IEC meter accuracy depends on the meter class and installation details.")
+    return "\n".join(lines)
+
+
 def parse_datetime(value) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
@@ -2108,6 +2126,28 @@ def langchain_direct_mcp_answer(state: dict) -> dict:
     return state
 
 
+def langchain_general_fallback_answer(state: dict) -> dict:
+    if state.get("reply") or not state.get("is_ems_related"):
+        return state
+    if state.get("contexts") or (state.get("mcp_context") or {}).get("results"):
+        return state
+    fallback = general_ems_fallback_answer(state["message"], state.get("selected_tools") or [])
+    if fallback:
+        state["reply"] = fallback
+        state["provider"] = "ems-general-fallback"
+        state["model"] = None
+        state["decision_model"] = "Deterministic EMS general fallback"
+        state["agent_answers"] = [
+            {
+                "agent": "EMS General Fallback",
+                "role": "Answer general EMS standards/protocol questions when no library or Daxview data is available.",
+                "model": "deterministic",
+                "answer": fallback,
+            }
+        ]
+    return state
+
+
 def langchain_generate_chat_answer(state: dict) -> dict:
     if state.get("reply") or not state.get("is_ems_related"):
         return state
@@ -2214,6 +2254,7 @@ CHAT_LANGCHAIN = (
     | RunnableLambda(langchain_classify_and_validate)
     | RunnableLambda(langchain_retrieve_context)
     | RunnableLambda(langchain_direct_mcp_answer)
+    | RunnableLambda(langchain_general_fallback_answer)
     | RunnableLambda(langchain_generate_chat_answer)
     | RunnableLambda(langchain_persist_and_trace)
 )
@@ -2223,6 +2264,7 @@ MULTI_AGENT_LANGCHAIN = (
     | RunnableLambda(langchain_classify_and_validate)
     | RunnableLambda(langchain_retrieve_context)
     | RunnableLambda(langchain_direct_mcp_answer)
+    | RunnableLambda(langchain_general_fallback_answer)
     | RunnableLambda(langchain_generate_multi_agent_answer)
     | RunnableLambda(langchain_persist_and_trace)
 )
