@@ -56,6 +56,21 @@ DAXVIEW_ALLOWED_HISTORICAL_TOOLS = {
     "telemetry_top_consumers",
     "site_energy_summary",
     "alarm_frequency_summary",
+    "site_metadata_summary",
+    "site_device_list",
+    "telemetry_timeseries",
+    "active_alarm_summary",
+    "meter_status_summary",
+    "energy_comparison_summary",
+    "data_availability_summary",
+    "alarm_detail_lookup",
+    "power_quality_summary",
+    "demand_peak_summary",
+    "tariff_cost_summary",
+    "device_energy_breakdown",
+    "energy_forecast",
+    "anomaly_detection_summary",
+    "report_summary",
 }
 DAXVIEW_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=AI_JOB_WORKERS)
 TRACES = deque(maxlen=TRACE_LIMIT)
@@ -99,12 +114,69 @@ DAXVIEW_TOOL_KEYWORDS = {
         "alarm frequency", "frequent alarm", "most alarms", "alarm summary",
         "alarm history", "repeated alarms", "historical alarms",
     },
+    "site_metadata_summary": {
+        "what site", "current site", "site details", "details about this site",
+        "site metadata", "site context", "buildings under this site",
+    },
+    "site_device_list": {
+        "list all devices", "devices under this site", "all meters", "installed meters",
+        "device list", "meters in this building", "devices have data",
+    },
+    "telemetry_timeseries": {
+        "trend", "timeseries", "time series", "chart", "plot", "hourly",
+        "voltage trend", "power factor", "thd trend", "kwh trend",
+    },
+    "active_alarm_summary": {
+        "active alarm", "active alarms", "current alarm", "current alarms",
+        "open alarm", "open alarms", "unresolved alarm", "critical alarms",
+    },
+    "meter_status_summary": {
+        "offline meter", "offline meters", "meter status", "device status",
+        "stale data", "reporting data", "all devices reporting",
+    },
+    "energy_comparison_summary": {
+        "compare energy", "compare usage", "compare consumption", "this week and last week",
+        "august and september", "today vs yesterday", "versus",
+    },
+    "data_availability_summary": {
+        "data coverage", "missing data", "no energy data", "data availability",
+        "data complete", "missing energy",
+    },
+    "alarm_detail_lookup": {
+        "alarm id", "alarm detail", "alarm details", "explain this alarm",
+        "latest voltage sag alarm", "what caused the alarm",
+    },
+    "power_quality_summary": {
+        "power quality", "voltage sag", "voltage swell", "thd", "power factor",
+        "unbalance", "imbalance",
+    },
+    "demand_peak_summary": {
+        "peak demand", "maximum demand", "highest demand", "demand limit",
+        "exceed demand",
+    },
+    "tariff_cost_summary": {
+        "tariff", "energy cost", "electricity cost", "billing cost",
+        "cost summary",
+    },
+    "device_energy_breakdown": {
+        "energy breakdown", "break down", "contribution by device",
+        "energy share", "by device", "by building",
+    },
+    "energy_forecast": {
+        "forecast", "predict", "prediction", "next 7 days", "tomorrow",
+        "expected usage",
+    },
+    "anomaly_detection_summary": {
+        "anomaly", "abnormal", "unusual", "suspicious", "detect abnormal",
+    },
+    "report_summary": {
+        "report", "management summary", "weekly ems report", "monthly report",
+        "ems health summary",
+    },
 }
 
 DAXVIEW_SCOPE_REQUIRED_TOOLS = {
-    "telemetry_top_consumers",
-    "site_energy_summary",
-    "alarm_frequency_summary",
+    *DAXVIEW_ALLOWED_HISTORICAL_TOOLS,
 }
 
 ENERGY_COMPLIANCE_CONTEXT = [
@@ -613,48 +685,50 @@ def select_historical_operation(message: str) -> str | None:
 def select_historical_operations(message: str) -> list[str]:
     lowered = message.lower()
     operations = []
-    if any(
-        phrase in lowered
-        for phrase in (
-            "top consumer",
-            "top consumers",
-            "top consuming",
-            "energy-consuming",
-            "energy consuming",
-            "top 5",
-            "top five",
-            "top devices",
-            "most energy",
-            "highest usage",
-            "highest consumption",
-            "largest load",
-            "biggest consumer",
-        )
-    ):
-        operations.append("telemetry_top_consumers")
-    if any(
-        phrase in lowered
-        for phrase in (
-            "energy summary",
-            "site energy",
-            "usage trend",
-            "consumption trend",
-            "kwh summary",
-            "energy consumption",
-            "consumption",
-            "usage",
-            "difference in energy",
-            "energy difference",
-        )
-    ) or (
-        any(word in lowered for word in ("energy", "kwh", "consumption", "usage"))
+    for tool_name, phrases in DAXVIEW_TOOL_KEYWORDS.items():
+        if any(phrase in lowered for phrase in phrases):
+            operations.append(tool_name)
+    if (
+        "site_energy_summary" not in operations
+        and "energy_comparison_summary" not in operations
+        and any(word in lowered for word in ("energy", "kwh", "consumption", "usage"))
         and any(word in lowered for word in ("compare", "comparison", "difference", "between"))
-        and any(month in lowered for month in MONTH_NAMES)
     ):
-        operations.append("site_energy_summary")
-    if any(phrase in lowered for phrase in ("alarm frequency", "frequent alarm", "most alarms", "alarm summary")):
-        operations.append("alarm_frequency_summary")
-    return operations
+        operations.append("energy_comparison_summary")
+    if "report_summary" in operations:
+        for tool_name in ("site_energy_summary", "telemetry_top_consumers", "alarm_frequency_summary"):
+            if tool_name in operations:
+                operations.remove(tool_name)
+    deduped = []
+    for operation in operations:
+        if operation not in deduped:
+            deduped.append(operation)
+    return deduped[:4]
+
+
+def first_regex_int(message: str, patterns: tuple[str, ...]) -> int | None:
+    for pattern in patterns:
+        match = re.search(pattern, message, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def requested_metric(message: str) -> str:
+    lowered = message.lower()
+    if "voltage" in lowered or "sag" in lowered or "swell" in lowered:
+        return "voltage"
+    if "power factor" in lowered:
+        return "power_factor"
+    if "thd" in lowered or "harmonic" in lowered:
+        return "thd"
+    if "demand" in lowered:
+        return "demand"
+    if "current" in lowered:
+        return "current"
+    if "frequency" in lowered:
+        return "frequency"
+    return "energy"
 
 
 def default_historical_range() -> dict:
@@ -753,18 +827,122 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
     site_id = context.get("site_id")
     if not site_id:
         raise ValueError("site_id is required for Daxview historical data")
-    args = {
-        "site_id": int(site_id),
-        **requested_historical_range(message),
-    }
+    args = {"site_id": int(site_id)}
     if context.get("building_id"):
         args["building_id"] = int(context["building_id"])
+
+    device_id = context.get("device_id") or first_regex_int(
+        message,
+        (
+            r"\bdevice\s*(?:id|#|:)?\s*(\d+)\b",
+            r"\bmeter\s*(?:id|#|:)?\s*(\d+)\b",
+        ),
+    )
+    alarm_id = context.get("alarm_id") or first_regex_int(
+        message,
+        (
+            r"\balarm\s*(?:id|#|:)?\s*(\d+)\b",
+            r"\bevent\s*(?:id|#|:)?\s*(\d+)\b",
+        ),
+    )
+
+    if device_id:
+        args["device_id"] = int(device_id)
+
+    range_args = requested_historical_range(message)
+    if operation_id in {
+        "telemetry_top_consumers",
+        "site_energy_summary",
+        "alarm_frequency_summary",
+        "telemetry_timeseries",
+        "energy_comparison_summary",
+        "data_availability_summary",
+        "power_quality_summary",
+        "demand_peak_summary",
+        "tariff_cost_summary",
+        "device_energy_breakdown",
+        "energy_forecast",
+        "anomaly_detection_summary",
+        "report_summary",
+    }:
+        args.update(range_args)
+
     if operation_id == "telemetry_top_consumers":
         args["limit"] = int(context.get("limit") or 5)
     elif operation_id == "alarm_frequency_summary":
         args["limit"] = int(context.get("limit") or 10)
     elif operation_id == "site_energy_summary":
         args["bucket"] = str(context.get("bucket") or "day")
+    elif operation_id == "site_device_list":
+        args["limit"] = int(context.get("limit") or 100)
+    elif operation_id == "telemetry_timeseries":
+        if not device_id:
+            raise ValueError("device_id is required for telemetry timeseries")
+        args["metric"] = context.get("metric") or requested_metric(message)
+        args["start_time"] = args.pop("start")
+        args["end_time"] = args.pop("end")
+        args["bucket"] = str(context.get("bucket") or ("1h" if "hour" in message.lower() else "1d"))
+        args["aggregation"] = str(context.get("aggregation") or "auto")
+        args["limit"] = int(context.get("limit") or 500)
+    elif operation_id == "active_alarm_summary":
+        args["limit"] = int(context.get("limit") or 50)
+    elif operation_id == "meter_status_summary":
+        args["limit"] = int(context.get("limit") or 100)
+    elif operation_id == "energy_comparison_summary":
+        requested_dates = requested_comparison_dates(message, datetime.now(timezone.utc).year)
+        requested_months = requested_month_ranges(message, datetime.now(timezone.utc).year)
+        if len(requested_dates) >= 2:
+            first_date = datetime.fromisoformat(requested_dates[0]).date()
+            second_date = datetime.fromisoformat(requested_dates[1]).date()
+            first_start = datetime(first_date.year, first_date.month, first_date.day, tzinfo=timezone.utc) - timedelta(days=1, hours=8)
+            first_end = datetime(first_date.year, first_date.month, first_date.day, tzinfo=timezone.utc) - timedelta(hours=8)
+            second_start = datetime(second_date.year, second_date.month, second_date.day, tzinfo=timezone.utc) - timedelta(days=1, hours=8)
+            second_end = datetime(second_date.year, second_date.month, second_date.day, tzinfo=timezone.utc) - timedelta(hours=8)
+            args["period_a_start"] = first_start.isoformat()
+            args["period_a_end"] = first_end.isoformat()
+            args["period_b_start"] = second_start.isoformat()
+            args["period_b_end"] = second_end.isoformat()
+            args.pop("start", None)
+            args.pop("end", None)
+        elif len(requested_months) >= 2:
+            first_start_date, first_end_date = requested_months[0]
+            second_start_date, second_end_date = requested_months[1]
+            args["period_a_start"] = (datetime(first_start_date.year, first_start_date.month, first_start_date.day, tzinfo=timezone.utc) - timedelta(days=1, hours=8)).isoformat()
+            args["period_a_end"] = (datetime(first_end_date.year, first_end_date.month, first_end_date.day, tzinfo=timezone.utc) - timedelta(days=1, hours=8)).isoformat()
+            args["period_b_start"] = (datetime(second_start_date.year, second_start_date.month, second_start_date.day, tzinfo=timezone.utc) - timedelta(days=1, hours=8)).isoformat()
+            args["period_b_end"] = (datetime(second_end_date.year, second_end_date.month, second_end_date.day, tzinfo=timezone.utc) - timedelta(days=1, hours=8)).isoformat()
+            args.pop("start", None)
+            args.pop("end", None)
+        elif "start" in args:
+            start = args.pop("start")
+            end = args.pop("end")
+            args["period_b_start"] = start
+            args["period_b_end"] = end
+            prev_start = datetime.fromisoformat(start) - (datetime.fromisoformat(end) - datetime.fromisoformat(start))
+            args["period_a_start"] = prev_start.isoformat()
+            args["period_a_end"] = start
+    elif operation_id == "data_availability_summary":
+        args["metric"] = context.get("metric") or requested_metric(message)
+        args["start_time"] = args.pop("start")
+        args["end_time"] = args.pop("end")
+    elif operation_id == "alarm_detail_lookup":
+        if not alarm_id:
+            raise ValueError("alarm_id is required for alarm details")
+        args = {"site_id": int(site_id), "alarm_id": int(alarm_id)}
+    elif operation_id in {"power_quality_summary", "demand_peak_summary"}:
+        args["start_time"] = args.pop("start")
+        args["end_time"] = args.pop("end")
+        if operation_id == "power_quality_summary":
+            args["limit"] = int(context.get("limit") or 100)
+    elif operation_id == "tariff_cost_summary":
+        args["start_time"] = args.pop("start")
+        args["end_time"] = args.pop("end")
+    elif operation_id == "device_energy_breakdown":
+        args["limit"] = int(context.get("limit") or 20)
+    elif operation_id == "energy_forecast":
+        args["forecast_days"] = int(context.get("forecast_days") or 7)
+    elif operation_id == "anomaly_detection_summary":
+        args["limit"] = int(context.get("limit") or 20)
     return args
 
 
@@ -791,7 +969,27 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
     safe_arguments = {
         key: value
         for key, value in arguments.items()
-        if key in {"site_id", "building_id", "start", "end", "timezone", "bucket", "limit"}
+        if key in {
+            "site_id",
+            "site_name",
+            "building_id",
+            "device_id",
+            "alarm_id",
+            "start",
+            "end",
+            "start_time",
+            "end_time",
+            "period_a_start",
+            "period_a_end",
+            "period_b_start",
+            "period_b_end",
+            "timezone",
+            "bucket",
+            "limit",
+            "metric",
+            "aggregation",
+            "forecast_days",
+        }
     }
     log_event(
         "daxview_data_plan_request",
@@ -1235,6 +1433,81 @@ def summarize_alarm_frequency(data: dict) -> str:
     return "\n".join(lines)
 
 
+def summarize_generic_tool(operation_id: str, data: dict) -> str:
+    title = operation_id.replace("_", " ").title()
+    lines = [f"{title} returned by DaxView MCP:"]
+    if not data:
+        lines.append("No structured data was returned.")
+        return "\n".join(lines)
+
+    scalar_keys = (
+        "status",
+        "site_id",
+        "site_name",
+        "building_id",
+        "building_name",
+        "device_id",
+        "device_name",
+        "metric",
+        "unit",
+        "total",
+        "count",
+        "row_count",
+        "active_count",
+        "online_count",
+        "offline_count",
+        "stale_count",
+        "coverage_percent",
+        "peak_kw",
+        "peak_time",
+        "total_cost",
+        "currency",
+        "confidence",
+        "method",
+    )
+    for key in scalar_keys:
+        value = data.get(key)
+        if value is not None:
+            lines.append(f"{key}: {value}")
+
+    rows = first_list(
+        data,
+        (
+            "rows",
+            "items",
+            "devices",
+            "alarms",
+            "series",
+            "forecast",
+            "anomalies",
+            "missing_intervals",
+            "buildings",
+            "sections",
+        ),
+    )
+    if rows:
+        lines.append("Rows:")
+        for index, row in enumerate(rows[:10], 1):
+            if not isinstance(row, dict):
+                lines.append(f"{index}. {row}")
+                continue
+            parts = []
+            for key, value in row.items():
+                if value is None or isinstance(value, (dict, list)):
+                    continue
+                parts.append(f"{key}={value}")
+                if len(parts) >= 6:
+                    break
+            lines.append(f"{index}. " + ", ".join(parts))
+        if len(rows) > 10:
+            lines.append(f"Showing 10 of {len(rows)} row(s).")
+
+    coverage_note = format_coverage_note(data)
+    if coverage_note:
+        lines.append(coverage_note)
+    return "\n".join(lines)
+
+
 def summarize_historical_answer(
     message: str,
     operation_id: str,
@@ -1249,6 +1522,8 @@ def summarize_historical_answer(
         return summarize_site_energy(data, message, arguments)
     if operation_id == "alarm_frequency_summary":
         return summarize_alarm_frequency(data)
+    if operation_id in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
+        return summarize_generic_tool(operation_id, data)
     context = {
         "enabled": True,
         "tools": [operation_id],
