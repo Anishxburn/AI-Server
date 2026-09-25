@@ -1442,44 +1442,56 @@ def summarize_alarm_frequency(data: dict) -> str:
 def summarize_active_alarms(data: dict) -> str:
     site = data.get("site") if isinstance(data.get("site"), dict) else {}
     alarms = data.get("alarms") if isinstance(data.get("alarms"), list) else []
-    lines = ["Active alarm summary returned by DaxView MCP:"]
+    parts = ["Active alarm summary from DaxView MCP."]
     if site.get("name"):
-        lines.append(f"Site: {site.get('name')} (ID {site.get('id', 'unknown')})")
-    lines.append(f"Active alarms: {format_number(data.get('active_count'), 0)}")
-    lines.append(f"Critical alarms: {format_number(data.get('critical_count'), 0)}")
-    lines.append(f"Warning alarms: {format_number(data.get('warning_count'), 0)}")
+        parts.append(f"Site: {site.get('name')} (ID {site.get('id', 'unknown')}).")
+    parts.append(
+        "Totals: "
+        f"{format_number(data.get('active_count'), 0)} active, "
+        f"{format_number(data.get('critical_count'), 0)} critical, "
+        f"{format_number(data.get('warning_count'), 0)} warning."
+    )
     if alarms:
-        lines.append("Latest active alarms:")
+        alarm_parts = []
         for index, alarm in enumerate(alarms[:10], 1):
             if not isinstance(alarm, dict):
                 continue
-            lines.append(
-                f"{index}. {alarm.get('alarm_name', 'Alarm')} | "
-                f"{alarm.get('severity', 'unknown')} | "
-                f"{alarm.get('device_name') or 'unknown device'} | "
-                f"started {alarm.get('started_at') or 'unknown time'}"
+            alarm_parts.append(
+                f"{index}) {alarm.get('alarm_name', 'Alarm')} "
+                f"on {alarm.get('device_name') or 'unknown device'} "
+                f"({alarm.get('severity', 'unknown')}, started {alarm.get('started_at') or 'unknown time'})"
             )
-    return "\n".join(lines)
+        if alarm_parts:
+            parts.append("Latest alarms: " + "; ".join(alarm_parts) + ".")
+    return " ".join(parts)
 
 
 def summarize_site_metadata(data: dict) -> str:
     site = data.get("site") if isinstance(data.get("site"), dict) else data
     buildings = data.get("buildings") if isinstance(data.get("buildings"), list) else []
-    lines = ["Site metadata summary returned by DaxView MCP:"]
+    parts = ["Site metadata summary from DaxView MCP."]
     if site.get("name"):
-        lines.append(f"Site: {site.get('name')} (ID {site.get('id', site.get('site_id', 'unknown'))})")
+        parts.append(f"Site: {site.get('name')} (ID {site.get('id', site.get('site_id', 'unknown'))}).")
+    details = []
     for key in ("timezone", "country", "currency", "address", "market"):
         if site.get(key):
-            lines.append(f"{key}: {site.get(key)}")
+            details.append(f"{key}: {site.get(key)}")
     for key in ("building_count", "device_count", "meter_count"):
         if data.get(key) is not None:
-            lines.append(f"{key}: {data.get(key)}")
+            details.append(f"{key}: {data.get(key)}")
+    if details:
+        parts.append("Details: " + "; ".join(details) + ".")
     if buildings:
-        lines.append("Buildings:")
+        building_parts = []
         for index, building in enumerate(buildings[:10], 1):
             if isinstance(building, dict):
-                lines.append(f"{index}. {building.get('name') or building.get('building_name')} (ID {building.get('id', building.get('building_id', 'unknown'))})")
-    return "\n".join(lines)
+                building_parts.append(
+                    f"{index}) {building.get('name') or building.get('building_name')} "
+                    f"(ID {building.get('id', building.get('building_id', 'unknown'))})"
+                )
+        if building_parts:
+            parts.append("Buildings: " + "; ".join(building_parts) + ".")
+    return " ".join(parts)
 
 
 def summarize_generic_tool(operation_id: str, data: dict) -> str:
