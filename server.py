@@ -1471,98 +1471,150 @@ def summarize_alarm_frequency(data: dict) -> str:
 def summarize_active_alarms(data: dict) -> str:
     site = data.get("site") if isinstance(data.get("site"), dict) else {}
     alarms = data.get("alarms") if isinstance(data.get("alarms"), list) else []
-    parts = ["Active alarm summary from DaxView MCP."]
+    lines = []
     if site.get("name"):
-        parts.append(f"Site: {site.get('name')} (ID {site.get('id', 'unknown')}).")
-    parts.append(
-        "Totals: "
-        f"{format_number(data.get('active_count'), 0)} active, "
+        lines.append(f"Site: {site.get('name')} (ID {site.get('id', 'unknown')})")
+    lines.append(
+        "Summary: "
+        f"{format_number(data.get('active_count'), 0)} active alarm(s), "
         f"{format_number(data.get('critical_count'), 0)} critical, "
-        f"{format_number(data.get('warning_count'), 0)} warning."
+        f"{format_number(data.get('warning_count'), 0)} warning"
     )
     if alarms:
-        alarm_parts = []
-        for index, alarm in enumerate(alarms[:10], 1):
+        lines.append("Latest active alarms:")
+        for index, alarm in enumerate(alarms[:8], 1):
             if not isinstance(alarm, dict):
                 continue
-            alarm_parts.append(
-                f"{index}) {alarm.get('alarm_name', 'Alarm')} "
-                f"on {alarm.get('device_name') or 'unknown device'} "
-                f"({alarm.get('severity', 'unknown')}, started {alarm.get('started_at') or 'unknown time'})"
+            lines.append(
+                f"- {index}. {alarm.get('alarm_name', 'Alarm')} on "
+                f"{alarm.get('device_name') or 'unknown device'} "
+                f"- {alarm.get('severity', 'unknown')} since {alarm.get('started_at') or 'unknown time'}"
             )
-        if alarm_parts:
-            parts.append("Latest alarms: " + "; ".join(alarm_parts) + ".")
-    return " ".join(parts)
+        if len(alarms) > 8:
+            lines.append(f"Showing 8 of {len(alarms)} alarm(s).")
+    return "\n".join(lines)
 
 
 def summarize_site_metadata(data: dict) -> str:
     site = data.get("site") if isinstance(data.get("site"), dict) else data
     buildings = data.get("buildings") if isinstance(data.get("buildings"), list) else []
-    parts = ["Site metadata summary from DaxView MCP."]
+    lines = []
     if site.get("name"):
-        parts.append(f"Site: {site.get('name')} (ID {site.get('id', site.get('site_id', 'unknown'))}).")
+        lines.append(f"Site: {site.get('name')} (ID {site.get('id', site.get('site_id', 'unknown'))})")
     details = []
+    detail_labels = {
+        "timezone": "Timezone",
+        "country": "Country",
+        "currency": "Currency",
+        "address": "Address",
+        "market": "Market",
+        "building_count": "Buildings",
+        "device_count": "Devices",
+        "meter_count": "Meters",
+    }
     for key in ("timezone", "country", "currency", "address", "market"):
         if site.get(key):
-            details.append(f"{key}: {site.get(key)}")
+            details.append(f"{detail_labels[key]}: {site.get(key)}")
     for key in ("building_count", "device_count", "meter_count"):
         if data.get(key) is not None:
-            details.append(f"{key}: {data.get(key)}")
+            details.append(f"{detail_labels[key]}: {data.get(key)}")
     if details:
-        parts.append("Details: " + "; ".join(details) + ".")
+        lines.append("Key details:")
+        for detail in details:
+            lines.append(f"- {detail}")
     if buildings:
-        building_parts = []
+        lines.append("Buildings:")
         for index, building in enumerate(buildings[:10], 1):
             if isinstance(building, dict):
                 building_details = []
-                for key in ("device_count", "meter_count", "floor_count"):
+                for key, label in (("device_count", "devices"), ("meter_count", "meters"), ("floor_count", "floors")):
                     if building.get(key) is not None:
-                        building_details.append(f"{key} {building.get(key)}")
-                detail_suffix = f", {', '.join(building_details)}" if building_details else ""
-                building_parts.append(
-                    f"{index}) {building.get('name') or building.get('building_name')} "
-                    f"(ID {building.get('id', building.get('building_id', 'unknown'))}{detail_suffix})"
+                        building_details.append(f"{building.get(key)} {label}")
+                detail_suffix = f" - {', '.join(building_details)}" if building_details else ""
+                lines.append(
+                    f"- {index}. {building.get('name') or building.get('building_name')} "
+                    f"(ID {building.get('id', building.get('building_id', 'unknown'))}){detail_suffix}"
                 )
-        if building_parts:
-            parts.append("Buildings: " + "; ".join(building_parts) + ".")
-    return " ".join(parts)
+    return "\n".join(lines)
 
 
 def summarize_site_devices(data: dict) -> str:
     devices = first_list(data, ("devices", "rows", "items", "meters"))
-    parts = ["Device list returned by DaxView MCP."]
-    for key in ("site_id", "site_name", "building_id", "building_name", "device_count", "meter_count", "row_count"):
-        if data.get(key) is not None:
-            parts.append(f"{key}: {data.get(key)}.")
+    lines = []
+    total = data.get("device_count") or data.get("meter_count") or data.get("row_count") or len(devices)
+    if data.get("site_name") or data.get("building_name"):
+        scope = data.get("building_name") or data.get("site_name")
+        lines.append(f"Scope: {scope}")
+    if total:
+        lines.append(f"Total devices returned: {total}")
     if not devices:
-        parts.append("No devices were returned.")
-        return " ".join(parts)
+        lines.append("No devices were returned.")
+        return "\n".join(lines)
 
     status_counts: dict[str, int] = {}
-    device_parts = []
-    for index, device in enumerate(devices[:15], 1):
+    for device in devices:
+        if isinstance(device, dict):
+            status = str(device.get("status") or device.get("connection_status") or device.get("state") or "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+    if status_counts:
+        lines.append("Status counts:")
+        for status, count in sorted(status_counts.items()):
+            lines.append(f"- {status.title()}: {count}")
+
+    lines.append("Sample devices:")
+    for index, device in enumerate(devices[:10], 1):
         if not isinstance(device, dict):
-            device_parts.append(f"{index}) {device}")
+            lines.append(f"- {index}. {device}")
             continue
         status = str(device.get("status") or device.get("connection_status") or device.get("state") or "unknown")
-        status_counts[status] = status_counts.get(status, 0) + 1
         name = device.get("device_name") or device.get("name") or device.get("meter_name") or "Unnamed device"
         device_id = device.get("device_id") or device.get("id") or device.get("meter_id") or "unknown"
         device_type = device.get("device_type") or device.get("type") or device.get("model")
         last_seen = device.get("last_updated") or device.get("last_seen") or device.get("last_telemetry_at")
-        details = [f"ID {device_id}", status]
+        details = [f"ID {device_id}", status.title()]
         if device_type:
             details.append(str(device_type))
         if last_seen:
             details.append(f"last seen {last_seen}")
-        device_parts.append(f"{index}) {name} ({', '.join(details)})")
+        lines.append(f"- {index}. {name} ({', '.join(details)})")
 
-    if status_counts:
-        parts.append("Status counts: " + "; ".join(f"{status}: {count}" for status, count in sorted(status_counts.items())) + ".")
-    parts.append("Devices: " + "; ".join(device_parts) + ".")
-    if len(devices) > 15:
-        parts.append(f"Showing 15 of {len(devices)} device(s).")
-    return " ".join(parts)
+    if len(devices) > 10:
+        lines.append(f"Showing 10 of {len(devices)} device(s).")
+    return "\n".join(lines)
+
+
+def summarize_meter_status(data: dict) -> str:
+    rows = first_list(data, ("rows", "devices", "items", "meters"))
+    lines = ["Meter communication status:"]
+    counts = []
+    for key, label in (("online_count", "online"), ("offline_count", "offline"), ("stale_count", "stale"), ("unknown_count", "unknown")):
+        if data.get(key) is not None:
+            counts.append(f"{format_number(data.get(key), 0)} {label}")
+    if counts:
+        lines.append("- " + ", ".join(counts))
+    if not rows:
+        return "\n".join(lines)
+
+    offline_or_unknown = [
+        row for row in rows
+        if isinstance(row, dict)
+        and str(row.get("status") or row.get("data_status") or "unknown").lower() in {"offline", "unknown", "stale"}
+    ]
+    focus_rows = offline_or_unknown[:8] or rows[:8]
+    lines.append("Devices needing attention:")
+    for index, row in enumerate(focus_rows, 1):
+        if not isinstance(row, dict):
+            lines.append(f"- {index}. {row}")
+            continue
+        name = row.get("device_name") or row.get("name") or "Unnamed device"
+        device_id = row.get("device_id") or row.get("id") or "unknown"
+        status = row.get("status") or row.get("data_status") or "unknown"
+        last_seen = row.get("last_seen") or row.get("last_updated") or row.get("last_telemetry_at")
+        last_seen_text = f", last seen {last_seen}" if last_seen else ""
+        lines.append(f"- {index}. {name} (ID {device_id}) - {status}{last_seen_text}")
+    if len(rows) > len(focus_rows):
+        lines.append(f"Showing {len(focus_rows)} of {len(rows)} device(s).")
+    return "\n".join(lines)
 
 
 def summarize_generic_tool(operation_id: str, data: dict) -> str:
@@ -1660,6 +1712,8 @@ def summarize_historical_answer(
         return summarize_site_metadata(data)
     if operation_id == "site_device_list":
         return summarize_site_devices(data)
+    if operation_id == "meter_status_summary":
+        return summarize_meter_status(data)
     if operation_id in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
         return summarize_generic_tool(operation_id, data)
     context = {
