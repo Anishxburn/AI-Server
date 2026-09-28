@@ -34,6 +34,8 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 RAG_MATCH_LIMIT = int(os.getenv("RAG_MATCH_LIMIT", "5"))
 RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.2"))
 TRACE_LIMIT = int(os.getenv("CHATBOT_TRACE_LIMIT", "25"))
+AI_DEBUG_DASHBOARD_ENABLED = os.getenv("AI_DEBUG_DASHBOARD_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+AI_DEBUG_DASHBOARD_KEY = os.getenv("AI_DEBUG_DASHBOARD_KEY", "").strip()
 DAXVIEW_MCP_ENABLED = os.getenv("DAXVIEW_MCP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 DAXVIEW_MCP_URL = os.getenv("DAXVIEW_MCP_URL", "").strip()
 DAXVIEW_MCP_AUTH_TOKEN = os.getenv("DAXVIEW_MCP_AUTH_TOKEN", "").strip()
@@ -507,7 +509,15 @@ def log_event(event: str, **fields: object) -> None:
         name: "[redacted]" if any(marker in name.lower() for marker in sensitive_markers) else value
         for name, value in fields.items()
     }
-    print(json.dumps({"event": event, **safe_fields}, ensure_ascii=False), flush=True)
+    record = {"event": event, **safe_fields}
+    if AI_DEBUG_DASHBOARD_ENABLED and AI_DEBUG_DASHBOARD_KEY:
+        TRACES.appendleft(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                **redact_debug_value(record),
+            }
+        )
+    print(json.dumps(record, ensure_ascii=False), flush=True)
 
 
 def preview(text: str, limit: int = 240) -> str:
@@ -2370,6 +2380,158 @@ def clean_final_answer(reply: str) -> str:
     return "\n".join(lines).strip() or reply.strip()
 
 
+DEBUG_DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI MCP Trace Dashboard</title>
+    <style>
+      :root { color-scheme: light; font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      body { margin: 0; background: #f5f7fb; color: #172033; }
+      header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 22px; background: #111827; color: white; }
+      header h1 { font-size: 18px; margin: 0; }
+      header .meta { color: #cbd5e1; font-size: 12px; }
+      main { display: grid; grid-template-columns: 380px 1fr; gap: 14px; padding: 14px; }
+      .panel { background: white; border: 1px solid #dbe3ef; border-radius: 8px; overflow: hidden; }
+      .panel h2 { margin: 0; padding: 12px 14px; font-size: 13px; border-bottom: 1px solid #e5ebf3; background: #f8fafc; }
+      .toolbar { display: flex; gap: 8px; align-items: center; padding: 10px 14px; border-bottom: 1px solid #e5ebf3; }
+      input, button { font: inherit; }
+      input { flex: 1; padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 6px; }
+      button { padding: 8px 10px; border: 1px solid #0ea5e9; color: white; background: #0284c7; border-radius: 6px; cursor: pointer; }
+      .request-list { max-height: calc(100vh - 150px); overflow: auto; }
+      .request { padding: 10px 12px; border-bottom: 1px solid #edf2f7; cursor: pointer; }
+      .request:hover, .request.active { background: #e0f2fe; }
+      .request .id { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; color: #475569; }
+      .request .events { font-size: 12px; margin-top: 4px; color: #0f172a; }
+      .chips { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 6px; }
+      .chip { font-size: 11px; border-radius: 999px; padding: 2px 7px; background: #e2e8f0; color: #334155; }
+      .chip.fail { background: #fee2e2; color: #991b1b; }
+      .chip.ok { background: #dcfce7; color: #166534; }
+      .timeline { padding: 12px 14px; max-height: calc(100vh - 150px); overflow: auto; }
+      .event { border-left: 3px solid #94a3b8; padding: 0 0 14px 12px; margin-left: 6px; }
+      .event.fail { border-left-color: #ef4444; }
+      .event.ok { border-left-color: #22c55e; }
+      .event h3 { margin: 0 0 6px; font-size: 13px; }
+      .event .time { color: #64748b; font-size: 11px; margin-bottom: 6px; }
+      pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #0f172a; color: #dbeafe; border-radius: 6px; padding: 10px; font-size: 12px; line-height: 1.45; margin: 0; }
+      .empty { padding: 18px; color: #64748b; }
+      @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+    </style>
+  </head>
+  <body>
+    <header>
+      <div>
+        <h1>AI MCP Trace Dashboard</h1>
+        <div class="meta">DaxView -> AI Server -> Data Plan -> MCP -> AI Server -> DaxView</div>
+      </div>
+      <button id="refresh">Refresh</button>
+    </header>
+    <main>
+      <section class="panel">
+        <h2>Recent Requests</h2>
+        <div class="toolbar"><input id="filter" placeholder="Filter request/tool/error..." /></div>
+        <div id="requests" class="request-list"><div class="empty">Loading...</div></div>
+      </section>
+      <section class="panel">
+        <h2>Timeline</h2>
+        <div id="timeline" class="timeline"><div class="empty">Select a request.</div></div>
+      </section>
+    </main>
+    <script>
+      let debugKey = sessionStorage.getItem("ai_debug_key") || "";
+      if (!debugKey) {
+        debugKey = prompt("Enter AI debug dashboard key") || "";
+        if (debugKey) sessionStorage.setItem("ai_debug_key", debugKey);
+      }
+      let grouped = [];
+      let selected = null;
+
+      function eventClass(name) {
+        if (/failed|error|timeout|404|403|409|429|500/i.test(name)) return "fail";
+        if (/response|completed|ok/i.test(name)) return "ok";
+        return "";
+      }
+      function summarize(events) {
+        const tools = [...new Set(events.map(e => e.tool).filter(Boolean))];
+        const failed = events.some(e => /failed|error/i.test(e.event || ""));
+        return {tools, failed};
+      }
+      function groupTraces(traces) {
+        const map = new Map();
+        for (const trace of traces) {
+          const id = trace.request_id || trace.job_id || "no-request-id";
+          if (!map.has(id)) map.set(id, []);
+          map.get(id).push(trace);
+        }
+        return [...map.entries()].map(([id, events]) => ({id, events: events.slice().reverse()}));
+      }
+      async function load() {
+        const res = await fetch("/debug/traces", {headers: {"X-Debug-Key": debugKey}});
+        if (!res.ok) {
+          document.querySelector("#requests").innerHTML = '<div class="empty">Unauthorized or debug dashboard disabled.</div>';
+          return;
+        }
+        const data = await res.json();
+        grouped = groupTraces(data.traces || []);
+        renderRequests();
+        if (selected) renderTimeline(selected);
+      }
+      function renderRequests() {
+        const filter = document.querySelector("#filter").value.toLowerCase();
+        const root = document.querySelector("#requests");
+        const rows = grouped.filter(group => JSON.stringify(group).toLowerCase().includes(filter));
+        if (!rows.length) {
+          root.innerHTML = '<div class="empty">No traces yet. Ask an AI question, then refresh.</div>';
+          return;
+        }
+        root.innerHTML = rows.map(group => {
+          const info = summarize(group.events);
+          const classes = ["request", selected === group.id ? "active" : ""].join(" ");
+          const chips = [`<span class="chip ${info.failed ? "fail" : "ok"}">${info.failed ? "failed/error" : "ok/no error"}</span>`]
+            .concat(info.tools.map(tool => `<span class="chip">${tool}</span>`)).join("");
+          return `<div class="${classes}" data-id="${group.id}">
+            <div class="id">${escapeHtml(group.id)}</div>
+            <div class="events">${group.events.length} event(s)</div>
+            <div class="chips">${chips}</div>
+          </div>`;
+        }).join("");
+        root.querySelectorAll(".request").forEach(node => {
+          node.addEventListener("click", () => {
+            selected = node.dataset.id;
+            renderRequests();
+            renderTimeline(selected);
+          });
+        });
+      }
+      function renderTimeline(id) {
+        const group = grouped.find(item => item.id === id);
+        const root = document.querySelector("#timeline");
+        if (!group) {
+          root.innerHTML = '<div class="empty">Select a request.</div>';
+          return;
+        }
+        root.innerHTML = group.events.map(event => {
+          const cls = eventClass(event.event || "");
+          return `<article class="event ${cls}">
+            <h3>${escapeHtml(event.event || "event")}</h3>
+            <div class="time">${escapeHtml(event.timestamp || "")}</div>
+            <pre>${escapeHtml(JSON.stringify(event, null, 2))}</pre>
+          </article>`;
+        }).join("");
+      }
+      function escapeHtml(value) {
+        return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+      }
+      document.querySelector("#refresh").addEventListener("click", load);
+      document.querySelector("#filter").addEventListener("input", renderRequests);
+      load();
+      setInterval(load, 10000);
+    </script>
+  </body>
+</html>"""
+
+
 def langchain_start_state(payload: dict) -> dict:
     message = str(payload.get("message", "")).strip()
     return {
@@ -2912,9 +3074,15 @@ class ChatHandler(BaseHTTPRequestHandler):
         if origin in ALLOWED_ORIGINS:
             self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-DaxView-Assertion")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-DaxView-Assertion, X-Debug-Key")
         self.end_headers()
         self.wfile.write(body)
+
+    def _debug_allowed(self) -> bool:
+        if not AI_DEBUG_DASHBOARD_ENABLED or not AI_DEBUG_DASHBOARD_KEY:
+            return False
+        supplied_key = self.headers.get("X-Debug-Key", "").strip()
+        return hmac.compare_digest(supplied_key, AI_DEBUG_DASHBOARD_KEY)
 
     def _read_json(self) -> dict:
         content_length = int(self.headers.get("Content-Length", "0"))
@@ -3328,7 +3496,16 @@ class ChatHandler(BaseHTTPRequestHandler):
                     db_status = f"error: {error}"
             self._send_json(200, {"status": "ok", "service": "AI-Server", "database": db_status})
             return
+        if path == "/debug/ai":
+            if not AI_DEBUG_DASHBOARD_ENABLED:
+                self._send_html(404, "<h1>Debug dashboard disabled</h1>")
+                return
+            self._send_html(200, DEBUG_DASHBOARD_HTML)
+            return
         if path == "/debug/traces":
+            if not self._debug_allowed():
+                self._send_json(401, json_error("unauthorized", "Debug dashboard is disabled or the debug key is invalid.", False))
+                return
             self._send_json(200, {"traces": list(TRACES)})
             return
         self._send_json(404, {"error": "Not found"})
