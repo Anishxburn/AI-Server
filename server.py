@@ -119,6 +119,8 @@ DAXVIEW_TOOL_KEYWORDS = {
     "site_metadata_summary": {
         "what site", "current site", "site details", "details about this site",
         "site metadata", "site context", "buildings under this site",
+        "site info", "site information", "site summary", "summary details of this site",
+        "all details", "other info",
     },
     "site_device_list": {
         "list all devices", "devices under this site", "all meters", "installed meters",
@@ -698,6 +700,23 @@ def select_historical_operations(message: str) -> list[str]:
     for tool_name, phrases in DAXVIEW_TOOL_KEYWORDS.items():
         if any(phrase in lowered for phrase in phrases):
             operations.append(tool_name)
+    if "site_metadata_summary" in operations and any(
+        phrase in lowered
+        for phrase in (
+            "all details",
+            "summary details",
+            "site summary",
+            "site information",
+            "devices and",
+            "alarms and",
+            "other info",
+            "complete",
+            "overview",
+        )
+    ):
+        for tool_name in ("site_device_list", "active_alarm_summary", "meter_status_summary"):
+            if tool_name not in operations:
+                operations.append(tool_name)
     if (
         "site_energy_summary" not in operations
         and "energy_comparison_summary" not in operations
@@ -713,7 +732,7 @@ def select_historical_operations(message: str) -> list[str]:
     for operation in operations:
         if operation not in deduped:
             deduped.append(operation)
-    return deduped[:4]
+    return deduped[:6]
 
 
 def first_regex_int(message: str, patterns: tuple[str, ...]) -> int | None:
@@ -1495,12 +1514,54 @@ def summarize_site_metadata(data: dict) -> str:
         building_parts = []
         for index, building in enumerate(buildings[:10], 1):
             if isinstance(building, dict):
+                building_details = []
+                for key in ("device_count", "meter_count", "floor_count"):
+                    if building.get(key) is not None:
+                        building_details.append(f"{key} {building.get(key)}")
+                detail_suffix = f", {', '.join(building_details)}" if building_details else ""
                 building_parts.append(
                     f"{index}) {building.get('name') or building.get('building_name')} "
-                    f"(ID {building.get('id', building.get('building_id', 'unknown'))})"
+                    f"(ID {building.get('id', building.get('building_id', 'unknown'))}{detail_suffix})"
                 )
         if building_parts:
             parts.append("Buildings: " + "; ".join(building_parts) + ".")
+    return " ".join(parts)
+
+
+def summarize_site_devices(data: dict) -> str:
+    devices = first_list(data, ("devices", "rows", "items", "meters"))
+    parts = ["Device list returned by DaxView MCP."]
+    for key in ("site_id", "site_name", "building_id", "building_name", "device_count", "meter_count", "row_count"):
+        if data.get(key) is not None:
+            parts.append(f"{key}: {data.get(key)}.")
+    if not devices:
+        parts.append("No devices were returned.")
+        return " ".join(parts)
+
+    status_counts: dict[str, int] = {}
+    device_parts = []
+    for index, device in enumerate(devices[:15], 1):
+        if not isinstance(device, dict):
+            device_parts.append(f"{index}) {device}")
+            continue
+        status = str(device.get("status") or device.get("connection_status") or device.get("state") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        name = device.get("device_name") or device.get("name") or device.get("meter_name") or "Unnamed device"
+        device_id = device.get("device_id") or device.get("id") or device.get("meter_id") or "unknown"
+        device_type = device.get("device_type") or device.get("type") or device.get("model")
+        last_seen = device.get("last_updated") or device.get("last_seen") or device.get("last_telemetry_at")
+        details = [f"ID {device_id}", status]
+        if device_type:
+            details.append(str(device_type))
+        if last_seen:
+            details.append(f"last seen {last_seen}")
+        device_parts.append(f"{index}) {name} ({', '.join(details)})")
+
+    if status_counts:
+        parts.append("Status counts: " + "; ".join(f"{status}: {count}" for status, count in sorted(status_counts.items())) + ".")
+    parts.append("Devices: " + "; ".join(device_parts) + ".")
+    if len(devices) > 15:
+        parts.append(f"Showing 15 of {len(devices)} device(s).")
     return " ".join(parts)
 
 
@@ -1597,6 +1658,8 @@ def summarize_historical_answer(
         return summarize_active_alarms(data)
     if operation_id == "site_metadata_summary":
         return summarize_site_metadata(data)
+    if operation_id == "site_device_list":
+        return summarize_site_devices(data)
     if operation_id in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
         return summarize_generic_tool(operation_id, data)
     context = {
@@ -1632,6 +1695,10 @@ def summarize_historical_answers(
             "telemetry_top_consumers": "Top energy-consuming devices",
             "site_energy_summary": "Site energy summary",
             "alarm_frequency_summary": "Alarm frequency summary",
+            "site_metadata_summary": "Site details",
+            "site_device_list": "Devices",
+            "active_alarm_summary": "Active alarms",
+            "meter_status_summary": "Meter status",
         }.get(operation_id, operation_id)
         summary = summarize_historical_answer(
             message,
