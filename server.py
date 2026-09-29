@@ -707,7 +707,7 @@ def select_historical_operations(message: str) -> list[str]:
     if "demand_peak_summary" in operations and any(
         phrase in lowered for phrase in ("detail", "details", "breakdown", "device", "devices", "which meter", "which meters")
     ):
-        for tool_name in ("site_device_list", "device_energy_breakdown"):
+        for tool_name in ("site_device_list",):
             if tool_name not in operations:
                 operations.append(tool_name)
     if "site_metadata_summary" in operations and any(
@@ -899,7 +899,6 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
         "power_quality_summary",
         "demand_peak_summary",
         "tariff_cost_summary",
-        "device_energy_breakdown",
         "energy_forecast",
         "anomaly_detection_summary",
         "report_summary",
@@ -1908,6 +1907,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     if not operation_ids:
         return langchain_chat_response(message, request_id, session_id)
     results = []
+    errors = []
     for operation_id in operation_ids:
         try:
             arguments = build_historical_arguments(operation_id, context, message)
@@ -1916,20 +1916,32 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
                 "provider": "daxview-question-filter",
                 "reply": "Choose a site and time range before I access Daxview historical data.",
             }
-        plan = request_daxview_data_plan(turn_id, operation_id, arguments, request_id)
-        authorization_id = plan.get("authorization_id")
-        normalized_arguments = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else arguments
-        if not authorization_id:
-            raise RuntimeError(f"Daxview did not return a data authorization for {operation_id}")
-        result = call_authorized_historical_tool(operation_id, str(authorization_id), normalized_arguments, request_id)
-        results.append(
-            {
-                "operation_id": operation_id,
-                "arguments": normalized_arguments,
-                "result": result,
-            }
-        )
+        try:
+            plan = request_daxview_data_plan(turn_id, operation_id, arguments, request_id)
+            authorization_id = plan.get("authorization_id")
+            normalized_arguments = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else arguments
+            if not authorization_id:
+                raise RuntimeError(f"Daxview did not return a data authorization for {operation_id}")
+            result = call_authorized_historical_tool(operation_id, str(authorization_id), normalized_arguments, request_id)
+            results.append(
+                {
+                    "operation_id": operation_id,
+                    "arguments": normalized_arguments,
+                    "result": result,
+                }
+            )
+        except Exception as error:
+            errors.append({"operation_id": operation_id, "error": str(error)})
+            log_event("daxview_tool_step_failed", request_id=request_id, turn_id=turn_id, operation_id=operation_id, error=str(error))
+            if len(operation_ids) == 1:
+                raise
+    if not results:
+        error_detail = "; ".join(f"{item['operation_id']}: {item['error']}" for item in errors)
+        raise RuntimeError(error_detail or "No DaxView MCP tool returned data")
     deterministic_reply = summarize_historical_answers(message, results, request_id)
+    if errors:
+        failed_tools = ", ".join(str(item["operation_id"]) for item in errors)
+        deterministic_reply = f"{deterministic_reply}\n\nUnavailable detail: {failed_tools} could not be retrieved for this request."
     refined_reply = refine_historical_answer_with_model(message, results, deterministic_reply, request_id)
     return {
         "provider": "daxview-historical-mcp",
@@ -2182,7 +2194,7 @@ def select_daxview_tools(message: str) -> list[str]:
     if "demand_peak_summary" in selected and any(
         phrase in lowered for phrase in ("detail", "details", "breakdown", "device", "devices", "which meter", "which meters")
     ):
-        for tool_name in ("site_device_list", "device_energy_breakdown"):
+        for tool_name in ("site_device_list",):
             if tool_name not in selected:
                 selected.append(tool_name)
     return selected[:5]
