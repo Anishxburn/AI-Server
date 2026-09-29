@@ -36,6 +36,7 @@ RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.2"))
 TRACE_LIMIT = int(os.getenv("CHATBOT_TRACE_LIMIT", "25"))
 AI_DEBUG_DASHBOARD_ENABLED = os.getenv("AI_DEBUG_DASHBOARD_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 AI_DEBUG_DASHBOARD_KEY = os.getenv("AI_DEBUG_DASHBOARD_KEY", "").strip()
+AI_REFINE_MCP_WITH_MODEL = os.getenv("AI_REFINE_MCP_WITH_MODEL", "true").lower() in {"1", "true", "yes", "on"}
 DAXVIEW_MCP_ENABLED = os.getenv("DAXVIEW_MCP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 DAXVIEW_MCP_URL = os.getenv("DAXVIEW_MCP_URL", "").strip()
 DAXVIEW_MCP_AUTH_TOKEN = os.getenv("DAXVIEW_MCP_AUTH_TOKEN", "").strip()
@@ -110,7 +111,7 @@ DAXVIEW_TOOL_KEYWORDS = {
         "energy summary", "site energy", "usage trend", "consumption trend",
         "kwh summary", "last 7 days", "weekly energy", "daily energy",
         "energy consumption", "consumption", "usage", "difference in energy",
-        "energy difference",
+        "energy difference", "highest energy consumption",
     },
     "alarm_frequency_summary": {
         "alarm frequency", "frequent alarm", "most alarms", "alarm summary",
@@ -155,8 +156,9 @@ DAXVIEW_TOOL_KEYWORDS = {
         "unbalance", "imbalance",
     },
     "demand_peak_summary": {
-        "peak demand", "maximum demand", "highest demand", "demand limit",
-        "exceed demand",
+        "peak demand", "maximum demand", "max demand", "highest demand",
+        "demand limit", "exceed demand", "maximum kw", "max kw",
+        "highest kw", "peak kw",
     },
     "tariff_cost_summary": {
         "tariff", "energy cost", "electricity cost", "billing cost",
@@ -700,6 +702,14 @@ def select_historical_operations(message: str) -> list[str]:
     for tool_name, phrases in DAXVIEW_TOOL_KEYWORDS.items():
         if any(phrase in lowered for phrase in phrases):
             operations.append(tool_name)
+    if "demand_peak_summary" in operations and "site_energy_summary" in operations:
+        operations.remove("site_energy_summary")
+    if "demand_peak_summary" in operations and any(
+        phrase in lowered for phrase in ("detail", "details", "breakdown", "device", "devices", "which meter", "which meters")
+    ):
+        for tool_name in ("site_device_list", "device_energy_breakdown"):
+            if tool_name not in operations:
+                operations.append(tool_name)
     if "site_metadata_summary" in operations and any(
         phrase in lowered
         for phrase in (
@@ -1765,6 +1775,63 @@ def summarize_historical_answers(
     return "\n\n".join(sections)
 
 
+def refine_historical_answer_with_model(message: str, results: list[dict], deterministic_answer: str, request_id: str) -> str:
+    if not AI_REFINE_MCP_WITH_MODEL:
+        return deterministic_answer
+    mcp_context = {
+        "enabled": True,
+        "tools": [item.get("operation_id") for item in results],
+        "results": [
+            {"tool": item.get("operation_id"), "result": item.get("result") or {}}
+            for item in results
+        ],
+        "errors": [],
+    }
+    raw_context = format_daxview_context(mcp_context)
+    prompt = f"""You are an EMS operations assistant.
+Rewrite the answer using only the DaxView MCP facts below.
+Make it human, clean, and practical.
+Do not invent values, devices, alarms, timestamps, causes, or recommendations not supported by the MCP data.
+Keep the answer concise but useful:
+- Start with the direct answer.
+- Use short sections and bullets.
+- Mention the tool/data limitation only if a requested value is missing.
+- Hide backend/internal terms such as MCP, row_count, source_count, aggregation, authorization_id, request_id, and JSON field names.
+- If the user asks for max demand, explain whether the result is site-level, building-level, or device-level based on the data. If device-level detail is missing, say which follow-up question would retrieve it.
+
+User question:
+{message}
+
+Deterministic draft:
+{deterministic_answer}
+
+DaxView data summary:
+{raw_context}
+
+Final answer:"""
+    started_at = time.perf_counter()
+    log_event("mcp_answer_refine_request", request_id=request_id, model=CHAT_MODEL, prompt_preview=preview(prompt))
+    try:
+        data = ollama_json(
+            "/api/generate",
+            {
+                "model": CHAT_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"temperature": 0.15},
+            },
+            timeout=OLLAMA_GENERATE_TIMEOUT,
+        )
+    except (TimeoutError, URLError, json.JSONDecodeError) as error:
+        log_event("mcp_answer_refine_error", request_id=request_id, error=str(error))
+        return deterministic_answer
+    reply = clean_final_answer(str(data.get("response", "")).strip())
+    if not reply:
+        return deterministic_answer
+    log_event("mcp_answer_refine_response", request_id=request_id, duration_ms=round((time.perf_counter() - started_at) * 1000))
+    return reply
+
+
 FOLLOW_UP_PHRASES = (
     "more detail",
     "more details",
@@ -1862,9 +1929,11 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
                 "result": result,
             }
         )
+    deterministic_reply = summarize_historical_answers(message, results, request_id)
+    refined_reply = refine_historical_answer_with_model(message, results, deterministic_reply, request_id)
     return {
         "provider": "daxview-historical-mcp",
-        "reply": summarize_historical_answers(message, results, request_id),
+        "reply": refined_reply,
     }
 
 
@@ -1916,6 +1985,37 @@ def needs_device_choice(message: str) -> bool:
     return not any(re.search(pattern, lowered) for pattern in (r"\bdevice\s*[:#-]\s*[\w.-]+", r"\bumg[\s-]?\d+\b"))
 
 
+def has_time_scope(message: str) -> bool:
+    lowered = message.lower()
+    if any(
+        phrase in lowered
+        for phrase in (
+            "today",
+            "yesterday",
+            "last ",
+            "past ",
+            "this week",
+            "last week",
+            "this month",
+            "last month",
+            "august",
+            "september",
+            "january",
+            "february",
+            "march",
+            "april",
+            "may",
+            "june",
+            "july",
+            "october",
+            "november",
+            "december",
+        )
+    ):
+        return True
+    return bool(re.search(r"\b\d{1,2}\s+\w+\s+\d{4}\b|\b\d{4}-\d{2}-\d{2}\b", lowered))
+
+
 def daxview_clarification_needed(message: str, tools: list[str]) -> bool:
     if not tools:
         return False
@@ -1926,12 +2026,16 @@ def daxview_clarification_needed(message: str, tools: list[str]) -> bool:
         return False
     if needs_device_choice(message):
         return True
+    if "demand_peak_summary" in tools and not has_time_scope(message):
+        return True
     return not has_daxview_scope(message)
 
 
 def build_daxview_clarification(message: str, tools: list[str]) -> str:
     if needs_device_choice(message):
         return "Which device should I use for this energy consumption request? Choose a specific device, or say all devices if you want the whole site."
+    if "demand_peak_summary" in tools and not has_time_scope(message):
+        return "For max demand, which time range should I check: today, yesterday, last 7 days, this month, or a specific date range?"
     if "telemetry_top_consumers" in tools:
         return "Choose a Daxview site and time range before I check top energy consumers."
     if "site_energy_summary" in tools:
@@ -2073,7 +2177,15 @@ def select_daxview_tools(message: str) -> list[str]:
     for tool_name, phrases in DAXVIEW_TOOL_KEYWORDS.items():
         if any(phrase in lowered for phrase in phrases):
             selected.append(tool_name)
-    return selected[:3]
+    if "demand_peak_summary" in selected and "site_energy_summary" in selected:
+        selected.remove("site_energy_summary")
+    if "demand_peak_summary" in selected and any(
+        phrase in lowered for phrase in ("detail", "details", "breakdown", "device", "devices", "which meter", "which meters")
+    ):
+        for tool_name in ("site_device_list", "device_energy_breakdown"):
+            if tool_name not in selected:
+                selected.append(tool_name)
+    return selected[:5]
 
 
 def retrieve_daxview_context(message: str, request_id: str) -> dict:
