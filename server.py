@@ -2530,6 +2530,18 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       .chip.fail { background: #fee2e2; color: #991b1b; }
       .chip.ok { background: #dcfce7; color: #166534; }
       .timeline { padding: 12px 14px; max-height: calc(100vh - 150px); overflow: auto; }
+      .flow { display: grid; grid-template-columns: repeat(6, minmax(118px, 1fr)); gap: 8px; padding: 12px 14px; border-bottom: 1px solid #e5ebf3; background: #fbfdff; }
+      .stage { border: 1px solid #cbd5e1; border-radius: 8px; padding: 9px; min-height: 76px; background: white; }
+      .stage.done { border-color: #22c55e; background: #f0fdf4; }
+      .stage.fail { border-color: #ef4444; background: #fef2f2; }
+      .stage.pending { color: #64748b; background: #f8fafc; }
+      .stage .label { font-size: 11px; font-weight: 700; text-transform: uppercase; color: #334155; }
+      .stage .count { font-size: 22px; font-weight: 700; margin-top: 6px; color: #0f172a; }
+      .stage .detail { font-size: 11px; margin-top: 3px; color: #475569; overflow-wrap: anywhere; }
+      .summary-grid { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 8px; padding: 12px 14px; border-bottom: 1px solid #e5ebf3; }
+      .metric { border: 1px solid #e2e8f0; border-radius: 8px; padding: 9px; background: #ffffff; }
+      .metric .label { color: #64748b; font-size: 11px; }
+      .metric .value { margin-top: 4px; font-size: 13px; font-weight: 700; overflow-wrap: anywhere; }
       .event { border-left: 3px solid #94a3b8; padding: 0 0 14px 12px; margin-left: 6px; }
       .event.fail { border-left-color: #ef4444; }
       .event.ok { border-left-color: #22c55e; }
@@ -2537,7 +2549,9 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       .event .time { color: #64748b; font-size: 11px; margin-bottom: 6px; }
       pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #0f172a; color: #dbeafe; border-radius: 6px; padding: 10px; font-size: 12px; line-height: 1.45; margin: 0; }
       .empty { padding: 18px; color: #64748b; }
+      @media (max-width: 1100px) { .flow { grid-template-columns: repeat(3, minmax(118px, 1fr)); } .summary-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); } }
       @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+      @media (max-width: 560px) { .flow, .summary-grid { grid-template-columns: 1fr; } }
     </style>
   </head>
   <body>
@@ -2577,6 +2591,57 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         const tools = [...new Set(events.map(e => e.tool).filter(Boolean))];
         const failed = events.some(e => /failed|error/i.test(e.event || ""));
         return {tools, failed};
+      }
+      const flowStages = [
+        {key: "incoming", label: "DaxView In", match: e => /daxview|api_to_ui/i.test(e.event || "") || e.job_id},
+        {key: "plan", label: "Data Plan", match: e => /data_plan/i.test(e.event || "")},
+        {key: "mcp", label: "MCP Tool", match: e => /mcp_tool/i.test(e.event || "")},
+        {key: "retrieval", label: "Knowledge", match: e => /retrieve|context|embedding/i.test(e.event || "")},
+        {key: "model", label: "AI Model", match: e => /ollama|agent|synthesizer/i.test(e.event || "")},
+        {key: "response", label: "Response", match: e => /response|completed|api_to_ui/i.test(e.event || "")},
+      ];
+      function durationMs(events) {
+        const times = events.map(e => Date.parse(e.timestamp)).filter(Number.isFinite).sort((a, b) => a - b);
+        return times.length > 1 ? times[times.length - 1] - times[0] : 0;
+      }
+      function stageState(events, stage) {
+        const matches = events.filter(stage.match);
+        const failed = matches.some(e => /failed|error|timeout/i.test(e.event || ""));
+        return {matches, failed, status: failed ? "fail" : matches.length ? "done" : "pending"};
+      }
+      function renderFlow(events) {
+        return `<div class="flow">${flowStages.map(stage => {
+          const state = stageState(events, stage);
+          const last = state.matches[state.matches.length - 1] || {};
+          const detail = last.tool || last.provider || last.model || last.event || "No trace yet";
+          return `<div class="stage ${state.status}">
+            <div class="label">${escapeHtml(stage.label)}</div>
+            <div class="count">${state.matches.length}</div>
+            <div class="detail">${escapeHtml(detail)}</div>
+          </div>`;
+        }).join("")}</div>`;
+      }
+      function renderSummary(group) {
+        const events = group.events;
+        const info = summarize(events);
+        const models = [...new Set(events.map(e => e.model).filter(Boolean))];
+        const jobs = [...new Set(events.map(e => e.job_id).filter(Boolean))];
+        const errors = events.filter(e => /failed|error|timeout/i.test(e.event || ""));
+        const elapsed = durationMs(events);
+        const metrics = [
+          ["Request", group.id],
+          ["Duration", elapsed ? `${elapsed} ms` : "n/a"],
+          ["Tools", info.tools.join(", ") || "none"],
+          ["Models", models.join(", ") || "none"],
+          ["Job IDs", jobs.join(", ") || "none"],
+          ["Errors", String(errors.length)],
+          ["First Event", events[0]?.event || "n/a"],
+          ["Last Event", events[events.length - 1]?.event || "n/a"],
+        ];
+        return `<div class="summary-grid">${metrics.map(([label, value]) => `<div class="metric">
+          <div class="label">${escapeHtml(label)}</div>
+          <div class="value">${escapeHtml(value)}</div>
+        </div>`).join("")}</div>`;
       }
       function groupTraces(traces) {
         const map = new Map();
@@ -2632,7 +2697,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
           root.innerHTML = '<div class="empty">Select a request.</div>';
           return;
         }
-        root.innerHTML = group.events.map(event => {
+        const eventsHtml = group.events.map(event => {
           const cls = eventClass(event.event || "");
           return `<article class="event ${cls}">
             <h3>${escapeHtml(event.event || "event")}</h3>
@@ -2640,6 +2705,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
             <pre>${escapeHtml(JSON.stringify(event, null, 2))}</pre>
           </article>`;
         }).join("");
+        root.innerHTML = renderFlow(group.events) + renderSummary(group) + eventsHtml;
       }
       function escapeHtml(value) {
         return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
