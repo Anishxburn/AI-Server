@@ -1797,6 +1797,8 @@ Keep the answer concise but useful:
 - Mention the tool/data limitation only if a requested value is missing.
 - Hide backend/internal terms such as MCP, row_count, source_count, aggregation, authorization_id, request_id, and JSON field names.
 - If the user asks for max demand, explain whether the result is site-level, building-level, or device-level based on the data. If device-level detail is missing, say which follow-up question would retrieve it.
+- If demand data and device-list data are both present, do not say the device list caused or contributed to the max demand unless the data explicitly links demand to those devices. Present devices as "devices to inspect" or "candidate meters to check".
+- If the actual max-demand value is missing but device counts are present, say the max-demand value was not returned and then list the useful device/status context separately.
 
 User question:
 {message}
@@ -1853,6 +1855,25 @@ FOLLOW_UP_PHRASES = (
     "show calculation",
     "show me calculation",
     "more explanation",
+    "follow up",
+    "follow-up",
+    "reply to this",
+    "reply to this answer",
+    "about this answer",
+    "based on this answer",
+    "use previous answer",
+    "use the previous answer",
+    "based on previous",
+    "based on the previous",
+    "from this result",
+    "from that result",
+    "explain this result",
+    "make it cleaner",
+    "summarize this",
+    "summarise this",
+    "turn this into",
+    "what should i check",
+    "what should i do next",
 )
 
 
@@ -1888,7 +1909,10 @@ def resolve_follow_up_message(turn_id: str, message: str, context: dict, convers
     previous_context = previous.get("context") if isinstance(previous.get("context"), dict) else {}
     merged_context = {**previous_context, **context}
     resolved = (
-        "Provide a more detailed EMS breakdown and explanation for this previous request: "
+        "Answer this as a follow-up to the previous DaxView EMS answer. "
+        "Reuse the same site/building/device/time context unless the follow-up changes it. "
+        "Do not treat this as a brand new unrelated question. "
+        "Previous request: "
         f"{previous_message}. "
         f"Follow-up request: {message}"
     )
