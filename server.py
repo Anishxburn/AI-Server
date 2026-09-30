@@ -2134,11 +2134,71 @@ def historical_argument_clarification(error: ValueError, operation_id: str) -> s
     return "Choose a site and time range before I access DaxView historical data."
 
 
+def device_selection_prompt_from_result(mcp_result: dict) -> tuple[str, list[dict]]:
+    data = historical_result_data(mcp_result)
+    devices = first_list(data, ("devices", "rows", "items", "meters"))
+    choices = []
+    lines = [
+        "Which device should I use for the max-demand check?",
+        "Reply with a device ID, for example: `device ID 380 for the last 7 days`.",
+        "",
+        "Available devices:",
+    ]
+    for index, device in enumerate(devices[:12], 1):
+        if not isinstance(device, dict):
+            continue
+        name = device.get("device_name") or device.get("name") or device.get("meter_name") or "Unnamed device"
+        device_id = device.get("device_id") or device.get("id") or device.get("meter_id")
+        if device_id is None:
+            continue
+        status = device.get("status") or device.get("connection_status") or device.get("state") or "unknown"
+        device_type = device.get("device_type") or device.get("type") or device.get("model")
+        detail = f"{name} (ID {device_id}, {str(status).title()}"
+        if device_type:
+            detail += f", {device_type}"
+        detail += ")"
+        lines.append(f"{index}. {detail}")
+        choices.append({"label": name, "value": str(device_id), "description": f"ID {device_id}, {status}"})
+    total = data.get("device_count") or data.get("meter_count") or data.get("row_count") or len(devices)
+    if total and len(devices) > len(choices):
+        lines.append(f"Showing {len(choices)} selectable device(s).")
+    if not choices:
+        lines.append("No selectable devices were returned. Please provide the device ID manually.")
+    return "\n".join(lines), choices
+
+
+def build_device_choice_response(turn_id: str, message: str, context: dict, request_id: str) -> dict:
+    try:
+        arguments = build_historical_arguments("site_device_list", context, message)
+        plan = request_daxview_data_plan(turn_id, "site_device_list", arguments, request_id)
+        authorization_id = plan.get("authorization_id")
+        normalized_arguments = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else arguments
+        if not authorization_id:
+            raise RuntimeError("Daxview did not return a data authorization for site_device_list")
+        result = call_authorized_historical_tool("site_device_list", str(authorization_id), normalized_arguments, request_id)
+        prompt, choices = device_selection_prompt_from_result(result)
+    except Exception as error:
+        log_event("daxview_device_choice_failed", request_id=request_id, turn_id=turn_id, error=str(error))
+        prompt = (
+            "Which device should I use for the max-demand check? "
+            "Reply with the device ID, for example: `device ID 380 for the last 7 days`."
+        )
+        choices = []
+    return {
+        "provider": "daxview-question-filter",
+        "reply": prompt,
+        "fields": ["device_id"],
+        "choices": choices,
+    }
+
+
 def run_daxview_integration_turn(turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> dict:
     message, context = resolve_follow_up_message(turn_id, message, context, session_id, request_id)
     operation_ids = select_historical_operations(message)
     if not operation_ids:
         return langchain_chat_response(message, request_id, session_id)
+    if "demand_peak_summary" in operation_ids and needs_device_choice(message):
+        return build_device_choice_response(turn_id, message, context, request_id)
     results = []
     errors = []
     for operation_id in operation_ids:
@@ -2194,10 +2254,16 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
         if is_job_cancelled(job_id):
             return
         if result.get("provider") == "daxview-question-filter":
+            waiting_event = {
+                "prompt": result["reply"],
+                "fields": result.get("fields") or ["site_id", "building_id", "time_range"],
+            }
+            if result.get("choices"):
+                waiting_event["choices"] = result["choices"]
             add_job_event(
                 job_id,
                 "waiting_for_user",
-                {"prompt": result["reply"], "fields": ["site_id", "building_id", "time_range"]},
+                waiting_event,
             )
             update_job_status(job_id, "completed")
             add_job_event(job_id, "completed", {"status": "completed"})
