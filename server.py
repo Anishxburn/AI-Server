@@ -2102,6 +2102,22 @@ def resolve_follow_up_message(turn_id: str, message: str, context: dict, convers
     return resolved, merged_context
 
 
+def historical_argument_clarification(error: ValueError, operation_id: str) -> str:
+    detail = str(error).lower()
+    if "device_id" in detail:
+        return (
+            "I need the specific device ID before I can request a telemetry time series. "
+            "Try: `Show the voltage trend for device ID 380 for the last 24 hours.`"
+        )
+    if "alarm_id" in detail:
+        return "I need the alarm ID before I can look up alarm details. Try: `Show details for alarm ID 123`."
+    if "site_id" in detail:
+        return "Choose a DaxView site before I access historical data."
+    if operation_id == "telemetry_timeseries":
+        return "Choose a device ID and time range before I request telemetry time-series data."
+    return "Choose a site and time range before I access DaxView historical data."
+
+
 def run_daxview_integration_turn(turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> dict:
     message, context = resolve_follow_up_message(turn_id, message, context, session_id, request_id)
     operation_ids = select_historical_operations(message)
@@ -2112,10 +2128,10 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     for operation_id in operation_ids:
         try:
             arguments = build_historical_arguments(operation_id, context, message)
-        except ValueError:
+        except ValueError as error:
             return {
                 "provider": "daxview-question-filter",
-                "reply": "Choose a site and time range before I access Daxview historical data.",
+                "reply": historical_argument_clarification(error, operation_id),
             }
         try:
             plan = request_daxview_data_plan(turn_id, operation_id, arguments, request_id)
