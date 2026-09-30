@@ -37,6 +37,8 @@ TRACE_LIMIT = int(os.getenv("CHATBOT_TRACE_LIMIT", "25"))
 AI_DEBUG_DASHBOARD_ENABLED = os.getenv("AI_DEBUG_DASHBOARD_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 AI_DEBUG_DASHBOARD_KEY = os.getenv("AI_DEBUG_DASHBOARD_KEY", "").strip()
 AI_REFINE_MCP_WITH_MODEL = os.getenv("AI_REFINE_MCP_WITH_MODEL", "true").lower() in {"1", "true", "yes", "on"}
+AI_CHARTS_ENABLED = os.getenv("AI_CHARTS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+AI_COMPARE_MODE = os.getenv("AI_COMPARE_MODE", "false").lower() in {"1", "true", "yes", "on"}
 DAXVIEW_MCP_ENABLED = os.getenv("DAXVIEW_MCP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 DAXVIEW_MCP_URL = os.getenv("DAXVIEW_MCP_URL", "").strip()
 DAXVIEW_MCP_AUTH_TOKEN = os.getenv("DAXVIEW_MCP_AUTH_TOKEN", "").strip()
@@ -1777,6 +1779,17 @@ def summarize_historical_answers(
 def refine_historical_answer_with_model(message: str, results: list[dict], deterministic_answer: str, request_id: str) -> str:
     if not AI_REFINE_MCP_WITH_MODEL:
         return deterministic_answer
+    prompt = build_mcp_refine_prompt(message, results, deterministic_answer)
+    if AI_COMPARE_MODE:
+        answers = []
+        for label, model in (("Qwen", CHAT_MODEL), ("DeepSeek", DEEPSEEK_MODEL)):
+            reply = run_mcp_refine_model(prompt, request_id, model, deterministic_answer)
+            answers.append(f"{label} ({model})\n{reply}")
+        return "\n\n---\n\n".join(answers)
+    return run_mcp_refine_model(prompt, request_id, CHAT_MODEL, deterministic_answer)
+
+
+def build_mcp_refine_prompt(message: str, results: list[dict], deterministic_answer: str) -> str:
     mcp_context = {
         "enabled": True,
         "tools": [item.get("operation_id") for item in results],
@@ -1810,13 +1823,16 @@ DaxView data summary:
 {raw_context}
 
 Final answer:"""
+
+
+def run_mcp_refine_model(prompt: str, request_id: str, model: str, fallback_answer: str) -> str:
     started_at = time.perf_counter()
-    log_event("mcp_answer_refine_request", request_id=request_id, model=CHAT_MODEL, prompt_preview=preview(prompt))
+    log_event("mcp_answer_refine_request", request_id=request_id, model=model, prompt_preview=preview(prompt))
     try:
         data = ollama_json(
             "/api/generate",
             {
-                "model": CHAT_MODEL,
+                "model": model,
                 "prompt": prompt,
                 "stream": False,
                 "options": {"temperature": 0.15},
@@ -1824,13 +1840,174 @@ Final answer:"""
             timeout=OLLAMA_GENERATE_TIMEOUT,
         )
     except (TimeoutError, URLError, json.JSONDecodeError) as error:
-        log_event("mcp_answer_refine_error", request_id=request_id, error=str(error))
-        return deterministic_answer
+        log_event("mcp_answer_refine_error", request_id=request_id, model=model, error=str(error))
+        return fallback_answer
     reply = clean_final_answer(str(data.get("response", "")).strip())
     if not reply:
-        return deterministic_answer
-    log_event("mcp_answer_refine_response", request_id=request_id, duration_ms=round((time.perf_counter() - started_at) * 1000))
+        return fallback_answer
+    log_event("mcp_answer_refine_response", request_id=request_id, model=model, duration_ms=round((time.perf_counter() - started_at) * 1000))
     return reply
+
+
+def chart_number(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def chart_label(row: dict, fallback: str = "item") -> str:
+    for key in ("device_name", "alarm_name", "name", "label", "timestamp", "bucket", "date", "started_at"):
+        value = row.get(key)
+        if value:
+            return str(value)
+    for key in ("device_id", "alarm_id", "id"):
+        value = row.get(key)
+        if value is not None:
+            return f"{fallback} {value}"
+    return fallback
+
+
+def chart_value(row: dict, keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = chart_number(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def build_chart_spec(chart_type: str, title: str, labels: list[str], values: list[float], unit: str = "", series_name: str = "value") -> dict | None:
+    if not labels or not values or len(labels) != len(values):
+        return None
+    return {
+        "type": chart_type,
+        "title": title,
+        "labels": labels,
+        "series": [{"name": series_name, "unit": unit, "data": values}],
+    }
+
+
+def chart_from_historical_result(operation_id: str, result: dict, arguments: dict | None = None) -> dict | None:
+    data = historical_result_data(result)
+    if not data:
+        return None
+    if operation_id == "site_energy_summary":
+        rows = first_list(data, ("series", "buckets", "rows", "data"))
+        labels = []
+        values = []
+        for row in rows[:60]:
+            if not isinstance(row, dict):
+                continue
+            label = str(row.get("timestamp") or row.get("bucket") or row.get("date") or row.get("start") or "")
+            value = chart_value(row, ("value", "kwh", "energy", "consumption"))
+            if label and value is not None:
+                labels.append(label)
+                values.append(value)
+        unit = data.get("unit") or (data.get("display") or {}).get("unit") if isinstance(data.get("display"), dict) else data.get("unit") or "kWh"
+        return build_chart_spec("line", "Site Energy Summary", labels, values, unit or "kWh", "Energy")
+    if operation_id == "telemetry_top_consumers":
+        rows = first_list(data, ("rows", "items", "results", "top_consumers", "consumers", "devices"))
+        labels = []
+        values = []
+        for row in rows[:10]:
+            if not isinstance(row, dict):
+                continue
+            value = chart_value(row, ("value", "kwh", "total_kwh", "consumption", "energy", "consumption_delta"))
+            if value is not None:
+                labels.append(chart_label(row, "device"))
+                values.append(value)
+        return build_chart_spec("bar", "Top Energy Consumers", labels, values, data.get("unit") or "kWh", "Consumption")
+    if operation_id == "alarm_frequency_summary":
+        rows = first_list(data, ("rows", "alarms", "items"))
+        labels = []
+        values = []
+        for row in rows[:10]:
+            if not isinstance(row, dict):
+                continue
+            value = chart_value(row, ("count", "frequency", "total", "value"))
+            if value is not None:
+                labels.append(chart_label(row, "alarm"))
+                values.append(value)
+        return build_chart_spec("bar", "Alarm Frequency", labels, values, "occurrence(s)", "Alarms")
+    if operation_id == "active_alarm_summary":
+        labels = []
+        values = []
+        for key, label in (("critical_count", "Critical"), ("warning_count", "Warning"), ("active_count", "Active")):
+            value = chart_number(data.get(key))
+            if value is not None:
+                labels.append(label)
+                values.append(value)
+        return build_chart_spec("donut", "Active Alarm Summary", labels, values, "alarm(s)", "Alarms")
+    if operation_id == "meter_status_summary":
+        labels = []
+        values = []
+        for key, label in (("online_count", "Online"), ("offline_count", "Offline"), ("stale_count", "Stale"), ("unknown_count", "Unknown")):
+            value = chart_number(data.get(key))
+            if value is not None:
+                labels.append(label)
+                values.append(value)
+        if not values:
+            rows = first_list(data, ("rows", "devices", "items", "meters"))
+            counts: dict[str, float] = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                status = str(row.get("status") or row.get("data_status") or "unknown").title()
+                counts[status] = counts.get(status, 0) + 1
+            labels = list(counts.keys())
+            values = list(counts.values())
+        return build_chart_spec("donut", "Meter Status", labels, values, "device(s)", "Devices")
+    if operation_id == "demand_peak_summary":
+        rows = first_list(data, ("rows", "items", "peaks", "series"))
+        labels = []
+        values = []
+        for row in rows[:20]:
+            if not isinstance(row, dict):
+                continue
+            value = chart_value(row, ("peak_kw", "max_kw", "demand_kw", "value", "peak", "maximum"))
+            if value is not None:
+                labels.append(chart_label(row, "peak"))
+                values.append(value)
+        if not values:
+            value = chart_value(data, ("peak_kw", "max_kw", "demand_kw", "value", "peak", "maximum"))
+            if value is not None:
+                labels = [str(data.get("peak_time") or data.get("timestamp") or "Peak demand")]
+                values = [value]
+        return build_chart_spec("bar", "Peak Demand", labels, values, data.get("unit") or "kW", "Demand")
+    if operation_id == "energy_forecast":
+        rows = first_list(data, ("forecast", "rows", "series", "items"))
+        labels = []
+        values = []
+        for row in rows[:30]:
+            if not isinstance(row, dict):
+                continue
+            value = chart_value(row, ("value", "forecast", "kwh", "energy", "predicted_value"))
+            if value is not None:
+                labels.append(chart_label(row, "forecast"))
+                values.append(value)
+        return build_chart_spec("line", "Energy Forecast", labels, values, data.get("unit") or "kWh", "Forecast")
+    return None
+
+
+def build_charts_from_historical_results(results: list[dict]) -> list[dict]:
+    if not AI_CHARTS_ENABLED:
+        return []
+    charts = []
+    for item in results:
+        chart = chart_from_historical_result(
+            str(item.get("operation_id")),
+            item.get("result") if isinstance(item.get("result"), dict) else {},
+            item.get("arguments") if isinstance(item.get("arguments"), dict) else None,
+        )
+        if chart:
+            charts.append(chart)
+    return charts
 
 
 FOLLOW_UP_PHRASES = (
@@ -1967,9 +2144,11 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         failed_tools = ", ".join(str(item["operation_id"]) for item in errors)
         deterministic_reply = f"{deterministic_reply}\n\nUnavailable detail: {failed_tools} could not be retrieved for this request."
     refined_reply = refine_historical_answer_with_model(message, results, deterministic_reply, request_id)
+    charts = build_charts_from_historical_results(results)
     return {
         "provider": "daxview-historical-mcp",
         "reply": refined_reply,
+        "charts": charts,
     }
 
 
@@ -1991,7 +2170,10 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
             update_job_status(job_id, "completed")
             add_job_event(job_id, "completed", {"status": "completed"})
             return
-        add_job_event(job_id, "message", {"text": result["reply"]})
+        message_event = {"text": result["reply"]}
+        if result.get("charts"):
+            message_event["charts"] = result["charts"]
+        add_job_event(job_id, "message", message_event)
         update_job_status(job_id, "completed")
         add_job_event(job_id, "completed", {"status": "completed"})
     except Exception as error:
