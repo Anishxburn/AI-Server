@@ -38,7 +38,6 @@ AI_DEBUG_DASHBOARD_ENABLED = os.getenv("AI_DEBUG_DASHBOARD_ENABLED", "false").lo
 AI_DEBUG_DASHBOARD_KEY = os.getenv("AI_DEBUG_DASHBOARD_KEY", "").strip()
 AI_REFINE_MCP_WITH_MODEL = os.getenv("AI_REFINE_MCP_WITH_MODEL", "true").lower() in {"1", "true", "yes", "on"}
 AI_CHARTS_ENABLED = os.getenv("AI_CHARTS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-AI_COMPARE_MODE = os.getenv("AI_COMPARE_MODE", "false").lower() in {"1", "true", "yes", "on"}
 DAXVIEW_MCP_ENABLED = os.getenv("DAXVIEW_MCP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 DAXVIEW_MCP_URL = os.getenv("DAXVIEW_MCP_URL", "").strip()
 DAXVIEW_MCP_AUTH_TOKEN = os.getenv("DAXVIEW_MCP_AUTH_TOKEN", "").strip()
@@ -1784,12 +1783,6 @@ def refine_historical_answer_with_model(message: str, results: list[dict], deter
     if not AI_REFINE_MCP_WITH_MODEL:
         return deterministic_answer
     prompt = build_mcp_refine_prompt(message, results, deterministic_answer)
-    if AI_COMPARE_MODE:
-        answers = []
-        for label, model in (("Qwen", CHAT_MODEL), ("DeepSeek", DEEPSEEK_MODEL)):
-            reply = run_mcp_refine_model(prompt, request_id, model, deterministic_answer)
-            answers.append(f"{label} ({model})\n{reply}")
-        return "\n\n---\n\n".join(answers)
     return run_mcp_refine_model(prompt, request_id, CHAT_MODEL, deterministic_answer)
 
 
