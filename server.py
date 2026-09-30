@@ -2188,7 +2188,9 @@ def build_device_choice_response(turn_id: str, message: str, context: dict, requ
         "provider": "daxview-question-filter",
         "reply": prompt,
         "fields": ["device_id"],
+        "input_type": "select",
         "choices": choices,
+        "submit_template": "device ID {value} for the last 7 days",
     }
 
 
@@ -2258,8 +2260,12 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
                 "prompt": result["reply"],
                 "fields": result.get("fields") or ["site_id", "building_id", "time_range"],
             }
+            if result.get("input_type"):
+                waiting_event["input_type"] = result["input_type"]
             if result.get("choices"):
                 waiting_event["choices"] = result["choices"]
+            if result.get("submit_template"):
+                waiting_event["submit_template"] = result["submit_template"]
             add_job_event(
                 job_id,
                 "waiting_for_user",
