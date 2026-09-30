@@ -9,6 +9,7 @@ import json
 import os
 import re
 import time
+import traceback
 import uuid
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
@@ -530,8 +531,10 @@ def log_event(event: str, **fields: object) -> None:
     print(json.dumps(record, ensure_ascii=False), flush=True)
 
 
-def preview(text: str, limit: int = 240) -> str:
-    normalized = " ".join(text.split())
+def preview(text: object, limit: int = 240) -> str:
+    if text is None:
+        return ""
+    normalized = " ".join(str(text).split())
     return normalized if len(normalized) <= limit else f"{normalized[:limit]}..."
 
 
@@ -2206,7 +2209,14 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
         update_job_status(job_id, "completed")
         add_job_event(job_id, "completed", {"status": "completed"})
     except Exception as error:
-        log_event("daxview_job_failed", request_id=request_id, job_id=job_id, error=str(error))
+        log_event(
+            "daxview_job_failed",
+            request_id=request_id,
+            job_id=job_id,
+            error=str(error),
+            error_type=type(error).__name__,
+            traceback=traceback.format_exc(limit=6),
+        )
         update_job_status(job_id, "failed")
         add_job_event(job_id, "failed", {"status": "failed", "text": "AI response generation failed."})
 
@@ -2841,6 +2851,9 @@ Final answer only:"""
 
 
 def clean_final_answer(reply: str) -> str:
+    if reply is None:
+        return ""
+    reply = str(reply)
     lines = []
     skip_patterns = (
         "the better final answer is",
