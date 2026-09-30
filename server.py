@@ -99,7 +99,8 @@ EMS_KEYWORDS = {
     "swell", "transient", "flicker", "unbalance", "imbalance", "phase loss",
     "overvoltage", "undervoltage", "current", "frequency", "thd", "power quality",
     "event", "alarm", "fault", "disturbance", "waveform", "rms", "l-n", "l-l",
-    "daxview", "site summary", "device summary", "inventory", "open alarms",
+    "daxview", "site summary", "summary for this site", "summary of this site",
+    "this site", "device summary", "inventory", "open alarms",
 }
 
 DAXVIEW_TOOL_KEYWORDS = {
@@ -123,6 +124,7 @@ DAXVIEW_TOOL_KEYWORDS = {
         "what site", "current site", "site details", "details about this site",
         "site metadata", "site context", "buildings under this site",
         "site info", "site information", "site summary", "summary details of this site",
+        "summary for this site", "summary of this site", "this site summary",
         "all details", "other info",
     },
     "site_device_list": {
@@ -717,6 +719,8 @@ def select_historical_operations(message: str) -> list[str]:
         for phrase in (
             "all details",
             "summary details",
+            "summary for this site",
+            "summary of this site",
             "site summary",
             "site information",
             "devices and",
