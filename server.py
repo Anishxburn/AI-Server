@@ -27,6 +27,9 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-r1:1.5b")
 CHAT_MODEL = os.getenv("CHAT_MODEL", OLLAMA_MODEL)
+AI_COMPARE_MODEL_ENABLED = os.getenv("AI_COMPARE_MODEL_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+AI_COMPARE_MODEL = os.getenv("AI_COMPARE_MODEL", DEEPSEEK_MODEL).strip()
+AI_COMPARE_MODEL_SHOW_TO_USER = os.getenv("AI_COMPARE_MODEL_SHOW_TO_USER", "true").lower() in {"1", "true", "yes", "on"}
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 OLLAMA_GENERATE_TIMEOUT = int(os.getenv("OLLAMA_GENERATE_TIMEOUT", "120"))
 OLLAMA_EMBEDDING_TIMEOUT = int(os.getenv("OLLAMA_EMBEDDING_TIMEOUT", "30"))
@@ -1783,7 +1786,20 @@ def refine_historical_answer_with_model(message: str, results: list[dict], deter
     if not AI_REFINE_MCP_WITH_MODEL:
         return deterministic_answer
     prompt = build_mcp_refine_prompt(message, results, deterministic_answer)
-    return run_mcp_refine_model(prompt, request_id, CHAT_MODEL, deterministic_answer)
+    primary_answer = run_mcp_refine_model(prompt, request_id, CHAT_MODEL, deterministic_answer, role="primary")
+    if not AI_COMPARE_MODEL_ENABLED or not AI_COMPARE_MODEL or AI_COMPARE_MODEL == CHAT_MODEL:
+        return primary_answer
+    compare_answer = run_mcp_refine_model(prompt, request_id, AI_COMPARE_MODEL, "", role="compare")
+    if not compare_answer:
+        return primary_answer
+    if not AI_COMPARE_MODEL_SHOW_TO_USER:
+        log_event("mcp_answer_compare_hidden", request_id=request_id, primary_model=CHAT_MODEL, compare_model=AI_COMPARE_MODEL)
+        return primary_answer
+    return (
+        f"{primary_answer}\n\n"
+        f"Alternative model view ({AI_COMPARE_MODEL})\n"
+        f"{compare_answer}"
+    )
 
 
 def build_mcp_refine_prompt(message: str, results: list[dict], deterministic_answer: str) -> str:
@@ -1822,9 +1838,9 @@ DaxView data summary:
 Final answer:"""
 
 
-def run_mcp_refine_model(prompt: str, request_id: str, model: str, fallback_answer: str) -> str:
+def run_mcp_refine_model(prompt: str, request_id: str, model: str, fallback_answer: str, role: str = "primary") -> str:
     started_at = time.perf_counter()
-    log_event("mcp_answer_refine_request", request_id=request_id, model=model, prompt_preview=preview(prompt))
+    log_event("mcp_answer_refine_request", request_id=request_id, model=model, role=role, prompt_preview=preview(prompt))
     try:
         data = ollama_json(
             "/api/generate",
@@ -1837,12 +1853,12 @@ def run_mcp_refine_model(prompt: str, request_id: str, model: str, fallback_answ
             timeout=OLLAMA_GENERATE_TIMEOUT,
         )
     except (TimeoutError, URLError, json.JSONDecodeError) as error:
-        log_event("mcp_answer_refine_error", request_id=request_id, model=model, error=str(error))
+        log_event("mcp_answer_refine_error", request_id=request_id, model=model, role=role, error=str(error))
         return fallback_answer
     reply = clean_final_answer(str(data.get("response", "")).strip())
     if not reply:
         return fallback_answer
-    log_event("mcp_answer_refine_response", request_id=request_id, model=model, duration_ms=round((time.perf_counter() - started_at) * 1000))
+    log_event("mcp_answer_refine_response", request_id=request_id, model=model, role=role, duration_ms=round((time.perf_counter() - started_at) * 1000))
     return reply
 
 
