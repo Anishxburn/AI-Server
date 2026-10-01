@@ -30,6 +30,9 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-r1:1.5b")
 CHAT_MODEL = os.getenv("CHAT_MODEL", OLLAMA_MODEL)
 AI_COMPARE_MODEL_ENABLED = os.getenv("AI_COMPARE_MODEL_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 AI_COMPARE_MODEL = os.getenv("AI_COMPARE_MODEL", DEEPSEEK_MODEL).strip()
+AI_COMPARE_MODELS = [model.strip() for model in os.getenv("AI_COMPARE_MODELS", "").split(",") if model.strip()]
+if not AI_COMPARE_MODELS and AI_COMPARE_MODEL:
+    AI_COMPARE_MODELS = [AI_COMPARE_MODEL]
 AI_COMPARE_MODEL_SHOW_TO_USER = os.getenv("AI_COMPARE_MODEL_SHOW_TO_USER", "true").lower() in {"1", "true", "yes", "on"}
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 OLLAMA_GENERATE_TIMEOUT = int(os.getenv("OLLAMA_GENERATE_TIMEOUT", "120"))
@@ -529,6 +532,18 @@ def log_event(event: str, **fields: object) -> None:
             }
         )
     print(json.dumps(record, ensure_ascii=False), flush=True)
+
+
+def debug_trace_event(event: str, **fields: object) -> None:
+    if not (AI_DEBUG_DASHBOARD_ENABLED and AI_DEBUG_DASHBOARD_KEY):
+        return
+    TRACES.appendleft(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": event,
+            **redact_debug_value(fields),
+        }
+    )
 
 
 def preview(text: object, limit: int = 240) -> str:
@@ -1790,18 +1805,30 @@ def refine_historical_answer_with_model(message: str, results: list[dict], deter
         return deterministic_answer
     prompt = build_mcp_refine_prompt(message, results, deterministic_answer)
     primary_answer = run_mcp_refine_model(prompt, request_id, CHAT_MODEL, deterministic_answer, role="primary")
-    if not AI_COMPARE_MODEL_ENABLED or not AI_COMPARE_MODEL or AI_COMPARE_MODEL == CHAT_MODEL:
+    if not AI_COMPARE_MODEL_ENABLED:
         return primary_answer
-    compare_answer = run_mcp_refine_model(prompt, request_id, AI_COMPARE_MODEL, "", role="compare")
-    if not compare_answer:
+    comparison_answers = []
+    for model in AI_COMPARE_MODELS:
+        if not model or model == CHAT_MODEL:
+            continue
+        compare_answer = run_mcp_refine_model(prompt, request_id, model, "", role="compare")
+        if not compare_answer:
+            continue
+        debug_trace_event("mcp_answer_compare_selected", request_id=request_id, model=model, role="compare")
+        comparison_answers.append((model, compare_answer))
+    if not comparison_answers:
         return primary_answer
     if not AI_COMPARE_MODEL_SHOW_TO_USER:
-        log_event("mcp_answer_compare_hidden", request_id=request_id, primary_model=CHAT_MODEL, compare_model=AI_COMPARE_MODEL)
+        log_event(
+            "mcp_answer_compare_hidden",
+            request_id=request_id,
+            primary_model=CHAT_MODEL,
+            compare_models=[model for model, _ in comparison_answers],
+        )
         return primary_answer
-    return (
-        f"{primary_answer}\n\n"
-        f"Alternative model view ({AI_COMPARE_MODEL})\n"
-        f"{compare_answer}"
+    return "\n\n".join(
+        [f"Primary model ({CHAT_MODEL})\n{primary_answer}"]
+        + [f"Alternative model view ({model})\n{answer}" for model, answer in comparison_answers]
     )
 
 
@@ -1862,6 +1889,14 @@ def run_mcp_refine_model(prompt: str, request_id: str, model: str, fallback_answ
     if not reply:
         return fallback_answer
     log_event("mcp_answer_refine_response", request_id=request_id, model=model, role=role, duration_ms=round((time.perf_counter() - started_at) * 1000))
+    debug_trace_event(
+        "mcp_answer_refine_response_debug",
+        request_id=request_id,
+        model=model,
+        role=role,
+        duration_ms=round((time.perf_counter() - started_at) * 1000),
+        answer=reply,
+    )
     return reply
 
 
@@ -2197,6 +2232,13 @@ def build_device_choice_response(turn_id: str, message: str, context: dict, requ
 def run_daxview_integration_turn(turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> dict:
     message, context = resolve_follow_up_message(turn_id, message, context, session_id, request_id)
     operation_ids = select_historical_operations(message)
+    debug_trace_event(
+        "daxview_tool_selection_debug",
+        request_id=request_id,
+        turn_id=turn_id,
+        operation_ids=operation_ids,
+        message=message,
+    )
     if not operation_ids:
         return langchain_chat_response(message, request_id, session_id)
     if "demand_peak_summary" in operation_ids and needs_device_choice(message):
@@ -2239,6 +2281,13 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         deterministic_reply = f"{deterministic_reply}\n\nUnavailable detail: {failed_tools} could not be retrieved for this request."
     refined_reply = refine_historical_answer_with_model(message, results, deterministic_reply, request_id)
     charts = build_charts_from_historical_results(results)
+    debug_trace_event(
+        "ai_final_response_debug",
+        request_id=request_id,
+        model=CHAT_MODEL if AI_REFINE_MCP_WITH_MODEL else "deterministic",
+        answer=refined_reply,
+        charts=charts,
+    )
     return {
         "provider": "daxview-historical-mcp",
         "reply": refined_reply,
@@ -2475,6 +2524,12 @@ def call_daxview_mcp_tool(tool_name: str, arguments: dict | None, request_id: st
             tool=tool_name,
             arguments=redact_debug_value(arguments or {}),
         )
+        debug_trace_event(
+            "mcp_tool_request_payload_debug",
+            request_id=request_id,
+            tool=tool_name,
+            arguments=arguments or {},
+        )
     response = mcp_json_rpc(
         "tools/call",
         {"name": tool_name, "arguments": arguments or {}},
@@ -2492,6 +2547,13 @@ def call_daxview_mcp_tool(tool_name: str, arguments: dict | None, request_id: st
     if DAXVIEW_MCP_DEBUG_RESPONSE:
         log_event(
             "mcp_tool_response_debug",
+            request_id=request_id,
+            tool=tool_name,
+            shape=mcp_result_shape(result),
+            sample=debug_json_sample(result, DAXVIEW_MCP_DEBUG_RESPONSE_LIMIT),
+        )
+        debug_trace_event(
+            "mcp_tool_response_payload_debug",
             request_id=request_id,
             tool=tool_name,
             shape=mcp_result_shape(result),
@@ -2991,6 +3053,15 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       .event.ok { border-left-color: #22c55e; }
       .event h3 { margin: 0 0 6px; font-size: 13px; }
       .event .time { color: #64748b; font-size: 11px; margin-bottom: 6px; }
+      .inspectors { display: grid; gap: 12px; padding: 12px 14px; border-bottom: 1px solid #e5ebf3; }
+      .inspectors h3 { margin: 0 0 8px; font-size: 13px; }
+      .inspectors details { border-top: 1px solid #e5ebf3; padding: 8px 0; }
+      .inspectors summary { cursor: pointer; font-size: 12px; font-weight: 700; }
+      .answer-block { border-left: 3px solid #0ea5e9; padding: 8px 10px; margin-top: 8px; white-space: pre-wrap; font-size: 12px; line-height: 1.5; }
+      .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
+      .chart-item { border: 1px solid #dbe3ef; padding: 10px; min-width: 0; }
+      .chart-item strong { font-size: 12px; }
+      .chart-item canvas { display: block; width: 100%; height: 220px; margin-top: 8px; }
       pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #0f172a; color: #dbeafe; border-radius: 6px; padding: 10px; font-size: 12px; line-height: 1.45; margin: 0; }
       .empty { padding: 18px; color: #64748b; }
       @media (max-width: 1100px) { .flow { grid-template-columns: repeat(3, minmax(118px, 1fr)); } .summary-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); } }
@@ -3087,6 +3158,67 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
           <div class="value">${escapeHtml(value)}</div>
         </div>`).join("")}</div>`;
       }
+      function renderInspectors(events) {
+        const answers = events.filter(e => e.event === "mcp_answer_refine_response_debug");
+        const final = events.find(e => e.event === "ai_final_response_debug");
+        const payloads = events.filter(e => e.event === "mcp_tool_request_payload_debug" || e.event === "mcp_tool_response_payload_debug");
+        const answerHtml = answers.map((item, index) => `<div class="answer-block"><strong>${escapeHtml(item.role || "model")} - ${escapeHtml(item.model || "unknown model")}</strong><br>${escapeHtml(item.answer || "")}</div>`).join("");
+        const chartItems = (final?.charts || []).map((chart, index) => `<div class="chart-item"><strong>${escapeHtml(chart.title || "Chart")}</strong><canvas id="trace-chart-${index}" data-spec="${escapeHtml(JSON.stringify(chart))}" aria-label="${escapeHtml(chart.title || "Chart preview")}"></canvas></div>`).join("");
+        const payloadHtml = payloads.map(item => `<details><summary>${escapeHtml(item.event.replace("_debug", ""))} · ${escapeHtml(item.tool || "")}</summary><pre>${escapeHtml(JSON.stringify(item, null, 2))}</pre></details>`).join("");
+        if (!answerHtml && !chartItems && !payloadHtml) return "";
+        return `<section class="inspectors">
+          ${answerHtml ? `<div><h3>Model answers</h3>${answerHtml}</div>` : ""}
+          ${chartItems ? `<div><h3>Chart preview</h3><div class="chart-grid">${chartItems}</div></div>` : ""}
+          ${payloadHtml ? `<div><h3>MCP payloads</h3>${payloadHtml}</div>` : ""}
+        </section>`;
+      }
+      function drawCharts() {
+        document.querySelectorAll("canvas[data-spec]").forEach(canvas => {
+          let spec;
+          try { spec = JSON.parse(canvas.dataset.spec); } catch { return; }
+          const ctx = canvas.getContext("2d");
+          if (!ctx) return;
+          const scale = window.devicePixelRatio || 1;
+          const width = Math.max(canvas.clientWidth, 280);
+          const height = 220;
+          canvas.width = width * scale;
+          canvas.height = height * scale;
+          ctx.scale(scale, scale);
+          const series = spec.series?.[0];
+          const values = (series?.data || []).map(Number).filter(Number.isFinite);
+          const labels = (spec.labels || []).slice(0, values.length);
+          if (!values.length) return;
+          const colors = ["#0284c7", "#16a34a", "#e11d48", "#d97706", "#0891b2", "#4f46e5"];
+          ctx.font = "11px system-ui";
+          ctx.fillStyle = "#475569";
+          if (spec.type === "donut") {
+            const total = values.reduce((sum, value) => sum + Math.max(value, 0), 0) || 1;
+            let angle = -Math.PI / 2;
+            values.forEach((value, i) => {
+              const next = angle + Math.max(value, 0) / total * Math.PI * 2;
+              ctx.beginPath(); ctx.arc(width / 2, 92, 62, angle, next); ctx.arc(width / 2, 92, 34, next, angle, true);
+              ctx.closePath(); ctx.fillStyle = colors[i % colors.length]; ctx.fill(); angle = next;
+              ctx.fillStyle = "#334155"; ctx.fillText(`${labels[i] || "Item"}: ${value}`, 12, 178 + i * 14);
+            });
+            return;
+          }
+          const max = Math.max(...values, 1);
+          const left = 42, right = 12, top = 12, bottom = 46;
+          const plotW = width - left - right, plotH = height - top - bottom;
+          ctx.strokeStyle = "#cbd5e1"; ctx.beginPath(); ctx.moveTo(left, top); ctx.lineTo(left, top + plotH); ctx.lineTo(width - right, top + plotH); ctx.stroke();
+          if (spec.type === "line") {
+            ctx.strokeStyle = colors[0]; ctx.lineWidth = 2; ctx.beginPath();
+            values.forEach((value, i) => { const x = left + (values.length === 1 ? plotW / 2 : i * plotW / (values.length - 1)); const y = top + plotH - value / max * plotH; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }); ctx.stroke();
+            values.forEach((value, i) => { const x = left + (values.length === 1 ? plotW / 2 : i * plotW / (values.length - 1)); const y = top + plotH - value / max * plotH; ctx.fillStyle = colors[0]; ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill(); });
+          } else {
+            const slot = plotW / values.length, barW = Math.max(4, slot * 0.62);
+            values.forEach((value, i) => { const barH = value / max * plotH; ctx.fillStyle = colors[i % colors.length]; ctx.fillRect(left + i * slot + (slot - barW) / 2, top + plotH - barH, barW, barH); });
+          }
+          const step = Math.max(1, Math.ceil(labels.length / 6));
+          labels.forEach((label, i) => { if (i % step === 0) { const x = left + (values.length === 1 ? plotW / 2 : i * plotW / Math.max(values.length - 1, 1)); ctx.save(); ctx.translate(x, height - 8); ctx.rotate(-0.3); ctx.fillStyle = "#475569"; ctx.fillText(String(label).slice(0, 18), -12, 0); ctx.restore(); } });
+          ctx.fillStyle = "#64748b"; ctx.fillText(series?.unit || "", 4, 12);
+        });
+      }
       function groupTraces(traces) {
         const map = new Map();
         for (const trace of traces) {
@@ -3149,7 +3281,8 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
             <pre>${escapeHtml(JSON.stringify(event, null, 2))}</pre>
           </article>`;
         }).join("");
-        root.innerHTML = renderFlow(group.events) + renderSummary(group) + eventsHtml;
+        root.innerHTML = renderFlow(group.events) + renderSummary(group) + renderInspectors(group.events) + eventsHtml;
+        drawCharts();
       }
       function escapeHtml(value) {
         return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
