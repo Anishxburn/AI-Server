@@ -17,13 +17,15 @@ FUNCTIONS = {
 }
 NAMES = (
     "requested_top_limit", "requested_forecast_days", "requested_energy_extrema",
-    "requested_question_parts", "completed_daily_range", "select_historical_operations",
+    "requested_question_parts", "completed_daily_range", "wants_device_usage_ranking", "wants_all_devices",
+    "select_historical_operations", "build_historical_arguments",
     "parse_datetime", "local_bucket_date", "first_list", "predict_daily_energy",
     "is_follow_up_message", "resolve_follow_up_message", "needs_ems_library",
     "build_compliance_context", "has_time_scope", "first_regex_int", "needs_device_choice",
     "run_authorized_energy_prediction", "run_daxview_integration_turn",
     "build_charts_from_historical_results", "summarize_site_energy",
-    "ensure_historical_answer_coverage",
+    "ensure_historical_answer_coverage", "ranked_consumer_rows", "summarize_top_consumers",
+    "summarize_historical_answers",
 )
 
 
@@ -68,6 +70,63 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertEqual(self.env["select_historical_operations"](question), ["site_energy_summary"])
         self.assertEqual(self.env["requested_energy_extrema"](question), (True, True))
         self.assertEqual(len(self.env["requested_question_parts"](question)), 2)
+
+    def test_device_ranking_uses_consumers_and_status_not_site_daily_totals(self):
+        question = "Which devices contributed most to energy use during that period? Show the top five and tell me which are offline."
+        self.assertEqual(
+            self.env["select_historical_operations"](question),
+            ["telemetry_top_consumers", "site_device_list"],
+        )
+        all_question = "List out all the devices and rank them based on usage"
+        self.assertEqual(
+            self.env["select_historical_operations"](all_question),
+            ["telemetry_top_consumers", "site_device_list"],
+        )
+        self.env["requested_historical_range"] = Mock(return_value={"start": "start", "end": "end", "timezone": "Asia/Kuala_Lumpur"})
+        args = self.env["build_historical_arguments"]("telemetry_top_consumers", {"site_id": 17}, all_question)
+        self.assertEqual(args["limit"], 100)
+
+    def test_ranking_sorts_numeric_usage_and_joins_current_status(self):
+        self.env["historical_result_data"] = lambda result: result["data"]
+        self.env["first_value"] = lambda row, keys: next((row[key] for key in keys if row.get(key) is not None), None)
+        self.env["format_time_window"] = lambda data, arguments: "last 7 days"
+        self.env["format_number"] = lambda value, precision=2: f"{value:.2f}"
+        self.env["reading_detail"] = lambda *args: None
+        results = [
+            {"operation_id": "telemetry_top_consumers", "arguments": {"limit": 5}, "result": {"data": {
+                "unit": "kWh", "rows": [
+                    {"device_id": 2, "device_name": "Low meter", "value": 10},
+                    {"device_id": 1, "device_name": "High meter", "value": 20},
+                    {"device_id": 3, "device_name": "Missing meter", "value": None},
+                ],
+            }}},
+            {"operation_id": "site_device_list", "result": {"data": {"devices": [
+                {"device_id": 1, "device_name": "High meter", "status": "offline"},
+                {"device_id": 2, "device_name": "Low meter", "status": "online"},
+                {"device_id": 3, "device_name": "Missing meter", "status": "unknown"},
+            ]}}},
+        ]
+        answer = self.env["summarize_historical_answers"](
+            "List all devices and rank them by usage; show which are offline", results, "request"
+        )
+        self.assertLess(answer.index("1. High meter"), answer.index("2. Low meter"))
+        self.assertIn("High meter (ID 1): offline", answer)
+        self.assertIn("Missing meter (ID 3)", answer)
+        self.assertIn("usage not returned, so not ranked", answer)
+
+    def test_model_cannot_drop_ranked_device(self):
+        self.env["historical_result_data"] = lambda result: result["data"]
+        self.env["first_value"] = lambda row, keys: next((row[key] for key in keys if row.get(key) is not None), None)
+        self.env["log_event"] = Mock()
+        results = [{"operation_id": "telemetry_top_consumers", "arguments": {"limit": 2}, "result": {"data": {
+            "rows": [{"device_name": "High meter", "value": 20}, {"device_name": "Low meter", "value": 10}]
+        }}}]
+        draft = "1. High meter: 20 kWh\n2. Low meter: 10 kWh"
+        answer = self.env["ensure_historical_answer_coverage"](
+            "Rank devices by energy usage", results, draft, "High meter used 20 kWh.", "request"
+        )
+        self.assertEqual(answer, draft)
+        self.env["log_event"].assert_called_once()
 
     def test_daily_energy_extrema_use_seven_complete_days(self):
         question = "Show this site's daily energy use for the last 7 days and what was the highest and lowest reading?"

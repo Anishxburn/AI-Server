@@ -756,12 +756,32 @@ def requested_question_parts(message: str) -> list[str]:
     return [part.strip(" .?;!") for part in parts if part.strip(" .?;!")]
 
 
+def wants_device_usage_ranking(message: str) -> bool:
+    lowered = message.lower()
+    has_device = bool(re.search(r"\b(?:devices?|meters?|consumers?)\b", lowered))
+    has_usage = bool(re.search(r"\b(?:energy|usage|consumption|consuming|kwh)\b", lowered))
+    has_rank = bool(re.search(r"\b(?:rank|ranking|top|most|highest|largest|biggest|contribut(?:e|ed|ion))\b", lowered))
+    return has_device and has_usage and has_rank
+
+
+def wants_all_devices(message: str) -> bool:
+    return bool(re.search(r"\b(?:all|every)\s+(?:(?:of\s+)?the\s+)?devices?\b", message, re.IGNORECASE))
+
+
 def select_historical_operations(message: str) -> list[str]:
     lowered = message.lower()
     operations = []
     for tool_name, phrases in DAXVIEW_TOOL_KEYWORDS.items():
         if any(phrase in lowered for phrase in phrases):
             operations.append(tool_name)
+    if wants_device_usage_ranking(message):
+        if "telemetry_top_consumers" not in operations:
+            operations.append("telemetry_top_consumers")
+        if not re.search(r"\b(?:daily|site energy|site-wide|overall|total site|site total|site usage)\b", lowered):
+            operations = [name for name in operations if name != "site_energy_summary"]
+        if any(term in lowered for term in ("offline", "online", "status")) or wants_all_devices(message):
+            if "site_device_list" not in operations:
+                operations.append("site_device_list")
     if "tomorrow" in lowered and any(term in lowered for term in ("energy", "kwh", "consumption", "usage")):
         operations.append("energy_forecast")
     if "alarm_frequency_summary" in operations and not any(
@@ -770,7 +790,7 @@ def select_historical_operations(message: str) -> list[str]:
         operations = [name for name in operations if name not in {"telemetry_top_consumers", "site_energy_summary"}]
     if "site_energy_summary" in operations and any(requested_energy_extrema(message)) and not any(
         term in lowered for term in ("top consumer", "top device", "by device", "which device")
-    ):
+    ) and not wants_device_usage_ranking(message):
         operations = [name for name in operations if name != "telemetry_top_consumers"]
     if "energy_forecast" in operations and not any(
         term in lowered for term in ("compare", "comparison", "difference", "top consumer", "energy summary")
@@ -1010,7 +1030,8 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
         args.update(range_args)
 
     if operation_id == "telemetry_top_consumers":
-        args["limit"] = int(context.get("limit") or 5)
+        wants_all = wants_all_devices(message)
+        args["limit"] = 100 if wants_all else requested_top_limit(message) or int(context.get("limit") or 5)
     elif operation_id == "alarm_frequency_summary":
         args["limit"] = requested_top_limit(message) or int(context.get("limit") or 10)
     elif operation_id == "site_energy_summary":
@@ -1392,8 +1413,32 @@ def reading_detail(row: dict, value_keys: tuple[str, ...], time_keys: tuple[str,
     return f"{detail} {row_unit}"
 
 
+def ranked_consumer_rows(data: dict) -> tuple[list[tuple[dict, float]], list[dict]]:
+    measured = []
+    unmeasured = []
+    for row in first_list(data, ("rows", "items", "results", "top_consumers", "consumers", "devices")):
+        if not isinstance(row, dict):
+            continue
+        value = first_value(row, (
+            "value", "kwh", "total_kwh", "consumption", "energy",
+            "consumption_delta", "stored_consumption_delta_sum",
+        ))
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            unmeasured.append(row)
+            continue
+        if not math.isfinite(amount):
+            unmeasured.append(row)
+            continue
+        measured.append((row, amount))
+    measured.sort(key=lambda item: item[1], reverse=True)
+    return measured, unmeasured
+
+
 def summarize_top_consumers(data: dict, arguments: dict | None = None) -> str:
     rows = first_list(data, ("rows", "items", "results", "top_consumers", "consumers", "devices"))
+    measured, unmeasured = ranked_consumer_rows(data)
     unit = data.get("unit") or "kWh"
     time_window = format_time_window(data, arguments)
     lines = [
@@ -1402,9 +1447,8 @@ def summarize_top_consumers(data: dict, arguments: dict | None = None) -> str:
     ]
     if not rows:
         lines.append("No consuming devices were returned for this site and time range.")
-    for index, row in enumerate(rows[:10], 1):
-        if not isinstance(row, dict):
-            continue
+    limit = min(max(int((arguments or {}).get("limit") or 10), 1), 100)
+    for index, (row, amount) in enumerate(measured[:limit], 1):
         name = (
             row.get("device_name")
             or row.get("name")
@@ -1412,21 +1456,7 @@ def summarize_top_consumers(data: dict, arguments: dict | None = None) -> str:
             or f"Device {row.get('device_id', 'unknown')}"
         )
         precision = int(row.get("precision") if isinstance(row.get("precision"), int) else 2)
-        value = format_number(
-            first_value(
-                row,
-                (
-                    "value",
-                    "kwh",
-                    "total_kwh",
-                    "consumption",
-                    "energy",
-                    "consumption_delta",
-                    "stored_consumption_delta_sum",
-                ),
-            ),
-            precision,
-        )
+        value = format_number(amount, precision)
         row_unit = row.get("unit") or unit
         highest = reading_detail(
             row,
@@ -1450,8 +1480,9 @@ def summarize_top_consumers(data: dict, arguments: dict | None = None) -> str:
             lines.append(f"   Lowest reading: {lowest}")
         lines.append("")
     if rows:
-        shown = min(len(rows), 10)
-        lines.append(f"Showing {shown} device(s). Ranking is based on total consumption over the {time_window}.")
+        lines.append(f"Showing {min(len(measured), limit)} measured device(s). Ranking is based on total consumption over the {time_window}.")
+    if unmeasured:
+        lines.append(f"{len(unmeasured)} returned device(s) had no numeric usage value and could not be ranked.")
     return "\n".join(lines)
 
 
@@ -1974,6 +2005,47 @@ def summarize_historical_answers(
             item.get("arguments"),
         )
 
+    top_result = next((item for item in results if item["operation_id"] == "telemetry_top_consumers"), None)
+    device_result = next((item for item in results if item["operation_id"] == "site_device_list"), None)
+    if top_result and device_result and wants_device_usage_ranking(message):
+        top_data = historical_result_data(top_result["result"])
+        device_data = historical_result_data(device_result["result"])
+        devices = first_list(device_data, ("devices", "rows", "items", "meters"))
+        by_id = {
+            str(device.get("device_id") or device.get("id") or device.get("meter_id")): device
+            for device in devices if isinstance(device, dict)
+        }
+        measured, _ = ranked_consumer_rows(top_data)
+        limit = int(top_result.get("arguments", {}).get("limit") or 5)
+        lines = [summarize_top_consumers(top_data, top_result.get("arguments")), "Current status of ranked devices:"]
+        ranked_ids = set()
+        for index, (row, _) in enumerate(measured[:limit], 1):
+            device_id = row.get("device_id") or row.get("id") or row.get("meter_id")
+            matched = by_id.get(str(device_id)) if device_id is not None else None
+            if device_id is not None:
+                ranked_ids.add(str(device_id))
+            name = row.get("device_name") or row.get("name") or f"Device {device_id or 'unknown'}"
+            status = (matched or {}).get("status") or (matched or {}).get("connection_status") or row.get("status")
+            lines.append(f"{index}. {name} (ID {device_id or 'unknown'}): {status or 'status unavailable'}")
+        if not measured:
+            lines.append("No measured devices could be matched to current status.")
+        if wants_all_devices(message):
+            unranked = [device for device in devices if isinstance(device, dict)
+                        and str(device.get("device_id") or device.get("id") or device.get("meter_id")) not in ranked_ids]
+            if unranked:
+                lines.append("Other devices (usage not returned, so not ranked):")
+                for device in unranked:
+                    name = device.get("device_name") or device.get("name") or "Unnamed device"
+                    device_id = device.get("device_id") or device.get("id") or device.get("meter_id") or "unknown"
+                    lines.append(f"- {name} (ID {device_id})")
+            total = device_data.get("device_count") or device_data.get("row_count") or len(devices)
+            if str(total).isdigit() and int(total) > len(devices):
+                lines.append(f"Device inventory returned {len(devices)} of {total} devices; the rest are not shown.")
+        remaining = [item for item in results if item not in (top_result, device_result)]
+        if not remaining:
+            return "\n".join(lines)
+        return "\n".join(lines) + "\n\n" + summarize_historical_answers(message, remaining, request_id)
+
     sections = []
     for item in results:
         operation_id = item["operation_id"]
@@ -2039,6 +2111,24 @@ def ensure_historical_answer_coverage(
 ) -> str:
     if not model_answer:
         return deterministic_answer
+    top_result = next((item for item in results if item.get("operation_id") == "telemetry_top_consumers"), None)
+    if top_result and wants_device_usage_ranking(message):
+        top_data = historical_result_data(top_result["result"])
+        measured, _ = ranked_consumer_rows(top_data)
+        limit = int(top_result.get("arguments", {}).get("limit") or 5)
+        for row, amount in measured[:limit]:
+            name = str(row.get("device_name") or row.get("name") or row.get("label") or "")
+            value = str(int(amount)) if amount.is_integer() else str(amount)
+            if (name and name.lower() not in model_answer.lower()) or value not in model_answer:
+                log_event("historical_answer_coverage_fallback", request_id=request_id, missing_items="device_ranking")
+                return deterministic_answer
+        if any(term in message.lower() for term in ("offline", "online", "status")):
+            status_lines = [line for line in deterministic_answer.splitlines() if re.match(r"^\d+\. .+\(ID .+\): ", line)]
+            for line in status_lines:
+                status = line.rsplit(": ", 1)[-1]
+                if status.lower() not in model_answer.lower():
+                    log_event("historical_answer_coverage_fallback", request_id=request_id, missing_items="device_status")
+                    return deterministic_answer
     missing = []
     lowered = model_answer.lower()
     has_energy = any(item.get("operation_id") == "site_energy_summary" for item in results)
