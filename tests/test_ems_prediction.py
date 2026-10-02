@@ -16,12 +16,14 @@ FUNCTIONS = {
     node.name: node for node in TREE.body if isinstance(node, ast.FunctionDef)
 }
 NAMES = (
-    "requested_top_limit", "requested_forecast_days", "select_historical_operations",
+    "requested_top_limit", "requested_forecast_days", "requested_energy_extrema",
+    "requested_question_parts", "completed_daily_range", "select_historical_operations",
     "parse_datetime", "local_bucket_date", "first_list", "predict_daily_energy",
     "is_follow_up_message", "resolve_follow_up_message", "needs_ems_library",
     "build_compliance_context", "has_time_scope", "first_regex_int", "needs_device_choice",
     "run_authorized_energy_prediction", "run_daxview_integration_turn",
-    "build_charts_from_historical_results",
+    "build_charts_from_historical_results", "summarize_site_energy",
+    "ensure_historical_answer_coverage",
 )
 
 
@@ -60,6 +62,75 @@ class EmsPredictionTests(unittest.TestCase):
         question = "What alarm types occurred most often at this site in the last 7 days? Rank the top five."
         self.assertEqual(self.env["select_historical_operations"](question), ["alarm_frequency_summary"])
         self.assertEqual(self.env["requested_top_limit"](question), 5)
+
+    def test_combined_daily_energy_question_uses_site_summary(self):
+        question = "Show this site's daily energy use for the last 7 days and what was the highest and lowest reading?"
+        self.assertEqual(self.env["select_historical_operations"](question), ["site_energy_summary"])
+        self.assertEqual(self.env["requested_energy_extrema"](question), (True, True))
+        self.assertEqual(len(self.env["requested_question_parts"](question)), 2)
+
+    def test_daily_energy_extrema_use_seven_complete_days(self):
+        question = "Show this site's daily energy use for the last 7 days and what was the highest and lowest reading?"
+        arguments = self.env["completed_daily_range"](question)
+        arguments["bucket"] = "day"
+        first = self.env["parse_datetime"](arguments["start"]).astimezone(timezone(timedelta(hours=8))).date()
+        today = first + timedelta(days=7)
+        rows = [{"date": (first + timedelta(days=index)).isoformat(), "value": (index + 1) * 10}
+                for index in range(7)]
+        rows.append({"date": today.isoformat(), "value": 1})
+        self.env["requested_energy_unit"] = lambda message, unit: (1.0, unit, 2)
+        self.env["format_energy_value"] = lambda value, factor, unit, precision: f"{value / factor:.2f} {unit}"
+        self.env["requested_comparison_dates"] = lambda message, year: []
+        self.env["requested_comparison_months"] = lambda message, year: []
+        self.env["wants_relative_summary"] = lambda message: True
+        self.env["format_coverage_note"] = lambda data: None
+        self.env["format_compliance_context"] = lambda context: ""
+        answer = self.env["summarize_site_energy"]({"buckets": rows, "unit": "kWh"}, question, arguments)
+        self.assertIn(f"Highest daily energy: {(today - timedelta(days=1)).isoformat()} at 70.00 kWh", answer)
+        self.assertIn(f"Lowest daily energy: {first.isoformat()} at 10.00 kWh", answer)
+        self.assertEqual(sum(line.startswith("- ") for line in answer.splitlines()), 7)
+        self.assertNotIn(f"- {today.isoformat()}: 1.00 kWh", answer)
+
+    def test_refinement_cannot_drop_requested_extrema(self):
+        question = "Show daily energy for the last 7 days and what was the highest and lowest reading?"
+        draft = "Daily values:\n- 2026-10-01: 10.00 kWh\n- 2026-10-02: 20.00 kWh\nHighest daily energy: 2026-10-02 at 20.00 kWh.\nLowest daily energy: 2026-10-01 at 10.00 kWh."
+        self.env["log_event"] = Mock()
+        answer = self.env["ensure_historical_answer_coverage"](
+            question, [{"operation_id": "site_energy_summary"}], draft, "Energy use was 10 and 20 kWh.", "request"
+        )
+        self.assertIn("Highest daily energy: 2026-10-02 at 20.00 kWh", answer)
+        self.assertIn("Lowest daily energy: 2026-10-01 at 10.00 kWh", answer)
+        self.assertIn("- 2026-10-01: 10.00 kWh", answer)
+        self.env["log_event"].assert_called_once()
+
+    def test_refinement_keeps_both_tool_topics(self):
+        question = "Show daily energy for the last 7 days and list the active alarms."
+        self.assertEqual(
+            self.env["select_historical_operations"](question),
+            ["site_energy_summary", "active_alarm_summary"],
+        )
+        self.env["log_event"] = Mock()
+        self.env["summarize_historical_answer"] = Mock(return_value="Active alarms: 2 critical.")
+        answer = self.env["ensure_historical_answer_coverage"](
+            question,
+            [{"operation_id": "site_energy_summary", "result": {}},
+             {"operation_id": "active_alarm_summary", "result": {}, "arguments": {}}],
+            "Daily values:\n- 2026-10-01: 10.00 kWh", "Energy was 10.00 kWh on 2026-10-01.", "request",
+        )
+        self.assertIn("Active alarms: 2 critical.", answer)
+
+    def test_highest_day_follow_up_inherits_previous_question(self):
+        self.env["previous_daxview_turn"] = Mock(return_value={
+            "id": "previous", "user_message": "Show daily site energy for the last 7 days",
+            "context": {"site_id": 17},
+        })
+        self.env["log_event"] = Mock()
+        message, context = self.env["resolve_follow_up_message"](
+            "current", "Which day was highest?", {"site_id": 17}, "conversation", "request"
+        )
+        self.assertIn("last 7 days", message)
+        self.assertEqual(self.env["select_historical_operations"](message), ["site_energy_summary"])
+        self.assertEqual(context["site_id"], 17)
 
     def test_forecast_does_not_request_energy_summary_as_separate_answer(self):
         question = "Forecast energy usage for the next 7 days."

@@ -738,6 +738,24 @@ def requested_forecast_days(message: str) -> int | None:
     return 1 if "tomorrow" in message.lower() else None
 
 
+def requested_energy_extrema(message: str) -> tuple[bool, bool]:
+    lowered = message.lower()
+    if not re.search(r"\b(?:daily|day|days|reading|readings|week)\b", lowered):
+        return False, False
+    return (
+        bool(re.search(r"\b(?:highest|maximum|peak)\b", lowered)),
+        bool(re.search(r"\b(?:lowest|minimum)\b", lowered)),
+    )
+
+
+def requested_question_parts(message: str) -> list[str]:
+    parts = re.split(
+        r"(?<=[?.!])\s+|;\s*|\s+and\s+(?=(?:what|which|how|show|list|give|compare|rank|find)\b)",
+        message.strip(), flags=re.IGNORECASE,
+    )
+    return [part.strip(" .?;!") for part in parts if part.strip(" .?;!")]
+
+
 def select_historical_operations(message: str) -> list[str]:
     lowered = message.lower()
     operations = []
@@ -750,6 +768,10 @@ def select_historical_operations(message: str) -> list[str]:
         term in lowered for term in ("energy", "kwh", "consumption", "usage", "demand")
     ):
         operations = [name for name in operations if name not in {"telemetry_top_consumers", "site_energy_summary"}]
+    if "site_energy_summary" in operations and any(requested_energy_extrema(message)) and not any(
+        term in lowered for term in ("top consumer", "top device", "by device", "which device")
+    ):
+        operations = [name for name in operations if name != "telemetry_top_consumers"]
     if "energy_forecast" in operations and not any(
         term in lowered for term in ("compare", "comparison", "difference", "top consumer", "energy summary")
     ):
@@ -928,6 +950,22 @@ def requested_historical_range(message: str) -> dict:
     }
 
 
+def completed_daily_range(message: str) -> dict | None:
+    lowered = message.lower()
+    match = re.search(r"\blast\s+(\d{1,3})\s+days?\b", lowered)
+    if not match or not any(term in lowered for term in ("daily", "each day", "per day")):
+        return None
+    if "including today" in lowered or "include today" in lowered:
+        return None
+    local_midnight = datetime.now(timezone(timedelta(hours=8))).replace(hour=0, minute=0, second=0, microsecond=0)
+    days = max(int(match.group(1)), 1)
+    return {
+        "start": (local_midnight - timedelta(days=days)).astimezone(timezone.utc).isoformat(),
+        "end": local_midnight.astimezone(timezone.utc).isoformat(),
+        "timezone": "Asia/Kuala_Lumpur",
+    }
+
+
 def build_historical_arguments(operation_id: str, context: dict, message: str = "") -> dict:
     site_id = context.get("site_id")
     if not site_id:
@@ -977,6 +1015,8 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
         args["limit"] = requested_top_limit(message) or int(context.get("limit") or 10)
     elif operation_id == "site_energy_summary":
         args["bucket"] = str(context.get("bucket") or "day")
+        if args["bucket"] == "day":
+            args.update(completed_daily_range(message) or {})
     elif operation_id == "site_device_list":
         args["limit"] = int(context.get("limit") or 100)
     elif operation_id == "telemetry_timeseries":
@@ -1489,30 +1529,70 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
         lines.append(f"Total: {format_energy_value(total_value, conversion_factor, display_unit, precision)}.")
     buckets = data.get("buckets") or data.get("rows") or data.get("series") or data.get("data")
     daily_values = {}
+    complete_window = completed_daily_range(message) is not None and bool(arguments and arguments.get("bucket") == "day")
     if isinstance(buckets, list) and buckets:
         if has_specific_months:
             lines.append("Requested monthly values:")
         else:
-            lines.append("Daily values:" if include_range_summary else "Requested daily values:" if has_specific_dates else "Daily values:")
-        for index, item in enumerate(buckets):
+            lines.append("Daily values (complete local days):" if complete_window else "Requested daily values:" if has_specific_dates else "Daily values:")
+        shown_rows = 0
+        for item in buckets:
             if not isinstance(item, dict):
                 continue
             timestamp = item.get("timestamp") or item.get("bucket") or item.get("start") or item.get("date")
             label = local_bucket_date(timestamp, timezone_name) if isinstance(timestamp, str) else None
             label = label or timestamp or "period"
             value = item.get("value") if item.get("value") is not None else item.get("kwh")
-            if isinstance(value, (int, float)):
+            if complete_window and arguments:
+                start_day = parse_datetime(arguments.get("start"))
+                end_day = parse_datetime(arguments.get("end"))
+                if start_day and end_day:
+                    first_day = start_day.astimezone(timezone(timedelta(hours=8))).date().isoformat()
+                    last_day = end_day.astimezone(timezone(timedelta(hours=8))).date().isoformat()
+                    if not first_day <= str(label) < last_day:
+                        continue
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
                 daily_values[str(label)] = float(value)
             if has_specific_months:
                 continue
             if has_specific_dates and not include_range_summary and str(label) not in requested_date_set:
                 continue
-            if index < 10:
+            if shown_rows < 31:
                 row_unit = item.get("unit") or unit
                 row_factor, row_display_unit, row_precision = requested_energy_unit(message, row_unit)
                 lines.append(f"- {label}: {format_energy_value(value, row_factor, row_display_unit, row_precision if row_factor != 1.0 else precision)}")
+                shown_rows += 1
+        if not has_specific_months and len(daily_values) > 31:
+            lines.append(f"Showing 31 of {len(daily_values)} daily row(s).")
     elif total_value is None:
         lines.append("No energy values were returned for this site and time range.")
+    wants_highest, wants_lowest = requested_energy_extrema(message)
+    if wants_highest or wants_lowest:
+        complete_values = dict(daily_values)
+        requested_start = parse_datetime((arguments or {}).get("start"))
+        requested_end = parse_datetime((arguments or {}).get("end"))
+        local_zone = timezone(timedelta(hours=8)) if timezone_name == "Asia/Kuala_Lumpur" else timezone.utc
+        if requested_start and requested_end:
+            local_start = requested_start.astimezone(local_zone)
+            local_end = requested_end.astimezone(local_zone)
+            first_complete_day = local_start.date() + timedelta(days=bool(
+                local_start.hour or local_start.minute or local_start.second or local_start.microsecond
+            ))
+            complete_values = {
+                label: value for label, value in complete_values.items()
+                if first_complete_day.isoformat() <= label < local_end.date().isoformat()
+            }
+        if complete_values:
+            for wanted, title, extreme in (
+                (wants_highest, "Highest daily energy", max),
+                (wants_lowest, "Lowest daily energy", min),
+            ):
+                if wanted:
+                    amount = extreme(complete_values.values())
+                    days = ", ".join(sorted(day for day, value in complete_values.items() if value == amount))
+                    lines.append(f"{title}: {days} at {format_energy_value(amount, conversion_factor, display_unit, precision)}.")
+        else:
+            lines.append("Highest and lowest daily energy are unavailable because no complete daily readings were returned for this period.")
     wants_difference = any(phrase in message.lower() for phrase in ("difference", "compare", "comparison", "between"))
     if wants_difference and len(daily_values) >= 2:
         dates = requested_dates
@@ -1921,7 +2001,11 @@ def refine_historical_answer_with_model(message: str, results: list[dict], deter
     if not AI_REFINE_MCP_WITH_MODEL:
         return deterministic_answer
     prompt = build_mcp_refine_prompt(message, results, deterministic_answer, request_id)
-    primary_answer = run_mcp_refine_model(prompt, request_id, CHAT_MODEL, deterministic_answer, role="primary")
+    primary_answer = ensure_historical_answer_coverage(
+        message, results, deterministic_answer,
+        run_mcp_refine_model(prompt, request_id, CHAT_MODEL, deterministic_answer, role="primary"),
+        request_id,
+    )
     if not AI_COMPARE_MODEL_ENABLED:
         return primary_answer
     comparison_answers = []
@@ -1931,6 +2015,7 @@ def refine_historical_answer_with_model(message: str, results: list[dict], deter
         compare_answer = run_mcp_refine_model(prompt, request_id, model, "", role="compare")
         if not compare_answer:
             continue
+        compare_answer = ensure_historical_answer_coverage(message, results, deterministic_answer, compare_answer, request_id)
         debug_trace_event("mcp_answer_compare_selected", request_id=request_id, model=model, role="compare")
         comparison_answers.append((model, compare_answer))
     if not comparison_answers:
@@ -1949,6 +2034,67 @@ def refine_historical_answer_with_model(message: str, results: list[dict], deter
     )
 
 
+def ensure_historical_answer_coverage(
+    message: str, results: list[dict], deterministic_answer: str, model_answer: str, request_id: str,
+) -> str:
+    if not model_answer:
+        return deterministic_answer
+    missing = []
+    lowered = model_answer.lower()
+    has_energy = any(item.get("operation_id") == "site_energy_summary" for item in results)
+    wants_highest, wants_lowest = requested_energy_extrema(message) if has_energy else (False, False)
+    wants_daily = has_energy and any(term in message.lower() for term in ("daily", "each day", "per day"))
+    for line in deterministic_answer.splitlines():
+        date_match = re.match(r"^- (\d{4}-\d{2}-\d{2}):", line)
+        value_match = re.search(r"\b[\d,]+(?:\.\d+)?\s*(?:kWh|MWh|GWh)\b", line, re.IGNORECASE)
+        if wants_daily and date_match and (
+            date_match.group(1) not in model_answer
+            or (value_match and value_match.group(0) not in model_answer)
+        ):
+            missing.append(line)
+        if wants_highest and line.startswith("Highest daily energy:") and (
+            not re.search(r"\b(?:highest|maximum|peak)\b", lowered)
+            or not any(day in model_answer for day in re.findall(r"\d{4}-\d{2}-\d{2}", line))
+            or (value_match and value_match.group(0) not in model_answer)
+        ):
+            missing.append(line)
+        if wants_lowest and line.startswith("Lowest daily energy:") and (
+            not re.search(r"\b(?:lowest|minimum)\b", lowered)
+            or not any(day in model_answer for day in re.findall(r"\d{4}-\d{2}-\d{2}", line))
+            or (value_match and value_match.group(0) not in model_answer)
+        ):
+            missing.append(line)
+    if (wants_highest or wants_lowest) and not any(
+        line.startswith(("Highest daily energy:", "Lowest daily energy:")) for line in deterministic_answer.splitlines()
+    ):
+        unavailable = next(
+            (line for line in deterministic_answer.splitlines() if "unavailable because no complete daily readings" in line),
+            None,
+        )
+        if unavailable and unavailable not in model_answer:
+            missing.append(unavailable)
+    if len(results) > 1:
+        markers = {
+            "site_energy_summary": r"\b(?:energy|usage|consumption|kwh|mwh)\b",
+            "alarm_frequency_summary": r"\b(?:alarm|alert)\b",
+            "active_alarm_summary": r"\b(?:alarm|alert)\b",
+            "telemetry_top_consumers": r"\b(?:device|meter|consumer|umg)\b",
+            "demand_peak_summary": r"\b(?:demand|peak)\b",
+            "energy_forecast": r"\b(?:forecast|predict|estimate)\b",
+        }
+        for item in results:
+            operation_id = item.get("operation_id")
+            marker = markers.get(operation_id)
+            if marker and not re.search(marker, lowered):
+                missing.append(summarize_historical_answer(
+                    message, operation_id, item["result"], request_id, item.get("arguments")
+                ))
+    if not missing:
+        return model_answer
+    log_event("historical_answer_coverage_fallback", request_id=request_id, missing_items=len(missing))
+    return f"{model_answer.rstrip()}\n\nRequested details:\n" + "\n".join(dict.fromkeys(missing))
+
+
 def build_mcp_refine_prompt(message: str, results: list[dict], deterministic_answer: str, request_id: str = "") -> str:
     mcp_context = {
         "enabled": True,
@@ -1960,6 +2106,8 @@ def build_mcp_refine_prompt(message: str, results: list[dict], deterministic_ans
         "errors": [],
     }
     raw_context = format_daxview_context(mcp_context)
+    question_parts = requested_question_parts(message)
+    question_plan = "\n".join(f"{index}. {part}" for index, part in enumerate(question_parts, 1))
     library_section = ""
     if needs_ems_library(message):
         try:
@@ -1978,6 +2126,8 @@ Do not invent values, devices, alarms, timestamps, causes, or recommendations no
 Answer each part of the user's question using the matching tool result. Never present energy consumption as an alarm count.
 Do not include standards, protocols, or library background unless the user asks for them.
 For predictions, label every future value as an estimate and retain the method, coverage, and backtest error.
+Answer every numbered request below. If a value was not returned, state that for the affected request.
+When daily values are requested, retain every date and its value from the deterministic draft.
 Keep the answer concise but useful:
 - Start with the direct answer.
 - Use short sections and bullets.
@@ -1989,6 +2139,9 @@ Keep the answer concise but useful:
 
 User question:
 {message}
+
+Requested parts:
+{question_plan}
 
 Deterministic draft:
 {deterministic_answer}
@@ -2243,7 +2396,7 @@ def is_follow_up_message(message: str) -> bool:
         return True
     if re.fullmatch(r"(?:why|how|what about that|and that|same one)[?.! ]*", lowered):
         return True
-    if re.match(r"^(?:and\s+)?(?:what about|how about|for the same|on the same|can you also|show me more about)\b", lowered):
+    if re.match(r"^(?:and\s+)?(?:what about|how about|for the same|on the same|can you also|show me more about|which day|which one|which was)\b", lowered):
         return True
     return any(phrase in lowered for phrase in FOLLOW_UP_PHRASES if phrase != "why")
 
