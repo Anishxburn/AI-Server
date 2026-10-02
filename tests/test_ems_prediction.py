@@ -20,12 +20,14 @@ NAMES = (
     "parse_datetime", "local_bucket_date", "first_list", "predict_daily_energy",
     "is_follow_up_message", "resolve_follow_up_message", "needs_ems_library",
     "build_compliance_context", "has_time_scope", "first_regex_int", "needs_device_choice",
-    "run_authorized_energy_prediction",
+    "run_authorized_energy_prediction", "run_daxview_integration_turn",
+    "build_charts_from_historical_results",
 )
 
 
 def load_functions():
-    module = ast.Module(body=[FUNCTIONS[name] for name in NAMES], type_ignores=[])
+    exception = next(node for node in TREE.body if isinstance(node, ast.ClassDef) and node.name == "PredictionSourceError")
+    module = ast.Module(body=[exception] + [FUNCTIONS[name] for name in NAMES], type_ignores=[])
     env = {
         "__builtins__": __builtins__, "date": date, "datetime": datetime,
         "timedelta": timedelta, "timezone": timezone, "math": math,
@@ -110,6 +112,40 @@ class EmsPredictionTests(unittest.TestCase):
         self.env["call_authorized_historical_tool"].assert_called_once()
         self.assertEqual(self.env["call_authorized_historical_tool"].call_args.args[1], "authorized")
         self.assertEqual(len(result["structuredContent"]["data"]["forecast"]), 7)
+
+    def test_upstream_unavailable_is_not_treated_as_a_forecast(self):
+        self.env["request_daxview_data_plan"] = Mock(return_value={"authorization_id": "authorized"})
+        self.env["call_authorized_historical_tool"] = Mock(return_value={
+            "isError": False,
+            "structuredContent": {"status": "error", "error_code": "DAXVIEW_UNAVAILABLE"},
+        })
+        self.env["mcp_structured_result"] = lambda result: result["structuredContent"]
+        with self.assertRaises(self.env["PredictionSourceError"]) as raised:
+            self.env["run_authorized_energy_prediction"](
+                "turn", {"site_id": 17, "forecast_days": 7}, "request"
+            )
+        self.assertEqual(raised.exception.error_code, "DAXVIEW_UNAVAILABLE")
+
+    def test_upstream_unavailable_returns_readable_answer(self):
+        self.env["resolve_follow_up_message"] = Mock(side_effect=lambda turn, message, context, conversation, request: (message, context))
+        self.env["build_historical_arguments"] = Mock(return_value={"site_id": 17, "forecast_days": 7})
+        self.env["run_authorized_energy_prediction"] = Mock(side_effect=self.env["PredictionSourceError"]("DAXVIEW_UNAVAILABLE"))
+        self.env["debug_trace_event"] = Mock()
+        self.env["log_event"] = Mock()
+        result = self.env["run_daxview_integration_turn"](
+            "turn", "Forecast energy usage for the next 7 days", {"site_id": 17}, "request", "conversation"
+        )
+        self.assertIn("couldn't calculate a forecast", result["reply"])
+        self.assertEqual(result["charts"], [])
+        self.env["log_event"].assert_called_once()
+
+    def test_dashboard_can_preview_charts_without_daxview_chart_payload(self):
+        chart = {"type": "line", "labels": ["2026-10-03"], "series": [{"data": [42]}]}
+        self.env["AI_CHARTS_ENABLED"] = False
+        self.env["chart_from_historical_result"] = Mock(return_value=chart)
+        results = [{"operation_id": "energy_forecast", "result": {}, "arguments": {}}]
+        self.assertEqual(self.env["build_charts_from_historical_results"](results), [])
+        self.assertEqual(self.env["build_charts_from_historical_results"](results, preview=True), [chart])
 
     def test_follow_up_keeps_new_tool_intent(self):
         self.env["previous_daxview_turn"] = Mock(return_value={

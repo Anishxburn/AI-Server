@@ -2178,8 +2178,8 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
     return None
 
 
-def build_charts_from_historical_results(results: list[dict]) -> list[dict]:
-    if not AI_CHARTS_ENABLED:
+def build_charts_from_historical_results(results: list[dict], preview: bool = False) -> list[dict]:
+    if not AI_CHARTS_ENABLED and not preview:
         return []
     charts = []
     for item in results:
@@ -2385,6 +2385,12 @@ def build_device_choice_response(turn_id: str, message: str, context: dict, requ
     }
 
 
+class PredictionSourceError(RuntimeError):
+    def __init__(self, error_code: str):
+        self.error_code = error_code
+        super().__init__(f"Historical energy data is unavailable: {error_code}")
+
+
 def run_authorized_energy_prediction(turn_id: str, arguments: dict, request_id: str) -> dict:
     source_args = {
         key: arguments[key]
@@ -2400,7 +2406,7 @@ def run_authorized_energy_prediction(turn_id: str, arguments: dict, request_id: 
     source = call_authorized_historical_tool("site_energy_summary", str(authorization_id), normalized, request_id)
     structured = mcp_structured_result(source)
     if structured.get("status") == "error" or source.get("isError"):
-        raise RuntimeError(f"Historical energy data is unavailable: {structured.get('error_code') or 'MCP tool error'}")
+        raise PredictionSourceError(str(structured.get("error_code") or "MCP_TOOL_ERROR"))
     prediction = predict_daily_energy(
         historical_result_data(source, ("buckets", "rows", "series", "data")),
         arguments["forecast_days"],
@@ -2443,9 +2449,20 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
             try:
                 result = run_authorized_energy_prediction(turn_id, arguments, request_id)
                 results.append({"operation_id": operation_id, "arguments": arguments, "result": result})
+            except PredictionSourceError as error:
+                log_event("energy_prediction_unavailable", request_id=request_id, source_tool="site_energy_summary", error_code=error.error_code)
+                if len(operation_ids) == 1:
+                    return {
+                        "provider": "energy-prediction",
+                        "reply": "I couldn't calculate a forecast because DaxView did not return historical energy readings for this site. Please retry after the data service is available.",
+                        "charts": [],
+                    }
+                errors.append({"operation_id": operation_id, "error": str(error)})
             except ValueError as error:
                 log_event("energy_prediction_rejected", request_id=request_id, reason=str(error))
-                return {"provider": "energy-prediction", "reply": str(error)}
+                if len(operation_ids) == 1:
+                    return {"provider": "energy-prediction", "reply": str(error), "charts": []}
+                errors.append({"operation_id": operation_id, "error": str(error)})
             except Exception as error:
                 errors.append({"operation_id": operation_id, "error": str(error)})
                 log_event("daxview_tool_step_failed", request_id=request_id, turn_id=turn_id, operation_id=operation_id, error=str(error))
@@ -2480,17 +2497,19 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         deterministic_reply = f"{deterministic_reply}\n\nUnavailable detail: {failed_tools} could not be retrieved for this request."
     refined_reply = refine_historical_answer_with_model(message, results, deterministic_reply, request_id)
     charts = build_charts_from_historical_results(results)
+    preview_charts = charts if charts else build_charts_from_historical_results(results, preview=True)
     debug_trace_event(
         "ai_final_response_debug",
         request_id=request_id,
         model=CHAT_MODEL if AI_REFINE_MCP_WITH_MODEL else "deterministic",
         answer=refined_reply,
-        charts=charts,
+        charts=preview_charts,
     )
     return {
         "provider": "daxview-historical-mcp",
         "reply": refined_reply,
         "charts": charts,
+        "debug_charts": preview_charts,
     }
 
 
@@ -2521,6 +2540,7 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
             )
             update_job_status(job_id, "completed")
             add_job_event(job_id, "completed", {"status": "completed"})
+            debug_trace_event("ai_outcome_debug", request_id=request_id, status="waiting_for_user", answer=result["reply"], charts=[])
             return
         message_event = {"text": result["reply"]}
         if result.get("charts"):
@@ -2528,6 +2548,11 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
         add_job_event(job_id, "message", message_event)
         update_job_status(job_id, "completed")
         add_job_event(job_id, "completed", {"status": "completed"})
+        debug_trace_event(
+            "ai_outcome_debug", request_id=request_id, status="completed",
+            answer=result["reply"], charts=result.get("debug_charts") or result.get("charts") or [],
+            charts_enabled=AI_CHARTS_ENABLED,
+        )
     except Exception as error:
         log_event(
             "daxview_job_failed",
@@ -2539,6 +2564,7 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
         )
         update_job_status(job_id, "failed")
         add_job_event(job_id, "failed", {"status": "failed", "text": "AI response generation failed."})
+        debug_trace_event("ai_outcome_debug", request_id=request_id, status="failed", error=str(error), charts=[])
 
 
 def is_ems_related(message: str) -> bool:
@@ -3255,6 +3281,11 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       .event h3 { margin: 0 0 6px; font-size: 13px; }
       .event .time { color: #64748b; font-size: 11px; margin-bottom: 6px; }
       .inspectors { display: grid; gap: 12px; padding: 12px 14px; border-bottom: 1px solid #e5ebf3; }
+      .outcome { padding: 14px; border-bottom: 1px solid #e5ebf3; }
+      .outcome h3 { margin: 0 0 10px; font-size: 14px; }
+      .outcome-answer { white-space: pre-wrap; line-height: 1.55; font-size: 13px; max-width: 85ch; }
+      .outcome-state { margin-top: 10px; padding: 9px 10px; border-left: 3px solid #94a3b8; background: #f8fafc; font-size: 12px; }
+      .outcome-state.fail { border-left-color: #ef4444; background: #fef2f2; color: #991b1b; }
       .inspectors h3 { margin: 0 0 8px; font-size: 13px; }
       .inspectors details { border-top: 1px solid #e5ebf3; padding: 8px 0; }
       .inspectors summary { cursor: pointer; font-size: 12px; font-weight: 700; }
@@ -3263,6 +3294,10 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       .chart-item { border: 1px solid #dbe3ef; padding: 10px; min-width: 0; }
       .chart-item strong { font-size: 12px; }
       .chart-item canvas { display: block; width: 100%; height: 220px; margin-top: 8px; }
+      .chart-item details { margin-top: 8px; font-size: 12px; }
+      .chart-item summary { cursor: pointer; }
+      .chart-item table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 12px; }
+      .chart-item th, .chart-item td { padding: 5px 6px; border-bottom: 1px solid #e5ebf3; text-align: left; }
       pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #0f172a; color: #dbeafe; border-radius: 6px; padding: 10px; font-size: 12px; line-height: 1.45; margin: 0; }
       .empty { padding: 18px; color: #64748b; }
       @media (max-width: 1100px) { .flow { grid-template-columns: repeat(3, minmax(118px, 1fr)); } .summary-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); } }
@@ -3304,13 +3339,13 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       let activeView = "traces";
 
       function eventClass(name) {
-        if (/failed|error|timeout|404|403|409|429|500/i.test(name)) return "fail";
+        if (/failed|error|unavailable|rejected|timeout|404|403|409|429|500/i.test(name)) return "fail";
         if (/response|completed|ok/i.test(name)) return "ok";
         return "";
       }
       function summarize(events) {
         const tools = [...new Set(events.map(e => e.tool).filter(Boolean))];
-        const failed = events.some(e => /failed|error/i.test(e.event || ""));
+        const failed = events.some(e => /failed|error|unavailable|rejected/i.test(e.event || ""));
         return {tools, failed};
       }
       const flowStages = [
@@ -3327,7 +3362,8 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       }
       function stageState(events, stage) {
         const matches = events.filter(stage.match);
-        const failed = matches.some(e => /failed|error|timeout/i.test(e.event || ""));
+        const failed = matches.some(e => /failed|error|unavailable|rejected|timeout/i.test(e.event || ""))
+          || (stage.key === "mcp" && events.some(e => e.event === "energy_prediction_unavailable"));
         return {matches, failed, status: failed ? "fail" : matches.length ? "done" : "pending"};
       }
       function renderFlow(events) {
@@ -3347,7 +3383,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         const info = summarize(events);
         const models = [...new Set(events.map(e => e.model).filter(Boolean))];
         const jobs = [...new Set(events.map(e => e.job_id).filter(Boolean))];
-        const errors = events.filter(e => /failed|error|timeout/i.test(e.event || ""));
+        const errors = events.filter(e => /failed|error|unavailable|rejected|timeout/i.test(e.event || ""));
         const elapsed = durationMs(events);
         const metrics = [
           ["Request", group.id],
@@ -3366,16 +3402,47 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       }
       function renderInspectors(events) {
         const answers = events.filter(e => e.event === "mcp_answer_refine_response_debug");
-        const final = events.find(e => e.event === "ai_final_response_debug");
         const payloads = events.filter(e => e.event === "mcp_tool_request_payload_debug" || e.event === "mcp_tool_response_payload_debug");
         const answerHtml = answers.map((item, index) => `<div class="answer-block"><strong>${escapeHtml(item.role || "model")} - ${escapeHtml(item.model || "unknown model")}</strong><br>${escapeHtml(item.answer || "")}</div>`).join("");
-        const chartItems = (final?.charts || []).map((chart, index) => `<div class="chart-item"><strong>${escapeHtml(chart.title || "Chart")}</strong><canvas id="trace-chart-${index}" data-spec="${escapeHtml(JSON.stringify(chart))}" aria-label="${escapeHtml(chart.title || "Chart preview")}"></canvas></div>`).join("");
         const payloadHtml = payloads.map(item => `<details><summary>${escapeHtml(item.event.replace("_debug", ""))} · ${escapeHtml(item.tool || "")}</summary><pre>${escapeHtml(JSON.stringify(item, null, 2))}</pre></details>`).join("");
-        if (!answerHtml && !chartItems && !payloadHtml) return "";
+        if (!answerHtml && !payloadHtml) return "";
         return `<section class="inspectors">
           ${answerHtml ? `<div><h3>Model answers</h3>${answerHtml}</div>` : ""}
-          ${chartItems ? `<div><h3>Chart preview</h3><div class="chart-grid">${chartItems}</div></div>` : ""}
           ${payloadHtml ? `<div><h3>MCP payloads</h3>${payloadHtml}</div>` : ""}
+        </section>`;
+      }
+      function renderOutcome(events) {
+        const outcome = events.find(event => event.event === "ai_outcome_debug");
+        const final = events.find(event => event.event === "ai_final_response_debug");
+        const failed = events.find(event => event.event === "daxview_job_failed");
+        const unavailable = events.find(event => event.event === "energy_prediction_unavailable");
+        const answer = outcome?.answer || final?.answer || "";
+        const charts = outcome?.charts || final?.charts || [];
+        const error = outcome?.error || failed?.error || "";
+        const unavailableCode = unavailable?.error_code || (/DAXVIEW_UNAVAILABLE/.test(error) ? "DAXVIEW_UNAVAILABLE" : "");
+        const chartExpected = events.some(event =>
+          (event.operation_ids || []).some(id => ["energy_forecast", "site_energy_summary", "telemetry_timeseries", "alarm_frequency_summary", "demand_peak_summary"].includes(id))
+        );
+        const chartItems = charts.map(chart => {
+          const series = chart.series?.[0] || {};
+          const valueRows = (chart.labels || []).map((label, index) =>
+            `<tr><td>${escapeHtml(label)}</td><td>${escapeHtml(series.data?.[index] ?? "")}</td></tr>`
+          ).join("");
+          return `<div class="chart-item"><strong>${escapeHtml(chart.title || "Chart")}</strong>
+            <canvas data-spec="${escapeHtml(JSON.stringify(chart))}" aria-label="${escapeHtml(chart.title || "Chart preview")}"></canvas>
+            <details><summary>View chart values</summary><table><thead><tr><th>Period</th><th>${escapeHtml(series.unit || "Value")}</th></tr></thead><tbody>${valueRows}</tbody></table></details>
+          </div>`;
+        }).join("");
+        let state = "";
+        if (unavailableCode) state = `DaxView returned ${unavailableCode}. There are no historical values to plot for this request.`;
+        else if (error) state = error;
+        else if (!outcome && !final) state = "Waiting for the AI Server result.";
+        else if (chartExpected && !charts.length && outcome?.charts_enabled === false) state = "Chart generation is disabled in the AI Server configuration.";
+        else if (chartExpected && !charts.length) state = "No numeric chart data was available for this answer.";
+        return `<section class="outcome"><h3>Outcome preview</h3>
+          ${answer ? `<div class="outcome-answer">${escapeHtml(answer)}</div>` : ""}
+          ${chartItems ? `<div class="chart-grid">${chartItems}</div>` : ""}
+          ${state ? `<div class="outcome-state ${unavailableCode || error ? "fail" : ""}">${escapeHtml(state)}</div>` : ""}
         </section>`;
       }
       function drawCharts() {
@@ -3502,8 +3569,8 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
               <div class="metric"><div class="label">Method</div><div class="value">${escapeHtml(prediction.method)}</div></div>
             </div>` : "";
         root.innerHTML = activeView === "predictions"
-          ? predictionHtml + renderInspectors(group.events) + eventsHtml
-          : renderFlow(group.events) + renderSummary(group) + renderInspectors(group.events) + eventsHtml;
+          ? predictionHtml + renderOutcome(group.events) + renderInspectors(group.events) + eventsHtml
+          : renderFlow(group.events) + renderSummary(group) + renderOutcome(group.events) + renderInspectors(group.events) + eventsHtml;
         drawCharts();
       }
       function escapeHtml(value) {
