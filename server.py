@@ -6,8 +6,10 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
+import statistics
 import time
 import traceback
 import uuid
@@ -113,18 +115,19 @@ DAXVIEW_TOOL_KEYWORDS = {
     "telemetry_top_consumers": {
         "top consumer", "top consumers", "most energy", "highest usage",
         "highest consumption", "largest load", "biggest consumer",
-        "top consuming", "energy-consuming", "energy consuming",
-        "top 5", "top five", "top devices",
+        "top consuming", "energy-consuming", "energy consuming", "top devices",
     },
     "site_energy_summary": {
         "energy summary", "site energy", "usage trend", "consumption trend",
-        "kwh summary", "last 7 days", "weekly energy", "daily energy",
+        "kwh summary", "weekly energy", "daily energy",
         "energy consumption", "consumption", "usage", "difference in energy",
         "energy difference", "highest energy consumption",
     },
     "alarm_frequency_summary": {
         "alarm frequency", "frequent alarm", "most alarms", "alarm summary",
         "alarm history", "repeated alarms", "historical alarms",
+        "alarm types", "alarms occurred most often", "most common alarms",
+        "which alarms occurred", "top alarms",
     },
     "site_metadata_summary": {
         "what site", "current site", "site details", "details about this site",
@@ -179,8 +182,8 @@ DAXVIEW_TOOL_KEYWORDS = {
         "energy share", "by device", "by building",
     },
     "energy_forecast": {
-        "forecast", "predict", "prediction", "next 7 days", "tomorrow",
-        "expected usage",
+        "forecast", "predict", "prediction", "expected usage",
+        "expected energy", "future energy",
     },
     "anomaly_detection_summary": {
         "anomaly", "abnormal", "unusual", "suspicious", "detect abnormal",
@@ -720,12 +723,37 @@ def select_historical_operation(message: str) -> str | None:
     return operations[0] if operations else None
 
 
+def requested_top_limit(message: str) -> int | None:
+    match = re.search(r"\btop\s+(\d{1,2}|five|ten)\b", message, re.IGNORECASE)
+    if not match:
+        return None
+    value = {"five": 5, "ten": 10}.get(match.group(1).lower())
+    return value if value is not None else min(max(int(match.group(1)), 1), 20)
+
+
+def requested_forecast_days(message: str) -> int | None:
+    match = re.search(r"\b(?:next|coming|following)\s+(\d{1,2})\s+days?\b", message, re.IGNORECASE)
+    if match:
+        return min(max(int(match.group(1)), 1), 14)
+    return 1 if "tomorrow" in message.lower() else None
+
+
 def select_historical_operations(message: str) -> list[str]:
     lowered = message.lower()
     operations = []
     for tool_name, phrases in DAXVIEW_TOOL_KEYWORDS.items():
         if any(phrase in lowered for phrase in phrases):
             operations.append(tool_name)
+    if "tomorrow" in lowered and any(term in lowered for term in ("energy", "kwh", "consumption", "usage")):
+        operations.append("energy_forecast")
+    if "alarm_frequency_summary" in operations and not any(
+        term in lowered for term in ("energy", "kwh", "consumption", "usage", "demand")
+    ):
+        operations = [name for name in operations if name not in {"telemetry_top_consumers", "site_energy_summary"}]
+    if "energy_forecast" in operations and not any(
+        term in lowered for term in ("compare", "comparison", "difference", "top consumer", "energy summary")
+    ):
+        operations = [name for name in operations if name != "site_energy_summary"]
     if "demand_peak_summary" in operations and "site_energy_summary" in operations:
         operations.remove("site_energy_summary")
     if "demand_peak_summary" in operations and any(
@@ -857,6 +885,7 @@ def requested_historical_range(message: str) -> dict:
     requested_dates = requested_comparison_dates(message, end.year)
     requested_months = [] if requested_dates else requested_month_ranges(message, end.year)
     relative_range = relative_historical_range(message)
+    local_now = end.astimezone(timezone(timedelta(hours=8)))
     if requested_dates and relative_range:
         start, end = relative_range
     elif requested_dates:
@@ -870,6 +899,17 @@ def requested_historical_range(message: str) -> dict:
         end_date = max(month_end for _, month_end in requested_months) - timedelta(days=1)
         start = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc) - timedelta(days=1, hours=8)
         end = datetime(end_date.year, end_date.month, end_date.day, tzinfo=timezone.utc) - timedelta(hours=8)
+    elif "last month" in lowered:
+        current_month = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        previous_month = (current_month - timedelta(days=1)).replace(day=1)
+        start, end = previous_month.astimezone(timezone.utc), current_month.astimezone(timezone.utc)
+    elif "this month" in lowered:
+        start = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    elif "last week" in lowered:
+        this_week = (local_now - timedelta(days=local_now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+        start, end = (this_week - timedelta(days=7)).astimezone(timezone.utc), this_week.astimezone(timezone.utc)
+    elif "this week" in lowered:
+        start = (local_now - timedelta(days=local_now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
     elif "today" in lowered:
         start = end.replace(hour=0, minute=0, second=0, microsecond=0)
     elif "yesterday" in lowered:
@@ -896,20 +936,20 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
     if context.get("building_id"):
         args["building_id"] = int(context["building_id"])
 
-    device_id = context.get("device_id") or first_regex_int(
+    device_id = first_regex_int(
         message,
         (
             r"\bdevice\s*(?:id|#|:)?\s*(\d+)\b",
             r"\bmeter\s*(?:id|#|:)?\s*(\d+)\b",
         ),
-    )
-    alarm_id = context.get("alarm_id") or first_regex_int(
+    ) or context.get("device_id")
+    alarm_id = first_regex_int(
         message,
         (
             r"\balarm\s*(?:id|#|:)?\s*(\d+)\b",
             r"\bevent\s*(?:id|#|:)?\s*(\d+)\b",
         ),
-    )
+    ) or context.get("alarm_id")
 
     if device_id:
         args["device_id"] = int(device_id)
@@ -934,7 +974,7 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
     if operation_id == "telemetry_top_consumers":
         args["limit"] = int(context.get("limit") or 5)
     elif operation_id == "alarm_frequency_summary":
-        args["limit"] = int(context.get("limit") or 10)
+        args["limit"] = requested_top_limit(message) or int(context.get("limit") or 10)
     elif operation_id == "site_energy_summary":
         args["bucket"] = str(context.get("bucket") or "day")
     elif operation_id == "site_device_list":
@@ -1004,7 +1044,11 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
     elif operation_id == "device_energy_breakdown":
         args["limit"] = int(context.get("limit") or 20)
     elif operation_id == "energy_forecast":
-        args["forecast_days"] = int(context.get("forecast_days") or 7)
+        args["forecast_days"] = requested_forecast_days(message) or int(context.get("forecast_days") or 7)
+        args["forecast_days"] = min(max(args["forecast_days"], 1), 14)
+        history_days = min(max(int(context.get("history_days") or 35), 28), 90)
+        args["start"] = (datetime.now(timezone.utc) - timedelta(days=history_days)).isoformat()
+        args["end"] = datetime.now(timezone.utc).isoformat()
     elif operation_id == "anomaly_detection_summary":
         args["limit"] = int(context.get("limit") or 20)
     return args
@@ -1123,6 +1167,58 @@ def historical_result_data(mcp_result: dict, list_keys: tuple[str, ...] = ("rows
     return found if found else {}
 
 
+def predict_daily_energy(summary: dict, forecast_days: int, timezone_name: str = "Asia/Kuala_Lumpur") -> dict:
+    rows = first_list(summary, ("buckets", "rows", "series", "data"))
+    today = (datetime.now(timezone.utc) + timedelta(hours=8)).date() if timezone_name == "Asia/Kuala_Lumpur" else datetime.now(timezone.utc).date()
+    readings = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        stamp = row.get("timestamp") or row.get("bucket") or row.get("start") or row.get("date")
+        day = local_bucket_date(stamp, timezone_name) if isinstance(stamp, str) else None
+        value = row.get("value") if row.get("value") is not None else row.get("kwh")
+        if not day or isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if math.isfinite(value) and value >= 0 and day < today.isoformat():
+            readings[date.fromisoformat(day)] = float(value)
+    days = sorted(readings)[-35:]
+    if len(days) < 21:
+        raise ValueError(f"Prediction needs at least 21 complete daily readings; {len(days)} were available.")
+    latest = days[-1]
+    if (today - latest).days > 2:
+        raise ValueError(f"The latest complete energy reading is {latest.isoformat()}; refresh historical data before forecasting.")
+    span = (latest - days[0]).days + 1
+    coverage = len(days) / span
+    if coverage < 0.8:
+        raise ValueError(f"Daily energy coverage is {coverage:.0%}; at least 80% is needed for a forecast.")
+
+    def estimate(target: date, training: list[date]) -> float:
+        same_weekday = [readings[day] for day in training if day.weekday() == target.weekday()]
+        values = same_weekday[-4:] if len(same_weekday) >= 2 else [readings[day] for day in training[-7:]]
+        return statistics.mean(values)
+
+    validation = days[-7:]
+    errors = [abs(readings[day] - estimate(day, [earlier for earlier in days if earlier < day])) for day in validation]
+    horizon = min(max(int(forecast_days), 1), 14)
+    forecast = []
+    first_forecast_day = max(latest + timedelta(days=1), today)
+    for offset in range(horizon):
+        target = first_forecast_day + timedelta(days=offset)
+        forecast.append({"date": target.isoformat(), "value": round(estimate(target, days), 2)})
+    return {
+        "status": "ok",
+        "source_tool": "site_energy_summary",
+        "method": "recent same-weekday average (last four matching days)",
+        "unit": summary.get("unit") or "kWh",
+        "history_start": days[0].isoformat(),
+        "history_end": latest.isoformat(),
+        "observed_days": len(days),
+        "coverage_percent": round(100 * coverage, 1),
+        "backtest_mae": round(statistics.mean(errors), 2),
+        "forecast": forecast,
+    }
+
+
 def format_number(value, precision: int = 2) -> str:
     if isinstance(value, bool):
         return str(value)
@@ -1169,30 +1265,23 @@ def format_coverage_note(data: dict) -> str | None:
 
 def build_compliance_context(message: str = "", operation_ids: list[str] | None = None) -> list[dict]:
     lowered = message.lower()
-    operation_ids = operation_ids or []
-    wants_energy = (
-        "site_energy_summary" in operation_ids
-        or any(term in lowered for term in ("kwh", "energy", "consumption", "usage", "enpi", "baseline"))
-    )
-    wants_power_quality = any(
-        term in lowered
-        for term in ("sag", "dip", "swell", "transient", "harmonic", "thd", "flicker", "power quality")
-    )
-    wants_protocol = any(term in lowered for term in ("janitza", "umg", "protocol", "modbus", "bacnet", "snmp"))
-    context = []
-    for item in ENERGY_COMPLIANCE_CONTEXT:
-        standard = item["standard"].lower()
-        if "power quality" in item["label"].lower() and not wants_power_quality:
-            continue
-        if "data protocol" in item["label"].lower() and not (wants_protocol or wants_energy):
-            continue
-        if wants_energy or ("iso" in standard and ("iso" in lowered or "enpi" in lowered or "baseline" in lowered)):
-            context.append(item)
-        elif wants_protocol and "janitza" in standard:
-            context.append(item)
-        elif wants_power_quality and ("iec 61000" in standard or "ieee" in standard):
-            context.append(item)
-    return context
+    if not any(term in lowered for term in (
+        "standard", "compliance", "compliant", "certif", "iso", "iec", "ieee",
+        "protocol", "modbus", "bacnet", "snmp", "accuracy", "calibration", "enpi", "baseline",
+    )):
+        return []
+    wants_compliance = any(term in lowered for term in ("standard", "compliance", "compliant", "certif"))
+    wants_protocol = any(term in lowered for term in ("protocol", "modbus", "bacnet", "snmp"))
+    wants_management = any(term in lowered for term in ("iso", "enpi", "baseline"))
+    wants_accuracy = any(term in lowered for term in ("accuracy", "calibration", "iec 62053"))
+    wants_quality = any(term in lowered for term in ("power quality", "sag", "swell", "thd", "ieee", "iec 61000"))
+    requested = {
+        "Data protocol": wants_protocol,
+        "Energy management": wants_management or wants_compliance,
+        "Metering accuracy": wants_accuracy or wants_compliance,
+        "Power quality context": wants_quality,
+    }
+    return [item for item in ENERGY_COMPLIANCE_CONTEXT if requested.get(item["label"], False)]
 
 
 def format_compliance_context(context: list[dict]) -> str:
@@ -1486,18 +1575,25 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
     return "\n".join(lines)
 
 
-def summarize_alarm_frequency(data: dict) -> str:
+def summarize_alarm_frequency(data: dict, arguments: dict | None = None) -> str:
     rows = data.get("rows") or data.get("alarms") or data.get("items")
     rows = rows if isinstance(rows, list) else []
     lines = ["Alarm frequency summary returned by Daxview MCP:"]
     if not rows:
         lines.append("No alarm-frequency rows were returned for this site and time range.")
-    for index, row in enumerate(rows[:10], 1):
+    limit = min(max(int((arguments or {}).get("limit") or 10), 1), 20)
+    for index, row in enumerate(rows[:limit], 1):
         if not isinstance(row, dict):
             continue
         name = row.get("alarm_name") or row.get("name") or row.get("type") or row.get("severity") or "Alarm"
-        count = row.get("count") or row.get("frequency") or row.get("total") or row.get("value")
-        lines.append(f"{index}. {name} - {format_number(count, 0)} occurrence(s)")
+        count = next((row[key] for key in ("count", "frequency", "total", "value") if row.get(key) is not None), None)
+        detail = f"{index}. {name} - {format_number(count, 0)} occurrence(s)"
+        if row.get("severity"):
+            detail += f", severity {row['severity']}"
+        latest = row.get("latest_occurrence") or row.get("last_seen") or row.get("latest_at")
+        if latest:
+            detail += f", latest {latest}"
+        lines.append(detail)
     if data.get("row_count") is not None:
         lines.append(f"Rows returned: {data.get('row_count')}.")
     return "\n".join(lines)
@@ -1727,6 +1823,25 @@ def summarize_generic_tool(operation_id: str, data: dict) -> str:
     return "\n".join(lines)
 
 
+def summarize_energy_forecast(data: dict) -> str:
+    rows = data.get("forecast") if isinstance(data.get("forecast"), list) else []
+    if not rows:
+        return "A forecast could not be calculated from the available daily energy readings."
+    unit = data.get("unit") or "kWh"
+    lines = [f"Daily energy forecast ({unit}):"]
+    for row in rows:
+        if isinstance(row, dict):
+            lines.append(f"- {row.get('date')}: {format_number(row.get('value'), 2)} {unit}")
+    lines.append(
+        f"Method: {data.get('method')}. Based on {data.get('observed_days')} complete days "
+        f"({data.get('coverage_percent')}% coverage), through {data.get('history_end')}."
+    )
+    if data.get("backtest_mae") is not None:
+        lines.append(f"Recent 7-day backtest mean absolute error: {data['backtest_mae']} {unit}.")
+    lines.append("This is a historical-pattern estimate, not a guaranteed future reading.")
+    return "\n".join(lines)
+
+
 def summarize_historical_answer(
     message: str,
     operation_id: str,
@@ -1740,7 +1855,9 @@ def summarize_historical_answer(
     if operation_id == "site_energy_summary":
         return summarize_site_energy(data, message, arguments)
     if operation_id == "alarm_frequency_summary":
-        return summarize_alarm_frequency(data)
+        return summarize_alarm_frequency(data, arguments)
+    if operation_id == "energy_forecast":
+        return summarize_energy_forecast(data)
     if operation_id == "active_alarm_summary":
         return summarize_active_alarms(data)
     if operation_id == "site_metadata_summary":
@@ -1803,7 +1920,7 @@ def summarize_historical_answers(
 def refine_historical_answer_with_model(message: str, results: list[dict], deterministic_answer: str, request_id: str) -> str:
     if not AI_REFINE_MCP_WITH_MODEL:
         return deterministic_answer
-    prompt = build_mcp_refine_prompt(message, results, deterministic_answer)
+    prompt = build_mcp_refine_prompt(message, results, deterministic_answer, request_id)
     primary_answer = run_mcp_refine_model(prompt, request_id, CHAT_MODEL, deterministic_answer, role="primary")
     if not AI_COMPARE_MODEL_ENABLED:
         return primary_answer
@@ -1832,7 +1949,7 @@ def refine_historical_answer_with_model(message: str, results: list[dict], deter
     )
 
 
-def build_mcp_refine_prompt(message: str, results: list[dict], deterministic_answer: str) -> str:
+def build_mcp_refine_prompt(message: str, results: list[dict], deterministic_answer: str, request_id: str = "") -> str:
     mcp_context = {
         "enabled": True,
         "tools": [item.get("operation_id") for item in results],
@@ -1843,10 +1960,24 @@ def build_mcp_refine_prompt(message: str, results: list[dict], deterministic_ans
         "errors": [],
     }
     raw_context = format_daxview_context(mcp_context)
+    library_section = ""
+    if needs_ems_library(message):
+        try:
+            library_rows = retrieve_context(message)[:3]
+            if library_rows:
+                library_section = "\nRelevant EMS library excerpts:\n" + "\n".join(
+                    f"- {row.get('title')}: {str(row.get('chunk_text') or '')[:900]}"
+                    for row in library_rows
+                )
+        except Exception as error:
+            log_event("ems_library_retrieval_error", request_id=request_id, error=str(error))
     prompt = f"""You are an EMS operations assistant.
-Rewrite the answer using only the DaxView MCP facts below.
+Use DaxView MCP data for site-specific facts. Use library excerpts only for relevant general EMS explanations.
 Make it human, clean, and practical.
 Do not invent values, devices, alarms, timestamps, causes, or recommendations not supported by the MCP data.
+Answer each part of the user's question using the matching tool result. Never present energy consumption as an alarm count.
+Do not include standards, protocols, or library background unless the user asks for them.
+For predictions, label every future value as an estimate and retain the method, coverage, and backtest error.
 Keep the answer concise but useful:
 - Start with the direct answer.
 - Use short sections and bullets.
@@ -1864,6 +1995,7 @@ Deterministic draft:
 
 DaxView data summary:
 {raw_context}
+{library_section}
 
 Final answer:"""
 
@@ -2107,7 +2239,13 @@ FOLLOW_UP_PHRASES = (
 
 def is_follow_up_message(message: str) -> bool:
     lowered = message.lower().strip()
-    return any(phrase in lowered for phrase in FOLLOW_UP_PHRASES)
+    if re.match(r"^device\s*(?:id\s*)?[:#-]?\s*\d+\b", lowered):
+        return True
+    if re.fullmatch(r"(?:why|how|what about that|and that|same one)[?.! ]*", lowered):
+        return True
+    if re.match(r"^(?:and\s+)?(?:what about|how about|for the same|on the same|can you also|show me more about)\b", lowered):
+        return True
+    return any(phrase in lowered for phrase in FOLLOW_UP_PHRASES if phrase != "why")
 
 
 def previous_daxview_turn(conversation_id: str, current_turn_id: str) -> dict | None:
@@ -2119,12 +2257,15 @@ def previous_daxview_turn(conversation_id: str, current_turn_id: str) -> dict | 
                 FROM daxview_turns
                 WHERE conversation_id = %s AND id <> %s
                 ORDER BY created_at DESC
-                LIMIT 1
+                LIMIT 10
                 """,
                 (conversation_id, current_turn_id),
             )
-            row = cur.fetchone()
-    return row if row else None
+            rows = cur.fetchall()
+    return next(
+        (row for row in rows if row.get("user_message") and not str(row["user_message"]).lower().startswith("requested context")),
+        None,
+    )
 
 
 def resolve_follow_up_message(turn_id: str, message: str, context: dict, conversation_id: str, request_id: str) -> tuple[str, dict]:
@@ -2136,14 +2277,29 @@ def resolve_follow_up_message(turn_id: str, message: str, context: dict, convers
     previous_message = str(previous["user_message"])
     previous_context = previous.get("context") if isinstance(previous.get("context"), dict) else {}
     merged_context = {**previous_context, **context}
-    resolved = (
-        "Answer this as a follow-up to the previous DaxView EMS answer. "
-        "Reuse the same site/building/device/time context unless the follow-up changes it. "
-        "Do not treat this as a brand new unrelated question. "
-        "Previous request: "
-        f"{previous_message}. "
-        f"Follow-up request: {message}"
-    )
+    device_patterns = (r"\bdevice\s*(?:id|#|:)?\s*(\d+)\b", r"\bmeter\s*(?:id|#|:)?\s*(\d+)\b")
+    if not merged_context.get("device_id") and first_regex_int(message, device_patterns) is None:
+        previous_device_id = first_regex_int(previous_message, device_patterns)
+        if previous_device_id is not None:
+            merged_context["device_id"] = previous_device_id
+    if select_historical_operations(message):
+        resolved = message
+        if not has_time_scope(message):
+            prior_window = re.search(
+                r"\b(?:last|past)\s+\d{1,3}\s+(?:days?|weeks?|months?)\b|\b(?:today|yesterday|last week|this week)\b",
+                previous_message,
+                re.IGNORECASE,
+            )
+            if prior_window:
+                resolved += f" for {prior_window.group(0)}"
+    else:
+        prior_question = previous_message
+        if has_time_scope(message):
+            prior_question = re.sub(
+                r"\b(?:last|past)\s+\d{1,3}\s+(?:days?|weeks?|months?)\b|\b(?:today|yesterday|last week|this week)\b",
+                "", prior_question, flags=re.IGNORECASE,
+            )
+        resolved = f"{message}. Regarding {prior_question}"
     log_event(
         "daxview_follow_up_resolved",
         request_id=request_id,
@@ -2229,6 +2385,36 @@ def build_device_choice_response(turn_id: str, message: str, context: dict, requ
     }
 
 
+def run_authorized_energy_prediction(turn_id: str, arguments: dict, request_id: str) -> dict:
+    source_args = {
+        key: arguments[key]
+        for key in ("site_id", "building_id", "start", "end", "timezone")
+        if key in arguments
+    }
+    source_args["bucket"] = "day"
+    plan = request_daxview_data_plan(turn_id, "site_energy_summary", source_args, request_id)
+    authorization_id = plan.get("authorization_id")
+    normalized = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else source_args
+    if not authorization_id:
+        raise RuntimeError("DaxView did not authorize site_energy_summary for prediction")
+    source = call_authorized_historical_tool("site_energy_summary", str(authorization_id), normalized, request_id)
+    structured = mcp_structured_result(source)
+    if structured.get("status") == "error" or source.get("isError"):
+        raise RuntimeError(f"Historical energy data is unavailable: {structured.get('error_code') or 'MCP tool error'}")
+    prediction = predict_daily_energy(
+        historical_result_data(source, ("buckets", "rows", "series", "data")),
+        arguments["forecast_days"],
+        arguments.get("timezone") or "Asia/Kuala_Lumpur",
+    )
+    log_event(
+        "energy_prediction_completed", request_id=request_id, tool="energy_forecast",
+        source_tool="site_energy_summary", observed_days=prediction["observed_days"],
+        coverage_percent=prediction["coverage_percent"], backtest_mae=prediction["backtest_mae"],
+    )
+    debug_trace_event("energy_prediction_debug", request_id=request_id, prediction=prediction)
+    return {"structuredContent": {"data": prediction}}
+
+
 def run_daxview_integration_turn(turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> dict:
     message, context = resolve_follow_up_message(turn_id, message, context, session_id, request_id)
     operation_ids = select_historical_operations(message)
@@ -2253,6 +2439,19 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
                 "provider": "daxview-question-filter",
                 "reply": historical_argument_clarification(error, operation_id),
             }
+        if operation_id == "energy_forecast":
+            try:
+                result = run_authorized_energy_prediction(turn_id, arguments, request_id)
+                results.append({"operation_id": operation_id, "arguments": arguments, "result": result})
+            except ValueError as error:
+                log_event("energy_prediction_rejected", request_id=request_id, reason=str(error))
+                return {"provider": "energy-prediction", "reply": str(error)}
+            except Exception as error:
+                errors.append({"operation_id": operation_id, "error": str(error)})
+                log_event("daxview_tool_step_failed", request_id=request_id, turn_id=turn_id, operation_id=operation_id, error=str(error))
+                if len(operation_ids) == 1:
+                    raise
+            continue
         try:
             plan = request_daxview_data_plan(turn_id, operation_id, arguments, request_id)
             authorization_id = plan.get("authorization_id")
@@ -2360,7 +2559,9 @@ def needs_device_choice(message: str) -> bool:
         return False
     if any(phrase in lowered for phrase in ("all devices", "every device", "top devices")):
         return False
-    return not any(re.search(pattern, lowered) for pattern in (r"\bdevice\s*[:#-]\s*[\w.-]+", r"\bumg[\s-]?\d+\b"))
+    return not any(re.search(pattern, lowered) for pattern in (
+        r"\bdevice\s*(?:id\s*)?[:#-]?\s*\d+\b", r"\bumg[\s-]?\d+\b"
+    ))
 
 
 def has_time_scope(message: str) -> bool:
@@ -2563,20 +2764,7 @@ def call_daxview_mcp_tool(tool_name: str, arguments: dict | None, request_id: st
 
 
 def select_daxview_tools(message: str) -> list[str]:
-    lowered = message.lower()
-    selected = []
-    for tool_name, phrases in DAXVIEW_TOOL_KEYWORDS.items():
-        if any(phrase in lowered for phrase in phrases):
-            selected.append(tool_name)
-    if "demand_peak_summary" in selected and "site_energy_summary" in selected:
-        selected.remove("site_energy_summary")
-    if "demand_peak_summary" in selected and any(
-        phrase in lowered for phrase in ("detail", "details", "breakdown", "device", "devices", "which meter", "which meters")
-    ):
-        for tool_name in ("site_device_list",):
-            if tool_name not in selected:
-                selected.append(tool_name)
-    return selected[:5]
+    return select_historical_operations(message)[:5]
 
 
 def retrieve_daxview_context(message: str, request_id: str) -> dict:
@@ -2779,6 +2967,15 @@ def chunk_text(text: str, max_chars: int = 1400, overlap: int = 180) -> list[str
     return chunks
 
 
+def needs_ems_library(message: str) -> bool:
+    lowered = message.lower()
+    return any(term in lowered for term in (
+        "standard", "compliance", "certif", "iso", "iec", "ieee", "protocol",
+        "modbus", "bacnet", "snmp", "calibration", "accuracy", "enpi",
+        "how does", "how do", "explain", "what is", "troubleshoot",
+    ))
+
+
 def retrieve_context(question: str) -> list[dict]:
     if not DATABASE_URL:
         return []
@@ -2818,6 +3015,7 @@ Answer only EMS, energy management, ISO 50001, IEC, IEEE, power monitoring, mete
 Keep the final answer simple and compact: maximum 5 short bullets or 1 short paragraph.
 Use the EMS library context when relevant. If no matching EMS library context is found, still answer the EMS question using general domain knowledge, and clearly state when site-specific proof, device configuration, calibration, or source evidence is missing.
 Use historical Daxview data when it is provided. If a Daxview tool failed, say historical Daxview data is currently unavailable for that part.
+Only cite EMS library facts when they directly answer the question. Do not add ISO or protocol background to routine site results.
 For ranked historical answers, number the result from 1 to last, include the time window, and omit internal fields such as source_count, raw row_count, aggregation names, backend endpoints, and last_updated unless the user explicitly asks for diagnostics.
 When explaining kWh or consumption compliance, distinguish data protocols from standards: protocols such as Modbus, BACnet, and SNMP describe data transport; ISO 50001/50006 describe energy-management baselines and EnPIs; IEC meter standards and device active-energy class describe measurement accuracy. Do not claim a reading is certified or in accordance with a standard unless source data proves that certification, calibration, and device configuration.
 For Janitza UMG device, voltage sag, power quality, alarm, THD, or meter troubleshooting questions, prioritize likely root causes, what readings to check, and practical EMS investigation steps.
@@ -3023,6 +3221,9 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       .panel { background: white; border: 1px solid #dbe3ef; border-radius: 8px; overflow: hidden; }
       .panel h2 { margin: 0; padding: 12px 14px; font-size: 13px; border-bottom: 1px solid #e5ebf3; background: #f8fafc; }
       .toolbar { display: flex; gap: 8px; align-items: center; padding: 10px 14px; border-bottom: 1px solid #e5ebf3; }
+      .tabs { display: flex; gap: 4px; padding: 0 14px; border-bottom: 1px solid #e5ebf3; }
+      .tabs button { background: transparent; border: 0; border-bottom: 2px solid transparent; color: #475569; border-radius: 0; }
+      .tabs button.active { color: #0369a1; border-bottom-color: #0284c7; }
       input, button { font: inherit; }
       input { flex: 1; padding: 8px 10px; border: 1px solid #cbd5e1; border-radius: 6px; }
       button { padding: 8px 10px; border: 1px solid #0ea5e9; color: white; background: #0284c7; border-radius: 6px; cursor: pointer; }
@@ -3077,6 +3278,10 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       </div>
       <button id="refresh">Refresh</button>
     </header>
+    <nav class="tabs" aria-label="Dashboard views">
+      <button type="button" data-view="traces" class="active">Traces</button>
+      <button type="button" data-view="predictions">Predictions</button>
+    </nav>
     <main>
       <section class="panel">
         <h2>Recent Requests</h2>
@@ -3096,6 +3301,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       }
       let grouped = [];
       let selected = null;
+      let activeView = "traces";
 
       function eventClass(name) {
         if (/failed|error|timeout|404|403|409|429|500/i.test(name)) return "fail";
@@ -3242,9 +3448,15 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       function renderRequests() {
         const filter = document.querySelector("#filter").value.toLowerCase();
         const root = document.querySelector("#requests");
-        const rows = grouped.filter(group => JSON.stringify(group).toLowerCase().includes(filter));
+        const rows = grouped.filter(group =>
+          (activeView === "traces" || group.events.some(event =>
+            event.event === "energy_prediction_debug" || (event.operation_ids || []).includes("energy_forecast")))
+          && JSON.stringify(group).toLowerCase().includes(filter)
+        );
         if (!rows.length) {
-          root.innerHTML = '<div class="empty">No traces yet. Ask an AI question, then refresh.</div>';
+          root.innerHTML = activeView === "predictions"
+            ? '<div class="empty">No prediction requests yet. Ask DaxView for a 7-day energy forecast, then refresh.</div>'
+            : '<div class="empty">No traces yet. Ask an AI question, then refresh.</div>';
           return;
         }
         root.innerHTML = rows.map(group => {
@@ -3281,7 +3493,17 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
             <pre>${escapeHtml(JSON.stringify(event, null, 2))}</pre>
           </article>`;
         }).join("");
-        root.innerHTML = renderFlow(group.events) + renderSummary(group) + renderInspectors(group.events) + eventsHtml;
+        const prediction = group.events.find(event => event.event === "energy_prediction_debug")?.prediction;
+        const predictionHtml = activeView === "predictions" && prediction
+          ? `<div class="summary-grid">
+              <div class="metric"><div class="label">History</div><div class="value">${escapeHtml(prediction.history_start)} to ${escapeHtml(prediction.history_end)}</div></div>
+              <div class="metric"><div class="label">Coverage</div><div class="value">${escapeHtml(prediction.coverage_percent)}%</div></div>
+              <div class="metric"><div class="label">Backtest MAE</div><div class="value">${escapeHtml(prediction.backtest_mae)} ${escapeHtml(prediction.unit)}</div></div>
+              <div class="metric"><div class="label">Method</div><div class="value">${escapeHtml(prediction.method)}</div></div>
+            </div>` : "";
+        root.innerHTML = activeView === "predictions"
+          ? predictionHtml + renderInspectors(group.events) + eventsHtml
+          : renderFlow(group.events) + renderSummary(group) + renderInspectors(group.events) + eventsHtml;
         drawCharts();
       }
       function escapeHtml(value) {
@@ -3289,6 +3511,17 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       }
       document.querySelector("#refresh").addEventListener("click", load);
       document.querySelector("#filter").addEventListener("input", renderRequests);
+      document.querySelectorAll(".tabs button").forEach(button => button.addEventListener("click", () => {
+        activeView = button.dataset.view;
+        document.querySelectorAll(".tabs button").forEach(tab => tab.classList.toggle("active", tab === button));
+        selected = activeView === "predictions"
+          ? grouped.find(group => group.events.some(event =>
+              event.event === "energy_prediction_debug" || (event.operation_ids || []).includes("energy_forecast")))?.id || null
+          : null;
+        renderRequests();
+        if (selected) renderTimeline(selected);
+        else document.querySelector("#timeline").innerHTML = '<div class="empty">Select a request.</div>';
+      }));
       load();
       setInterval(load, 10000);
     </script>
@@ -3340,7 +3573,7 @@ def langchain_retrieve_context(state: dict) -> dict:
     if not state.get("is_ems_related") or state.get("needs_clarification"):
         return state
     message = state["message"]
-    contexts = retrieve_context(message)
+    contexts = retrieve_context(message) if needs_ems_library(message) else []
     state["contexts"] = contexts
     state["sources"] = [
         {
