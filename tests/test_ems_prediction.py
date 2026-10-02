@@ -18,14 +18,15 @@ FUNCTIONS = {
 NAMES = (
     "requested_top_limit", "requested_forecast_days", "requested_energy_extrema",
     "requested_question_parts", "completed_daily_range", "wants_device_usage_ranking", "wants_all_devices",
-    "select_historical_operations", "build_historical_arguments",
+    "select_historical_operations", "build_historical_arguments", "requested_device_id",
     "parse_datetime", "local_bucket_date", "first_list", "predict_daily_energy",
     "is_follow_up_message", "resolve_follow_up_message", "needs_ems_library",
     "build_compliance_context", "has_time_scope", "first_regex_int", "needs_device_choice",
     "run_authorized_energy_prediction", "run_daxview_integration_turn",
     "build_charts_from_historical_results", "summarize_site_energy",
     "ensure_historical_answer_coverage", "ranked_consumer_rows", "summarize_top_consumers",
-    "summarize_historical_answers",
+    "summarize_historical_answers", "summarize_demand_peak", "device_selection_prompt_from_result",
+    "build_device_choice_response",
 )
 
 
@@ -301,6 +302,62 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertIn("demand_peak_summary", self.env["select_historical_operations"](message))
         self.assertFalse(self.env["needs_device_choice"](message))
         self.assertEqual(context["site_id"], 17)
+
+    def test_displayed_device_id_does_not_trigger_choice_again(self):
+        question = "(ID 519, Online, Virtual) I want max demand for this device for the last 7 days"
+        self.assertEqual(self.env["requested_device_id"](question), 519)
+        self.assertFalse(self.env["needs_device_choice"](question))
+        self.assertEqual(self.env["select_historical_operations"](question), ["demand_peak_summary"])
+        self.env["requested_historical_range"] = Mock(return_value={"start": "start", "end": "end", "timezone": "Asia/Kuala_Lumpur"})
+        arguments = self.env["build_historical_arguments"]("demand_peak_summary", {"site_id": 17}, question)
+        self.assertEqual(arguments["device_id"], 519)
+
+    def test_selected_device_context_does_not_trigger_choice_again(self):
+        self.env["resolve_follow_up_message"] = Mock(side_effect=lambda turn, message, context, conversation, request: (message, context))
+        self.env["build_device_choice_response"] = Mock()
+        self.env["build_historical_arguments"] = Mock(return_value={"site_id": 17, "device_id": 519})
+        self.env["request_daxview_data_plan"] = Mock(return_value={"authorization_id": "authorized"})
+        self.env["call_authorized_historical_tool"] = Mock(return_value={"structuredContent": {"data": {"peak_kw": 42}}})
+        self.env["summarize_historical_answers"] = Mock(return_value="Peak demand: 42 kW")
+        self.env["refine_historical_answer_with_model"] = Mock(return_value="Peak demand: 42 kW")
+        self.env["build_charts_from_historical_results"] = Mock(return_value=[])
+        self.env["debug_trace_event"] = Mock()
+        self.env["AI_REFINE_MCP_WITH_MODEL"] = False
+        result = self.env["run_daxview_integration_turn"](
+            "turn", "Max demand for this device", {"site_id": 17, "device_id": 519}, "request", "conversation"
+        )
+        self.assertEqual(result["reply"], "Peak demand: 42 kW")
+        self.env["build_device_choice_response"].assert_not_called()
+
+    def test_device_choices_include_full_returned_list_and_keep_time_scope(self):
+        devices = [{"device_id": index, "device_name": f"Meter {index}", "status": "online"}
+                   for index in range(1, 16)]
+        self.env["historical_result_data"] = lambda result: result["data"]
+        prompt, choices = self.env["device_selection_prompt_from_result"]({"data": {"devices": devices}})
+        self.assertEqual(len(choices), 15)
+        self.assertIn("first 12", prompt)
+        self.env["build_historical_arguments"] = Mock(return_value={"site_id": 17})
+        self.env["request_daxview_data_plan"] = Mock(return_value={"authorization_id": "authorized"})
+        self.env["call_authorized_historical_tool"] = Mock(return_value={"data": {"devices": devices}})
+        result = self.env["build_device_choice_response"](
+            "turn", "Max demand for this device today", {"site_id": 17}, "request"
+        )
+        self.assertEqual(result["input_type"], "select")
+        self.assertEqual(len(result["choices"]), 15)
+        self.assertEqual(result["submit_template"], "max demand for device ID {value} for today")
+
+    def test_demand_summary_distinguishes_historical_and_live(self):
+        self.env["format_time_window"] = lambda data, arguments: "last 7 days"
+        self.env["first_value"] = lambda row, keys: next((row[key] for key in keys if row.get(key) is not None), None)
+        self.env["format_number"] = lambda value, precision=2: f"{value:.2f}"
+        answer = self.env["summarize_demand_peak"](
+            {"peak_kw": 42, "peak_time": "2026-10-01T10:00:00+08:00", "latest_kw": 15},
+            "Show the live and 7d max demand", {"device_id": 519},
+        )
+        self.assertIn("device ID 519 (historical, last 7 days)", answer)
+        self.assertIn("Peak demand: 42.00 kW", answer)
+        self.assertIn("Latest returned demand: 15.00 kW", answer)
+        self.assertIn("Live value: not provided", answer)
 
     def test_standards_are_not_added_to_routine_site_answer(self):
         self.assertEqual(self.env["build_compliance_context"]("Show site energy for the last 7 days", ["site_energy_summary"]), [])

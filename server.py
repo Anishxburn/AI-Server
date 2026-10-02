@@ -799,7 +799,7 @@ def select_historical_operations(message: str) -> list[str]:
     if "demand_peak_summary" in operations and "site_energy_summary" in operations:
         operations.remove("site_energy_summary")
     if "demand_peak_summary" in operations and any(
-        phrase in lowered for phrase in ("detail", "details", "breakdown", "device", "devices", "which meter", "which meters")
+        phrase in lowered for phrase in ("details", "breakdown", "devices", "which meter", "which meters")
     ):
         for tool_name in ("site_device_list",):
             if tool_name not in operations:
@@ -847,6 +847,15 @@ def first_regex_int(message: str, patterns: tuple[str, ...]) -> int | None:
         if match:
             return int(match.group(1))
     return None
+
+
+def requested_device_id(message: str) -> int | None:
+    return first_regex_int(message, (
+        r"\bdevice\s*(?:id|#|:)?\s*(\d+)\b",
+        r"\bmeter\s*(?:id|#|:)?\s*(\d+)\b",
+        r"\(\s*ID\s*[:#-]?\s*(\d+)\s*[,)]",
+        r"^\s*ID\s*[:#-]?\s*(\d+)\b",
+    ))
 
 
 def requested_metric(message: str) -> str:
@@ -994,13 +1003,7 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
     if context.get("building_id"):
         args["building_id"] = int(context["building_id"])
 
-    device_id = first_regex_int(
-        message,
-        (
-            r"\bdevice\s*(?:id|#|:)?\s*(\d+)\b",
-            r"\bmeter\s*(?:id|#|:)?\s*(\d+)\b",
-        ),
-    ) or context.get("device_id")
+    device_id = requested_device_id(message) or context.get("device_id")
     alarm_id = first_regex_int(
         message,
         (
@@ -1934,6 +1937,43 @@ def summarize_generic_tool(operation_id: str, data: dict) -> str:
     return "\n".join(lines)
 
 
+def summarize_demand_peak(data: dict, message: str, arguments: dict | None = None) -> str:
+    summary = data.get("summary") if isinstance(data.get("summary"), dict) else data
+    rows = first_list(data, ("rows", "items", "results", "devices"))
+    source = summary
+    peak_keys = ("peak_kw", "max_demand_kw", "maximum_demand_kw", "peak_demand_kw", "max_kw")
+    if first_value(source, peak_keys) is None:
+        source = next((row for row in rows if isinstance(row, dict) and first_value(row, peak_keys) is not None), summary)
+    device_id = first_value(source, ("device_id", "meter_id")) or (arguments or {}).get("device_id")
+    device_name = first_value(source, ("device_name", "meter_name", "name"))
+    heading = f"Max demand for {device_name or f'device ID {device_id}'}" if device_id or device_name else "Max demand"
+    lines = [f"{heading} (historical, {format_time_window(data, arguments)}):"]
+    peak = first_value(source, peak_keys)
+    if peak is None:
+        lines.append("Peak demand: not returned by DaxView for this device and period.")
+    else:
+        lines.append(f"Peak demand: {format_number(peak, 2)} kW")
+        peak_time = first_value(source, ("peak_time", "peak_at", "timestamp", "max_time", "max_at"))
+        if peak_time:
+            lines.append(f"Peak time: {peak_time}")
+    for keys, label, unit in (
+        (("average_kw", "avg_kw"), "Average demand", "kW"),
+        (("minimum_kw", "min_kw"), "Minimum demand", "kW"),
+        (("energy_kwh", "total_kwh"), "Energy in period", "kWh"),
+        (("coverage_percent",), "Data coverage", "%"),
+    ):
+        value = first_value(source, keys)
+        if value is not None:
+            lines.append(f"{label}: {format_number(value, 2)} {unit}")
+    latest = first_value(source, ("latest_kw", "latest_demand_kw"))
+    latest_time = first_value(source, ("latest_at", "latest_timestamp", "last_seen"))
+    if latest is not None:
+        lines.append(f"Latest returned demand: {format_number(latest, 2)} kW" + (f" at {latest_time}" if latest_time else " (timestamp unavailable)"))
+    if any(term in message.lower() for term in ("live", "real-time", "realtime", "current value")):
+        lines.append("Live value: not provided by this historical demand tool; the latest returned value is not verified live.")
+    return "\n".join(lines)
+
+
 def summarize_energy_forecast(data: dict) -> str:
     rows = data.get("forecast") if isinstance(data.get("forecast"), list) else []
     if not rows:
@@ -1977,6 +2017,8 @@ def summarize_historical_answer(
         return summarize_site_devices(data)
     if operation_id == "meter_status_summary":
         return summarize_meter_status(data)
+    if operation_id == "demand_peak_summary":
+        return summarize_demand_peak(data, message, arguments)
     if operation_id in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
         return summarize_generic_tool(operation_id, data)
     context = {
@@ -2520,9 +2562,8 @@ def resolve_follow_up_message(turn_id: str, message: str, context: dict, convers
     previous_message = str(previous["user_message"])
     previous_context = previous.get("context") if isinstance(previous.get("context"), dict) else {}
     merged_context = {**previous_context, **context}
-    device_patterns = (r"\bdevice\s*(?:id|#|:)?\s*(\d+)\b", r"\bmeter\s*(?:id|#|:)?\s*(\d+)\b")
-    if not merged_context.get("device_id") and first_regex_int(message, device_patterns) is None:
-        previous_device_id = first_regex_int(previous_message, device_patterns)
+    if not merged_context.get("device_id") and requested_device_id(message) is None:
+        previous_device_id = requested_device_id(previous_message)
         if previous_device_id is not None:
             merged_context["device_id"] = previous_device_id
     if select_historical_operations(message):
@@ -2574,11 +2615,11 @@ def device_selection_prompt_from_result(mcp_result: dict) -> tuple[str, list[dic
     choices = []
     lines = [
         "Which device should I use for the max-demand check?",
-        "Reply with a device ID, for example: `device ID 380 for the last 7 days`.",
+        "Select a device, or reply with its ID (for example, `device ID 380 for the last 7 days`).",
         "",
         "Available devices:",
     ]
-    for index, device in enumerate(devices[:12], 1):
+    for index, device in enumerate(devices[:100], 1):
         if not isinstance(device, dict):
             continue
         name = device.get("device_name") or device.get("name") or device.get("meter_name") or "Unnamed device"
@@ -2591,11 +2632,15 @@ def device_selection_prompt_from_result(mcp_result: dict) -> tuple[str, list[dic
         if device_type:
             detail += f", {device_type}"
         detail += ")"
-        lines.append(f"{index}. {detail}")
-        choices.append({"label": name, "value": str(device_id), "description": f"ID {device_id}, {status}"})
+        if index <= 12:
+            lines.append(f"{index}. {detail}")
+        description = f"ID {device_id} | {status}"
+        if device_type:
+            description += f" | {device_type}"
+        choices.append({"label": f"{name} (ID {device_id})", "value": str(device_id), "description": description})
     total = data.get("device_count") or data.get("meter_count") or data.get("row_count") or len(devices)
-    if total and len(devices) > len(choices):
-        lines.append(f"Showing {len(choices)} selectable device(s).")
+    if total and len(devices) > 12:
+        lines.append(f"Showing the first 12 of {len(devices)} returned devices here; {len(choices)} are selectable.")
     if not choices:
         lines.append("No selectable devices were returned. Please provide the device ID manually.")
     return "\n".join(lines), choices
@@ -2618,13 +2663,18 @@ def build_device_choice_response(turn_id: str, message: str, context: dict, requ
             "Reply with the device ID, for example: `device ID 380 for the last 7 days`."
         )
         choices = []
+    window = re.search(
+        r"\b(?:last|past)\s+\d{1,3}\s+days?\b|\b(?:today|yesterday|this week|last week|this month|last month)\b",
+        message, re.IGNORECASE,
+    )
+    time_scope = window.group(0) if window else "the last 7 days"
     return {
         "provider": "daxview-question-filter",
         "reply": prompt,
         "fields": ["device_id"],
         "input_type": "select",
         "choices": choices,
-        "submit_template": "device ID {value} for the last 7 days",
+        "submit_template": f"max demand for device ID {{value}} for {time_scope}",
     }
 
 
@@ -2676,7 +2726,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     )
     if not operation_ids:
         return langchain_chat_response(message, request_id, session_id)
-    if "demand_peak_summary" in operation_ids and needs_device_choice(message):
+    if "demand_peak_summary" in operation_ids and needs_device_choice(message) and not context.get("device_id"):
         return build_device_choice_response(turn_id, message, context, request_id)
     results = []
     errors = []
@@ -2828,9 +2878,7 @@ def needs_device_choice(message: str) -> bool:
         return False
     if any(phrase in lowered for phrase in ("all devices", "every device", "top devices")):
         return False
-    return not any(re.search(pattern, lowered) for pattern in (
-        r"\bdevice\s*(?:id\s*)?[:#-]?\s*\d+\b", r"\bumg[\s-]?\d+\b"
-    ))
+    return requested_device_id(message) is None and not re.search(r"\bumg[\s-]?\d+\b", lowered)
 
 
 def has_time_scope(message: str) -> bool:
