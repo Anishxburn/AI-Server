@@ -2876,6 +2876,11 @@ def needs_device_choice(message: str) -> bool:
     lowered = message.lower()
     if "device" not in lowered:
         return False
+    if any(phrase in lowered for phrase in (
+        "which device", "highest demand device", "top demand device",
+        "device with the highest demand", "device has the highest demand",
+    )):
+        return False
     if any(phrase in lowered for phrase in ("all devices", "every device", "top devices")):
         return False
     return requested_device_id(message) is None and not re.search(r"\bumg[\s-]?\d+\b", lowered)
@@ -4411,6 +4416,15 @@ def ingest_document(title: str, text: str, source_type: str = "manual", standard
     return {"document_id": document_id, "chunks": len(chunks)}
 
 
+def daxview_history_event(event: dict) -> dict:
+    event_type = event["event_type"]
+    data = event.get("event_data") or {}
+    item = {"type": event_type, "text": data.get("text") or data.get("prompt") or ""}
+    if event_type == "waiting_for_user":
+        item.update({key: data[key] for key in ("fields", "input_type", "choices", "submit_template") if key in data})
+    return item
+
+
 class ChatHandler(BaseHTTPRequestHandler):
     def _send_html(self, status: int, html: str) -> None:
         body = html.encode("utf-8")
@@ -4559,13 +4573,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                                     "turn_id": str(turn["id"]),
                                     "created_at": turn["created_at"].isoformat(),
                                     "user_message": {"text": turn["user_message"]},
-                                    "assistant_events": [
-                                        {
-                                            "type": event["event_type"],
-                                            "text": (event["event_data"] or {}).get("text") or (event["event_data"] or {}).get("prompt") or "",
-                                        }
-                                        for event in events
-                                    ],
+                                    "assistant_events": [daxview_history_event(event) for event in events],
                                 }
                             )
                 self._send_json(200, {"conversation_id": conversation_id, "items": items, "previous_cursor": None})

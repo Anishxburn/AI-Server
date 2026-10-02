@@ -27,6 +27,7 @@ NAMES = (
     "ensure_historical_answer_coverage", "ranked_consumer_rows", "summarize_top_consumers",
     "summarize_historical_answers", "summarize_demand_peak", "device_selection_prompt_from_result",
     "build_device_choice_response",
+    "daxview_history_event",
 )
 
 
@@ -312,6 +313,11 @@ class EmsPredictionTests(unittest.TestCase):
         arguments = self.env["build_historical_arguments"]("demand_peak_summary", {"site_id": 17}, question)
         self.assertEqual(arguments["device_id"], 519)
 
+    def test_site_wide_highest_demand_device_does_not_ask_for_device(self):
+        question = "What is the highest demand device today?"
+        self.assertEqual(self.env["select_historical_operations"](question), ["demand_peak_summary"])
+        self.assertFalse(self.env["needs_device_choice"](question))
+
     def test_selected_device_context_does_not_trigger_choice_again(self):
         self.env["resolve_follow_up_message"] = Mock(side_effect=lambda turn, message, context, conversation, request: (message, context))
         self.env["build_device_choice_response"] = Mock()
@@ -345,6 +351,17 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertEqual(result["input_type"], "select")
         self.assertEqual(len(result["choices"]), 15)
         self.assertEqual(result["submit_template"], "max demand for device ID {value} for today")
+
+    def test_history_keeps_select_metadata_after_reload(self):
+        event = {"event_type": "waiting_for_user", "event_data": {
+            "prompt": "Which device?", "fields": ["device_id"], "input_type": "select",
+            "choices": [{"label": "AC kWh (ID 519)", "value": "519"}],
+            "submit_template": "max demand for device ID {value} for today",
+        }}
+        history_item = self.env["daxview_history_event"](event)
+        self.assertEqual(history_item["text"], "Which device?")
+        self.assertEqual(history_item["choices"][0]["value"], "519")
+        self.assertEqual(history_item["input_type"], "select")
 
     def test_demand_summary_distinguishes_historical_and_live(self):
         self.env["format_time_window"] = lambda data, arguments: "last 7 days"
