@@ -18,10 +18,12 @@ FUNCTIONS = {
     node.name: node for node in TREE.body if isinstance(node, ast.FunctionDef)
 }
 NAMES = (
-    "requested_top_limit", "requested_forecast_days", "requested_energy_extrema",
+    "requested_top_limit", "requested_forecast_days", "requested_energy_extrema", "format_number", "format_time_window",
+    "reading_detail",
     "requested_question_parts", "completed_daily_range", "wants_device_usage_ranking", "wants_all_devices",
+    "wants_lowest_consumer", "wants_top_lowest_sum",
     "select_historical_operations", "build_historical_arguments", "requested_device_id",
-    "parse_datetime", "local_bucket_date", "first_list", "predict_daily_energy",
+    "parse_datetime", "local_bucket_date", "first_list", "first_value", "predict_daily_energy",
     "is_follow_up_message", "resolve_follow_up_message", "needs_ems_library",
     "build_compliance_context", "has_time_scope", "first_regex_int", "needs_device_choice",
     "run_authorized_energy_prediction", "run_daxview_integration_turn",
@@ -104,6 +106,26 @@ class EmsPredictionTests(unittest.TestCase):
         self.env["requested_historical_range"] = Mock(return_value={"start": "start", "end": "end", "timezone": "Asia/Kuala_Lumpur"})
         args = self.env["build_historical_arguments"]("telemetry_top_consumers", {"site_id": 17}, all_question)
         self.assertEqual(args["limit"], 100)
+
+    def test_top_lowest_consumer_question_includes_sum(self):
+        question = "What is the top energy consume device and the lowest and what are the total sum of their 2 energy"
+        self.assertTrue(self.env["wants_lowest_consumer"](question))
+        self.assertTrue(self.env["wants_top_lowest_sum"](question))
+        answer = self.env["summarize_top_consumers"](
+            {
+                "rows": [
+                    {"device_name": "Top Meter", "total_kwh": 100},
+                    {"device_name": "Low Meter", "total_kwh": 25},
+                    {"device_name": "Middle Meter", "total_kwh": 50},
+                ],
+                "unit": "kWh",
+            },
+            {"start": "2026-10-01T00:00:00+00:00", "end": "2026-10-08T00:00:00+00:00"},
+            question,
+        )
+        self.assertIn("Highest energy-consuming device: Top Meter at 100.00 kWh", answer)
+        self.assertIn("Lowest energy-consuming device: Low Meter at 25.00 kWh", answer)
+        self.assertIn("Combined total of those two devices: 125.00 kWh", answer)
 
     def test_ranking_sorts_numeric_usage_and_joins_current_status(self):
         self.env["historical_result_data"] = lambda result: result["data"]

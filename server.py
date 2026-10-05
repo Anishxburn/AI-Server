@@ -803,6 +803,16 @@ def wants_device_usage_ranking(message: str) -> bool:
     return has_device and has_usage and has_rank
 
 
+def wants_lowest_consumer(message: str) -> bool:
+    lowered = message.lower()
+    return bool(re.search(r"\b(?:lowest|least|minimum|smallest)\b", lowered) and re.search(r"\b(?:device|meter|consumer|energy|consume|consumption|usage)\b", lowered))
+
+
+def wants_top_lowest_sum(message: str) -> bool:
+    lowered = message.lower()
+    return wants_lowest_consumer(message) and bool(re.search(r"\b(?:sum|total|add|combined|their\s+2|both)\b", lowered))
+
+
 def wants_all_devices(message: str) -> bool:
     return bool(re.search(r"\b(?:all|every)\s+(?:(?:of\s+)?the\s+)?devices?\b", message, re.IGNORECASE))
 
@@ -1602,18 +1612,34 @@ def ranked_consumer_rows(data: dict) -> tuple[list[tuple[dict, float]], list[dic
     return measured, unmeasured
 
 
-def summarize_top_consumers(data: dict, arguments: dict | None = None) -> str:
+def summarize_top_consumers(data: dict, arguments: dict | None = None, message: str = "") -> str:
     rows = first_list(data, ("rows", "items", "results", "top_consumers", "consumers", "devices"))
     measured, unmeasured = ranked_consumer_rows(data)
     unit = data.get("unit") or "kWh"
     time_window = format_time_window(data, arguments)
-    lines = [
-        f"These are the top energy-consuming devices for this site over the {time_window}, ranked by total consumption:",
-        "",
-    ]
+    lines = []
     if not rows:
         lines.append("No consuming devices were returned for this site and time range.")
     limit = min(max(int((arguments or {}).get("limit") or 10), 1), 100)
+    if measured and (wants_lowest_consumer(message) or wants_top_lowest_sum(message)):
+        top_row, top_amount = measured[0]
+        low_row, low_amount = measured[-1]
+        top_name = top_row.get("device_name") or top_row.get("name") or top_row.get("label") or f"Device {top_row.get('device_id', 'unknown')}"
+        low_name = low_row.get("device_name") or low_row.get("name") or low_row.get("label") or f"Device {low_row.get('device_id', 'unknown')}"
+        lines.append(f"Direct answer for {time_window}:")
+        lines.append(f"- Highest energy-consuming device: {top_name} at {format_number(top_amount, 2)} kWh.")
+        lines.append(f"- Lowest energy-consuming device: {low_name} at {format_number(low_amount, 2)} kWh.")
+        if wants_top_lowest_sum(message):
+            lines.append(f"- Combined total of those two devices: {format_number(top_amount + low_amount, 2)} kWh.")
+        if len(measured) > 1 and top_amount:
+            gap = percentage_difference(top_amount, low_amount)
+            if gap is not None:
+                lines.append(f"- The lowest device is {format_number(gap, 1)}% below the highest device.")
+        lines.append("")
+    lines.extend([
+        f"Device ranking for this site over the {time_window}:",
+        "",
+    ])
     for index, (row, amount) in enumerate(measured[:limit], 1):
         name = (
             row.get("device_name")
@@ -1645,7 +1671,7 @@ def summarize_top_consumers(data: dict, arguments: dict | None = None) -> str:
         if lowest:
             lines.append(f"   Lowest reading: {lowest}")
         lines.append("")
-    if rows:
+    if measured:
         lines.append(f"Showing {min(len(measured), limit)} measured device(s). Ranking is based on total consumption over the {time_window}.")
     if unmeasured:
         lines.append(f"{len(unmeasured)} returned device(s) had no numeric usage value and could not be ranked.")
@@ -2198,7 +2224,7 @@ def summarize_historical_answer(
         return f"DaxView could not return {operation_id}: {issue}."
     data = historical_result_data(mcp_result)
     if operation_id == "telemetry_top_consumers":
-        return summarize_top_consumers(data, arguments)
+        return summarize_top_consumers(data, arguments, message)
     if operation_id == "site_energy_summary":
         return summarize_site_energy(data, message, arguments)
     if operation_id == "alarm_frequency_summary":
@@ -2255,7 +2281,7 @@ def summarize_historical_answers(
         }
         measured, _ = ranked_consumer_rows(top_data)
         limit = int(top_result.get("arguments", {}).get("limit") or 5)
-        lines = [summarize_top_consumers(top_data, top_result.get("arguments")), "Current status of ranked devices:"]
+        lines = [summarize_top_consumers(top_data, top_result.get("arguments"), message), "Current status of ranked devices:"]
         ranked_ids = set()
         for index, (row, _) in enumerate(measured[:limit], 1):
             device_id = row.get("device_id") or row.get("id") or row.get("meter_id")
