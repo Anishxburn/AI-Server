@@ -9,6 +9,7 @@ import statistics
 import unittest
 from unittest.mock import Mock
 from ems_contracts import question_metrics, metric_clarification, percentage_difference
+from contracts.tool_schemas import validate_tool_arguments
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "server.py"
@@ -29,6 +30,8 @@ NAMES = (
     "summarize_historical_answers", "summarize_demand_peak", "device_selection_prompt_from_result",
     "build_device_choice_response",
     "daxview_history_event",
+    "wants_highest_demand_device", "choose_historical_operations",
+    "resolved_plan_for_result",
 )
 
 
@@ -41,6 +44,15 @@ def load_functions():
         "re": re, "statistics": statistics,
         "question_metrics": question_metrics, "metric_clarification": metric_clarification,
         "percentage_difference": percentage_difference,
+        "validate_tool_arguments": validate_tool_arguments,
+        "AI_CHAT_MEMORY_ENABLED": False,
+        "AI_PLANNER_ENABLED": False,
+        "AI_PLANNER_SHADOW_MODE": False,
+        "DAXVIEW_ALLOWED_HISTORICAL_TOOLS": next(
+            ast.literal_eval(node.value)
+            for node in TREE.body
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "DAXVIEW_ALLOWED_HISTORICAL_TOOLS" for target in node.targets)
+        ),
         "requested_historical_range": Mock(return_value={"start": "start", "end": "end", "timezone": "Asia/Kuala_Lumpur"}),
         "save_resolved_turn_context": Mock(),
         "DAXVIEW_TOOL_KEYWORDS": next(

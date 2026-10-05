@@ -1,0 +1,34 @@
+# Planner evaluation cases. Live LLM scoring is optional and requires RUN_LIVE_LLM_TESTS=1.
+- question: "max demand yesterday for device 12"
+  tools: ["demand_peak_summary"]
+  slots: {device_refs: ["12"], time_phrase: "yesterday", metric: "demand"}
+- question: "what about today?"
+  tools: []
+  inherit_from_previous: ["device", "tools", "metric"]
+  slots: {time_phrase: "today"}
+- question: "top consumers last week"
+  tools: ["telemetry_top_consumers"]
+  slots: {time_phrase: "last week", metric: "energy"}
+- question: "show building 3"
+  tools: []
+  inherit_from_previous: ["tools", "time", "metric"]
+  slots: {building_ref: "3"}
+- question: "berapa max demand hari ini"
+  tools: ["demand_peak_summary"]
+  slots: {time_phrase: "today", metric: "demand"}
+- question: "show voltage and current trend for device 519 last 24 hours"
+  tools: ["telemetry_timeseries"]
+  slots: {device_refs: ["519"], time_phrase: "last 24 hours"}
+- question: "what alarm types occurred most often at this site in the last 7 days?"
+  tools: ["alarm_frequency_summary"]
+  slots: {time_phrase: "last 7 days", limit: 5}
+- question: "highest demand device today"
+  tools: ["demand_peak_summary"]
+  slots: {time_phrase: "today", metric: "demand"}
+- question: "compare energy today vs yesterday"
+  tools: ["energy_comparison_summary"]
+  slots: {time_phrase: "today", comparison_time_phrase: "yesterday", metric: "energy"}
+- question: "tell me a joke"
+  tools: []
+  intent: "out_of_scope"
+

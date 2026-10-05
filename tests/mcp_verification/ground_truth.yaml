@@ -1,0 +1,25 @@
+# Fill these expected values from direct read-only SQL on the target DaxView DB.
+# Use closed past windows only. SQL is recorded for traceability.
+environment:
+  site_id: 17
+  site_name: "Mun Hean Singapore (HQ)"
+  timezone: "Asia/Kuala_Lumpur"
+  device_count: null
+  meter_count: null
+cases:
+  - name: "site metadata fingerprint"
+    tool: "site_metadata_summary"
+    args: {site_id: 17}
+    expected: {site_name: "Mun Hean Singapore (HQ)"}
+    sql: "SELECT name FROM sites WHERE id = 17;"
+  - name: "closed daily energy"
+    tool: "site_energy_summary"
+    args:
+      site_id: 17
+      start: "2026-09-29T16:00:00+00:00"
+      end: "2026-09-30T16:00:00+00:00"
+      timezone: "Asia/Kuala_Lumpur"
+      bucket: "day"
+    expected: {total_kwh: null, tolerance: 0.01}
+    sql: "TODO: backend team fills read-only SQL for daily site kWh."
+

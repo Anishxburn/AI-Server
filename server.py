@@ -25,6 +25,9 @@ import psycopg
 from psycopg.rows import dict_row
 from prediction_lab import PredictionService, daily_dataset
 from ems_contracts import measurement_context, metric_clarification, percentage_difference, question_metrics, result_problem
+from contracts.tool_schemas import TOOL_ARGUMENT_KEYS, TOOL_SCHEMAS, validate_tool_arguments
+from memory.conversation import load_conversation_history as load_conversation_history_from_db
+from planner.hybrid_planner import parse_planner_response, planner_json_schema, planner_system_prompt
 
 
 HOST = os.getenv("CHATBOT_HOST", "127.0.0.1")
@@ -49,6 +52,12 @@ TRACE_LIMIT = int(os.getenv("CHATBOT_TRACE_LIMIT", "25"))
 AI_DEBUG_DASHBOARD_ENABLED = os.getenv("AI_DEBUG_DASHBOARD_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 AI_REFINE_MCP_WITH_MODEL = True
 AI_CHARTS_ENABLED = os.getenv("AI_CHARTS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+AI_PLANNER_ENABLED = os.getenv("AI_PLANNER_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+AI_PLANNER_SHADOW_MODE = os.getenv("AI_PLANNER_SHADOW_MODE", "false").lower() in {"1", "true", "yes", "on"}
+AI_CHAT_MEMORY_ENABLED = os.getenv("AI_CHAT_MEMORY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+PLANNER_MODEL = os.getenv("PLANNER_MODEL", OLLAMA_MODEL)
+PLANNER_TIMEOUT = int(os.getenv("PLANNER_TIMEOUT", "15"))
+DEMAND_RANKING_MAX_DEVICES = int(os.getenv("DEMAND_RANKING_MAX_DEVICES", "20"))
 STATIC_DIRECTORY = Path(__file__).resolve().parent / "static"
 PREDICTION_SERVICE = PredictionService(
     os.getenv("AI_PREDICTION_DATA_DIR", str(Path(__file__).resolve().parent / "data")),
@@ -201,6 +210,27 @@ DAXVIEW_TOOL_KEYWORDS = {
         "report", "management summary", "weekly ems report", "monthly report",
         "ems health summary",
     },
+}
+
+DAXVIEW_TOOL_DESCRIPTIONS = {
+    "telemetry_top_consumers": "Rank devices by energy consumption for a site/window.",
+    "site_energy_summary": "Summarize site energy values over a time window.",
+    "alarm_frequency_summary": "Rank historical alarm types by count/severity.",
+    "site_metadata_summary": "Return site/building/device/meter metadata counts.",
+    "site_device_list": "List devices/meters in the scoped site/building.",
+    "telemetry_timeseries": "Return a device metric trend such as voltage/current/energy.",
+    "active_alarm_summary": "Return currently active/open alarms.",
+    "meter_status_summary": "Return device/meter online/offline/stale state.",
+    "energy_comparison_summary": "Compare two energy periods.",
+    "data_availability_summary": "Check data coverage/missing readings.",
+    "alarm_detail_lookup": "Look up one alarm by alarm ID.",
+    "power_quality_summary": "Summarize voltage sag/swell/THD/power-quality events.",
+    "demand_peak_summary": "Return max/peak demand for site/building/device.",
+    "tariff_cost_summary": "Estimate tariff or cost for energy use.",
+    "device_energy_breakdown": "Break down site energy by device/building.",
+    "energy_forecast": "Forecast future energy from historical data.",
+    "anomaly_detection_summary": "Find abnormal readings or usage patterns.",
+    "report_summary": "Generate a compact EMS management report.",
 }
 
 DAXVIEW_SCOPE_REQUIRED_TOOLS = {
@@ -854,6 +884,109 @@ def select_historical_operations(message: str) -> list[str]:
     return deduped[:6]
 
 
+def plan_turn_with_llm(message: str, history: list[dict], context: dict, request_id: str):
+    messages = [
+        {"role": "system", "content": planner_system_prompt(DAXVIEW_TOOL_DESCRIPTIONS)},
+    ]
+    for turn in history[-6:]:
+        if turn.get("user_message"):
+            messages.append({"role": "user", "content": str(turn["user_message"])[:1000]})
+        if turn.get("assistant_reply"):
+            messages.append({"role": "assistant", "content": str(turn["assistant_reply"])[:900]})
+    messages.append({
+        "role": "user",
+        "content": json.dumps(
+            {
+                "question": message,
+                "context_scope": {
+                    "has_site": bool(context.get("site_id")),
+                    "has_building": bool(context.get("building_id")),
+                    "has_device": bool(context.get("device_id")),
+                },
+            },
+            ensure_ascii=True,
+        ),
+    })
+    started_at = time.perf_counter()
+    log_event("planner_request", request_id=request_id, model=PLANNER_MODEL, prompt_preview=preview(str(messages)))
+    data = ollama_json(
+        "/api/chat",
+        {
+            "model": PLANNER_MODEL,
+            "messages": messages,
+            "stream": False,
+            "format": planner_json_schema(),
+            "options": {"temperature": 0},
+        },
+        timeout=PLANNER_TIMEOUT,
+    )
+    plan = parse_planner_response(data, DAXVIEW_ALLOWED_HISTORICAL_TOOLS)
+    latency_ms = round((time.perf_counter() - started_at) * 1000)
+    log_event("planner_response", request_id=request_id, model=PLANNER_MODEL, latency_ms=latency_ms, tools=plan.tools, confidence=plan.confidence)
+    return plan, latency_ms
+
+
+def planner_slot_context(message: str, context: dict, plan) -> dict:
+    merged = dict(context)
+    slots = plan.slots
+    if slots.limit is not None:
+        merged["limit"] = slots.limit
+    if slots.metric:
+        metric_map = {"kw": "demand", "kwh": "energy", "amps": "current", "amp": "current", "a": "current"}
+        merged["metric"] = metric_map.get(str(slots.metric).lower(), slots.metric)
+    if slots.building_ref and str(slots.building_ref).isdigit():
+        merged["building_id"] = int(slots.building_ref)
+    if slots.alarm_id:
+        merged["alarm_id"] = slots.alarm_id
+    if slots.device_refs:
+        for ref in slots.device_refs:
+            match = re.search(r"\d+", str(ref))
+            if match:
+                merged["device_id"] = int(match.group(0))
+                break
+    return merged
+
+
+def choose_historical_operations(message: str, context: dict, turn_id: str, session_id: str, request_id: str) -> tuple[list[str], dict, dict | None]:
+    regex_operations = select_historical_operations(message)
+    if not (AI_PLANNER_ENABLED or AI_PLANNER_SHADOW_MODE):
+        return regex_operations, context, None
+    history = load_conversation_history(session_id, turn_id) if AI_CHAT_MEMORY_ENABLED else []
+    try:
+        plan, latency_ms = plan_turn_with_llm(message, history, context, request_id)
+        planned_context = planner_slot_context(message, context, plan)
+        planned_tools = [tool for tool in plan.tools if tool in DAXVIEW_ALLOWED_HISTORICAL_TOOLS]
+        if AI_PLANNER_SHADOW_MODE or not AI_PLANNER_ENABLED:
+            log_event(
+                "planner_shadow_compare",
+                request_id=request_id,
+                regex_tools=regex_operations,
+                planner_tools=planned_tools,
+                agreement=regex_operations == planned_tools,
+                latency_ms=latency_ms,
+                confidence=plan.confidence,
+            )
+            return regex_operations, context, {
+                "status": "shadow",
+                "tools": [{"tool": tool, "arguments": {}} for tool in planned_tools],
+                "slots": planned_context,
+            }
+        if plan.clarification and plan.clarification.question:
+            return [], {**planned_context, "_planner_clarification": plan.clarification.question}, {
+                "status": "clarification",
+                "tools": [],
+                "slots": planned_context,
+            }
+        return planned_tools or regex_operations, planned_context, {
+            "status": "ok",
+            "tools": [{"tool": tool, "arguments": {}} for tool in planned_tools],
+            "slots": planned_context,
+        }
+    except Exception as error:
+        log_event("planner_fallback", request_id=request_id, reason=str(error), regex_tools=regex_operations)
+        return regex_operations, context, None
+
+
 def first_regex_int(message: str, patterns: tuple[str, ...]) -> int | None:
     for pattern in patterns:
         match = re.search(pattern, message, flags=re.IGNORECASE)
@@ -1111,19 +1244,24 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
     elif operation_id == "device_energy_breakdown":
         args["limit"] = int(context.get("limit") or 20)
     elif operation_id == "energy_forecast":
-        args["forecast_days"] = requested_forecast_days(message) or int(context.get("forecast_days") or 7)
-        args["forecast_days"] = min(max(args["forecast_days"], 1), 14)
+        forecast_days = requested_forecast_days(message) or int(context.get("forecast_days") or 7)
+        forecast_days = min(max(forecast_days, 1), 14)
         history_days = min(max(int(context.get("history_days") or 35), 28), 90)
-        args["start"] = (datetime.now(timezone.utc) - timedelta(days=history_days)).isoformat()
-        args["end"] = datetime.now(timezone.utc).isoformat()
+        forecast_start = datetime.now(timezone.utc)
+        args.pop("start", None)
+        args.pop("end", None)
+        args["forecast_start"] = forecast_start.isoformat()
+        args["forecast_end"] = (forecast_start + timedelta(days=forecast_days)).isoformat()
+        args["training_days"] = history_days
     elif operation_id == "anomaly_detection_summary":
         args["limit"] = int(context.get("limit") or 20)
-    return args
+    return validate_tool_arguments(operation_id, args)
 
 
 def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, request_id: str) -> dict:
     if not DAXVIEW_CALLBACK_BASE_URL or not DAXVIEW_CALLBACK_KEY:
         raise RuntimeError("DAXVIEW_CALLBACK_BASE_URL and DAXVIEW_CALLBACK_KEY are required for historical data")
+    arguments = validate_tool_arguments(operation_id, arguments)
     payload = {
         "turn_id": turn_id,
         "continuation_id": str(uuid.uuid4()),
@@ -1163,7 +1301,9 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
             "limit",
             "metric",
             "aggregation",
-            "forecast_days",
+            "forecast_start",
+            "forecast_end",
+            "training_days",
         }
     }
     log_event(
@@ -1202,6 +1342,7 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
 def call_authorized_historical_tool(operation_id: str, authorization_id: str, arguments: dict, request_id: str) -> dict:
     if operation_id not in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
         raise ValueError("historical operation is not allowlisted")
+    arguments = validate_tool_arguments(operation_id, arguments)
     result = call_daxview_mcp_tool(operation_id, {"authorization_id": authorization_id, **arguments}, request_id)
     issue = result_problem(mcp_structured_result(result)) or result_problem(result)
     if issue:
@@ -1965,6 +2106,24 @@ def summarize_generic_tool(operation_id: str, data: dict) -> str:
 
 
 def summarize_demand_peak(data: dict, message: str, arguments: dict | None = None) -> str:
+    ranked_devices = data.get("ranked_devices") if isinstance(data.get("ranked_devices"), list) else []
+    if ranked_devices:
+        lines = [f"Highest demand devices ({format_time_window(data, arguments)}):"]
+        top_peak = ranked_devices[0].get("peak_kw") if ranked_devices else None
+        for index, row in enumerate(ranked_devices[:requested_top_limit(message) or 5], 1):
+            diff = ""
+            if index > 1 and top_peak not in (None, 0):
+                pct = percentage_difference(top_peak, row.get("peak_kw"))
+                if pct is not None:
+                    diff = f" ({format_number(pct, 1)}% below top)"
+            status = f", {row.get('status')}" if row.get("status") else ""
+            lines.append(
+                f"{index}. {row.get('device_name') or 'Device'} (ID {row.get('device_id')}): "
+                f"{format_number(row.get('peak_kw'), 2)} kW{diff}{status}"
+            )
+        if data.get("device_count"):
+            lines.append(f"Compared {data.get('device_count')} device(s) with returned demand data.")
+        return "\n".join(lines)
     summary = data.get("summary") if isinstance(data.get("summary"), dict) else data
     rows = first_list(data, ("rows", "items", "results", "devices"))
     source = summary
@@ -2027,6 +2186,16 @@ def summarize_historical_answer(
     request_id: str,
     arguments: dict | None = None,
 ) -> str:
+    issue = result_problem(mcp_structured_result(mcp_result)) or result_problem(mcp_result)
+    if issue:
+        metric = (arguments or {}).get("metric") or ("demand" if operation_id == "demand_peak_summary" else "energy")
+        scope = "device" if (arguments or {}).get("device_id") else "building" if (arguments or {}).get("building_id") else "site"
+        code = str(issue).upper()
+        if "NO_DATA" in code:
+            return f"DaxView has no {metric} data for this {scope} in {format_time_window({}, arguments)}."
+        if "UNAVAILABLE" in code:
+            return f"DaxView historical data is currently unavailable for this {scope}."
+        return f"DaxView could not return {operation_id}: {issue}."
     data = historical_result_data(mcp_result)
     if operation_id == "telemetry_top_consumers":
         return summarize_top_consumers(data, arguments)
@@ -2320,10 +2489,10 @@ def run_mcp_refine_model(prompt: str, request_id: str, model: str, fallback_answ
     log_event("mcp_answer_refine_request", request_id=request_id, model=model, role=role, prompt_preview=preview(prompt))
     try:
         data = ollama_json(
-            "/api/generate",
+            "/api/chat",
             {
                 "model": model,
-                "prompt": prompt,
+                "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
                 "options": {"temperature": 0.15},
             },
@@ -2333,7 +2502,7 @@ def run_mcp_refine_model(prompt: str, request_id: str, model: str, fallback_answ
         log_event("mcp_answer_refine_error", request_id=request_id, model=model, role=role, error=str(error))
         debug_trace_event("mcp_answer_refine_fallback", request_id=request_id, model=model, role=role, reason="model_request_failed")
         return fallback_answer
-    reply = clean_final_answer(str(data.get("response", "")).strip())
+    reply = clean_final_answer(str(data.get("message", {}).get("content") or data.get("response", "")).strip())
     if not reply:
         debug_trace_event("mcp_answer_refine_fallback", request_id=request_id, model=model, role=role, reason="empty_model_answer")
         return fallback_answer
@@ -2575,18 +2744,57 @@ def is_follow_up_message(message: str) -> bool:
     return any(phrase in lowered for phrase in FOLLOW_UP_PHRASES if phrase != "why")
 
 
-def previous_daxview_turn(conversation_id: str, current_turn_id: str) -> dict | None:
+def current_turn_identity(turn_id: str) -> dict | None:
+    if not DATABASE_URL:
+        return None
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT id, user_message, context
+                SELECT deployment_id, company_id, user_id, conversation_id
                 FROM daxview_turns
-                WHERE conversation_id = %s AND id <> %s
+                WHERE id = %s
+                """,
+                (turn_id,),
+            )
+            return cur.fetchone()
+
+
+def load_conversation_history(conversation_id: str, current_turn_id: str, limit: int = 6) -> list[dict]:
+    if not DATABASE_URL:
+        return []
+    identity = current_turn_identity(current_turn_id)
+    if not identity:
+        return []
+    with db() as conn:
+        return load_conversation_history_from_db(conn, conversation_id, current_turn_id, identity, limit)
+
+
+def previous_daxview_turn(conversation_id: str, current_turn_id: str) -> dict | None:
+    identity = current_turn_identity(current_turn_id)
+    if not identity:
+        return None
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, user_message, context, assistant_reply, resolved_plan
+                FROM daxview_turns
+                WHERE conversation_id = %s
+                  AND id <> %s
+                  AND deployment_id = %s
+                  AND company_id = %s
+                  AND user_id = %s
                 ORDER BY created_at DESC
                 LIMIT 10
                 """,
-                (conversation_id, current_turn_id),
+                (
+                    conversation_id,
+                    current_turn_id,
+                    identity["deployment_id"],
+                    identity["company_id"],
+                    identity["user_id"],
+                ),
             )
             rows = cur.fetchall()
     return next(
@@ -2596,22 +2804,32 @@ def previous_daxview_turn(conversation_id: str, current_turn_id: str) -> dict | 
 
 
 def resolve_follow_up_message(turn_id: str, message: str, context: dict, conversation_id: str, request_id: str) -> tuple[str, dict]:
-    if not is_follow_up_message(message):
-        return message, context
     previous = previous_daxview_turn(conversation_id, turn_id)
     if not previous or not previous.get("user_message"):
         return message, context
     previous_message = str(previous["user_message"])
     previous_context = previous.get("context") if isinstance(previous.get("context"), dict) else {}
-    merged_context = {**previous_context, **context}
-    if context.get("site_id") and str(context["site_id"]) != str(previous_context.get("site_id")):
+    previous_plan = previous.get("resolved_plan") if isinstance(previous.get("resolved_plan"), dict) else {}
+    reusable = previous_plan.get("status") in {"ok", "no_data"} or not previous_plan
+    site_changed = context.get("site_id") and str(context["site_id"]) != str(previous_context.get("site_id"))
+    merged_context = {**previous_context, **context} if not site_changed else dict(context)
+    if site_changed:
         merged_context = dict(context)
+    elif reusable and AI_CHAT_MEMORY_ENABLED:
+        slots = previous_plan.get("slots") if isinstance(previous_plan.get("slots"), dict) else {}
+        for key in ("device_id", "building_id", "metric", "_time_window"):
+            if key not in merged_context and slots.get(key) is not None:
+                merged_context[key] = slots[key]
     if has_time_scope(message):
         merged_context.pop("_time_window", None)
-    if not merged_context.get("device_id") and requested_device_id(message) is None:
+    if requested_device_id(message) is not None:
+        merged_context["device_id"] = requested_device_id(message)
+    if not site_changed and not merged_context.get("device_id") and requested_device_id(message) is None:
         previous_device_id = requested_device_id(previous_message)
         if previous_device_id is not None:
             merged_context["device_id"] = previous_device_id
+    if not is_follow_up_message(message) and (select_historical_operations(message) or not AI_CHAT_MEMORY_ENABLED):
+        return message, merged_context
     if select_historical_operations(message):
         resolved = message
         if not has_time_scope(message):
@@ -2724,6 +2942,75 @@ def build_device_choice_response(turn_id: str, message: str, context: dict, requ
     }
 
 
+def run_highest_demand_device_ranking(turn_id: str, message: str, context: dict, request_id: str) -> list[dict]:
+    device_args = validate_tool_arguments("site_device_list", {
+        "site_id": int(context["site_id"]),
+        **({"building_id": int(context["building_id"])} if context.get("building_id") else {}),
+        "limit": DEMAND_RANKING_MAX_DEVICES + 1,
+    })
+    plan = request_daxview_data_plan(turn_id, "site_device_list", device_args, request_id)
+    authorization_id = plan.get("authorization_id")
+    normalized_args = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else device_args
+    if not authorization_id:
+        raise RuntimeError("DaxView did not authorize site_device_list for demand ranking")
+    device_result = call_authorized_historical_tool("site_device_list", str(authorization_id), normalized_args, request_id)
+    device_data = historical_result_data(device_result)
+    devices = first_list(device_data, ("devices", "rows", "items", "meters"))
+    selectable = [device for device in devices if isinstance(device, dict) and (device.get("device_id") or device.get("id") or device.get("meter_id"))]
+    total = device_data.get("device_count") or device_data.get("row_count") or len(selectable)
+    if len(selectable) > DEMAND_RANKING_MAX_DEVICES or (str(total).isdigit() and int(total) > DEMAND_RANKING_MAX_DEVICES):
+        prompt, choices = device_selection_prompt_from_result(device_result)
+        return [{
+            "operation_id": "site_device_list",
+            "arguments": normalized_args,
+            "result": device_result,
+            "clarification": (
+                f"The site has more than {DEMAND_RANKING_MAX_DEVICES} devices, so I need a smaller scope before ranking demand. "
+                f"{prompt}"
+            ),
+            "choices": choices,
+        }]
+    ranked = []
+    for device in selectable:
+        device_id = device.get("device_id") or device.get("id") or device.get("meter_id")
+        try:
+            demand_args = build_historical_arguments("demand_peak_summary", {**context, "device_id": int(device_id)}, message)
+            per_plan = request_daxview_data_plan(turn_id, "demand_peak_summary", demand_args, request_id)
+            per_auth = per_plan.get("authorization_id")
+            per_args = per_plan.get("arguments") if isinstance(per_plan.get("arguments"), dict) else demand_args
+            if not per_auth:
+                continue
+            per_result = call_authorized_historical_tool("demand_peak_summary", str(per_auth), per_args, request_id)
+            per_data = historical_result_data(per_result)
+            summary = per_data.get("summary") if isinstance(per_data.get("summary"), dict) else per_data
+            peak = first_value(summary, ("peak_kw", "max_demand_kw", "maximum_demand_kw", "peak_demand_kw", "max_kw"))
+            if peak is None:
+                rows = first_list(per_data, ("rows", "items", "results", "devices"))
+                for row in rows:
+                    if isinstance(row, dict):
+                        peak = first_value(row, ("peak_kw", "max_demand_kw", "maximum_demand_kw", "peak_demand_kw", "max_kw"))
+                        if peak is not None:
+                            break
+            if peak is None:
+                continue
+            ranked.append({
+                "device_id": int(device_id),
+                "device_name": device.get("device_name") or device.get("name") or f"Device {device_id}",
+                "status": device.get("status") or device.get("connection_status"),
+                "peak_kw": float(peak),
+                "result": per_result,
+                "arguments": per_args,
+            })
+        except Exception as error:
+            log_event("demand_device_rank_step_failed", request_id=request_id, device_id=device_id, error=str(error))
+    ranked.sort(key=lambda row: row["peak_kw"], reverse=True)
+    return [{
+        "operation_id": "demand_peak_summary",
+        "arguments": {key: context[key] for key in ("site_id", "building_id", "_time_window") if key in context},
+        "result": {"structuredContent": {"data": {"ranked_devices": ranked, "device_count": len(selectable)}}},
+    }]
+
+
 class PredictionSourceError(RuntimeError):
     def __init__(self, error_code: str):
         self.error_code = error_code
@@ -2731,11 +3018,17 @@ class PredictionSourceError(RuntimeError):
 
 
 def run_authorized_energy_prediction(turn_id: str, arguments: dict, request_id: str) -> dict:
+    forecast_start = parse_datetime(arguments.get("forecast_start")) if arguments.get("forecast_start") else datetime.now(timezone.utc)
+    training_days = int(arguments.get("training_days") or 35)
+    forecast_end = parse_datetime(arguments.get("forecast_end")) if arguments.get("forecast_end") else forecast_start + timedelta(days=7)
+    forecast_days = max(1, min(14, (forecast_end.date() - forecast_start.date()).days or 1))
     source_args = {
         key: arguments[key]
-        for key in ("site_id", "building_id", "start", "end", "timezone")
+        for key in ("site_id", "building_id", "timezone")
         if key in arguments
     }
+    source_args["start"] = (forecast_start - timedelta(days=training_days)).isoformat()
+    source_args["end"] = forecast_start.isoformat()
     source_args["bucket"] = "day"
     plan = request_daxview_data_plan(turn_id, "site_energy_summary", source_args, request_id)
     authorization_id = plan.get("authorization_id")
@@ -2751,7 +3044,7 @@ def run_authorized_energy_prediction(turn_id: str, arguments: dict, request_id: 
         raise PredictionSourceError(str(structured.get("error_code") or "MCP_TOOL_ERROR"))
     prediction = predict_daily_energy(
         historical_result_data(source, ("buckets", "rows", "series", "data")),
-        arguments["forecast_days"],
+        forecast_days,
         arguments.get("timezone") or "Asia/Kuala_Lumpur",
     )
     log_event(
@@ -2767,8 +3060,8 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     message, context = resolve_follow_up_message(turn_id, message, context, session_id, request_id)
     clarification = metric_clarification(message)
     if clarification:
-        return {"provider": "daxview-question-filter", "reply": clarification}
-    operation_ids = select_historical_operations(message)
+        return {"provider": "daxview-question-filter", "reply": clarification, "resolved_plan": resolved_plan_for_result("clarification", [], context)}
+    operation_ids, context, planner_plan = choose_historical_operations(message, context, turn_id, session_id, request_id)
     debug_trace_event(
         "daxview_tool_selection_debug",
         request_id=request_id,
@@ -2776,15 +3069,46 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         operation_ids=operation_ids,
         message=message,
     )
+    if context.get("_planner_clarification"):
+        return {
+            "provider": "daxview-question-filter",
+            "reply": str(context["_planner_clarification"]),
+            "resolved_plan": planner_plan or resolved_plan_for_result("clarification", [], context),
+        }
     if not operation_ids:
-        return langchain_chat_response(message, request_id, session_id)
+        result = langchain_chat_response(message, request_id, session_id)
+        result["resolved_plan"] = resolved_plan_for_result("ok", [], context)
+        return result
     if "demand_peak_summary" in operation_ids and needs_device_choice(message) and not context.get("device_id"):
-        return build_device_choice_response(turn_id, message, context, request_id)
+        result = build_device_choice_response(turn_id, message, context, request_id)
+        result["resolved_plan"] = resolved_plan_for_result("clarification", operation_ids, context)
+        return result
     context = dict(context)
     context.setdefault("_time_window", completed_daily_range(message) or requested_historical_range(message))
     if requested_device_id(message):
         context["device_id"] = requested_device_id(message)
     save_resolved_turn_context(turn_id, context)
+    if wants_highest_demand_device(message) and not context.get("device_id"):
+        ranked_results = run_highest_demand_device_ranking(turn_id, message, context, request_id)
+        if ranked_results and ranked_results[0].get("clarification"):
+            return {
+                "provider": "daxview-question-filter",
+                "reply": ranked_results[0]["clarification"],
+                "input_type": "select",
+                "choices": ranked_results[0].get("choices") or [],
+                "submit_template": "max demand for device ID {value} for the same period",
+                "resolved_plan": resolved_plan_for_result("clarification", operation_ids, context, ranked_results),
+            }
+        deterministic_reply = summarize_historical_answers(message, ranked_results, request_id)
+        refined_reply = refine_historical_answer_with_model(message, ranked_results, deterministic_reply, request_id)
+        charts = build_charts_from_historical_results(ranked_results)
+        return {
+            "provider": "daxview-historical-mcp",
+            "reply": refined_reply,
+            "charts": charts,
+            "debug_charts": charts,
+            "resolved_plan": resolved_plan_for_result("ok", ["demand_peak_summary"], context, ranked_results),
+        }
     results = []
     errors = []
     steps = []
@@ -2799,6 +3123,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
             return {
                 "provider": "daxview-question-filter",
                 "reply": historical_argument_clarification(error, operation_id),
+                "resolved_plan": resolved_plan_for_result("clarification", operation_ids, context),
             }
         if operation_id == "energy_forecast":
             try:
@@ -2811,12 +3136,13 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
                         "provider": "energy-prediction",
                         "reply": "I couldn't calculate a forecast because DaxView did not return historical energy readings for this site. Please retry after the data service is available.",
                         "charts": [],
+                        "resolved_plan": resolved_plan_for_result("no_data", operation_ids, context, results, errors),
                     }
                 errors.append({"operation_id": operation_id, "error": str(error)})
             except ValueError as error:
                 log_event("energy_prediction_rejected", request_id=request_id, reason=str(error))
                 if len(operation_ids) == 1:
-                    return {"provider": "energy-prediction", "reply": str(error), "charts": []}
+                    return {"provider": "energy-prediction", "reply": str(error), "charts": [], "resolved_plan": resolved_plan_for_result("error", operation_ids, context, results, errors)}
                 errors.append({"operation_id": operation_id, "error": str(error)})
             except Exception as error:
                 errors.append({"operation_id": operation_id, "error": str(error)})
@@ -2867,6 +3193,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         "reply": refined_reply,
         "charts": charts,
         "debug_charts": preview_charts,
+        "resolved_plan": resolved_plan_for_result("ok" if not errors else "no_data", operation_ids, context, results, errors),
     }
 
 
@@ -2877,6 +3204,44 @@ def save_resolved_turn_context(turn_id: str, context: dict) -> None:
         with conn.cursor() as cur:
             cur.execute("UPDATE daxview_turns SET context = %s WHERE id = %s", (json.dumps(context), turn_id))
         conn.commit()
+
+
+def save_turn_memory(turn_id: str, reply: str, resolved_plan: dict) -> None:
+    if not DATABASE_URL:
+        return
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE daxview_turns
+                SET assistant_reply = %s, resolved_plan = %s
+                WHERE id = %s
+                """,
+                (reply, json.dumps(resolved_plan or {}), turn_id),
+            )
+        conn.commit()
+
+
+def resolved_plan_for_result(status: str, operation_ids: list[str], context: dict, results: list[dict] | None = None, errors: list[dict] | None = None) -> dict:
+    safe_results = results or []
+    slots = {
+        "site_id": context.get("site_id"),
+        "building_id": context.get("building_id"),
+        "device_id": context.get("device_id"),
+        "metric": context.get("metric"),
+        "_time_window": context.get("_time_window"),
+    }
+    plan_tools = []
+    for item in safe_results:
+        args = dict(item.get("arguments") or {})
+        args.pop("authorization_id", None)
+        plan_tools.append({"tool": item.get("operation_id"), "arguments": args})
+    return {
+        "status": status,
+        "tools": plan_tools or [{"tool": tool, "arguments": {}} for tool in operation_ids],
+        "slots": {key: value for key, value in slots.items() if value is not None},
+        "errors": errors or [],
+    }
 
 
 def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> None:
@@ -2907,6 +3272,7 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
             update_job_status(job_id, "completed")
             add_job_event(job_id, "completed", {"status": "completed"})
             debug_trace_event("ai_outcome_debug", request_id=request_id, status="waiting_for_user", answer=result["reply"], charts=[])
+            save_turn_memory(turn_id, result["reply"], result.get("resolved_plan") or {})
             return
         message_event = {"text": result["reply"]}
         if result.get("charts"):
@@ -2919,6 +3285,7 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
             answer=result["reply"], charts=result.get("debug_charts") or result.get("charts") or [],
             charts_enabled=AI_CHARTS_ENABLED,
         )
+        save_turn_memory(turn_id, result["reply"], result.get("resolved_plan") or {})
     except Exception as error:
         log_event(
             "daxview_job_failed",
@@ -2957,6 +3324,14 @@ def needs_device_choice(message: str) -> bool:
     if any(phrase in lowered for phrase in ("all devices", "every device", "top devices")):
         return False
     return requested_device_id(message) is None and not re.search(r"\bumg[\s-]?\d+\b", lowered)
+
+
+def wants_highest_demand_device(message: str) -> bool:
+    lowered = message.lower()
+    return bool(
+        re.search(r"\b(?:highest|max(?:imum)?|peak|top)\s+demand\s+device\b", lowered)
+        or re.search(r"\bdevice\s+(?:with|has|having)\s+(?:the\s+)?(?:highest|max(?:imum)?|peak)\s+demand\b", lowered)
+    )
 
 
 def has_time_scope(message: str) -> bool:
@@ -3439,10 +3814,10 @@ def ask_ollama(message: str, contexts: list[dict], request_id: str, mcp_context:
     log_event("api_to_ollama_request", request_id=request_id, model=CHAT_MODEL, prompt_preview=preview(prompt))
     try:
         data = ollama_json(
-            "/api/generate",
+            "/api/chat",
             {
                 "model": CHAT_MODEL,
-                "prompt": prompt,
+                "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
                 "options": {"temperature": 0.2},
             },
@@ -3451,7 +3826,7 @@ def ask_ollama(message: str, contexts: list[dict], request_id: str, mcp_context:
     except (TimeoutError, URLError, json.JSONDecodeError) as error:
         log_event("api_to_ollama_error", request_id=request_id, error=str(error))
         raise RuntimeError(f"Ollama is not ready: {error}") from error
-    reply = str(data.get("response", "")).strip()
+    reply = str(data.get("message", {}).get("content") or data.get("response", "")).strip()
     if not reply:
         raise RuntimeError("Ollama returned an empty response")
     log_event("api_from_ollama_response", request_id=request_id, duration_ms=round((time.perf_counter() - started_at) * 1000))
@@ -4973,6 +5348,24 @@ class ChatHandler(BaseHTTPRequestHandler):
                 self._send_json(202 if "job_id" in result else 200, result)
             except (ValueError, TypeError) as error:
                 self._send_json(400, {"error": str(error)})
+            return
+        if path == "/debug/mcp-verify":
+            text = str(request.get("ground_truth_yaml") or "")
+            case_count = len(re.findall(r"^\s*-\s+name:", text, flags=re.MULTILINE))
+            self._send_json(
+                200,
+                {
+                    "status": "ready",
+                    "checks": [
+                        {
+                            "name": "ground truth file loaded",
+                            "status": "pass" if case_count else "skip",
+                            "detail": f"{case_count} verification case(s) detected. Fill expected values before strict live assertions.",
+                            "request_id": str(uuid.uuid4()),
+                        }
+                    ],
+                },
+            )
             return
 
         if path == "/knowledge":

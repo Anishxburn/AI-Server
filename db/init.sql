@@ -92,8 +92,13 @@ CREATE TABLE IF NOT EXISTS daxview_turns (
     user_message TEXT NOT NULL,
     request_id TEXT,
     context JSONB NOT NULL DEFAULT '{}'::jsonb,
+    assistant_reply TEXT,
+    resolved_plan JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE daxview_turns ADD COLUMN IF NOT EXISTS assistant_reply TEXT;
+ALTER TABLE daxview_turns ADD COLUMN IF NOT EXISTS resolved_plan JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE UNIQUE INDEX IF NOT EXISTS daxview_turns_unique_turn_idx
 ON daxview_turns (deployment_id, conversation_id, id);

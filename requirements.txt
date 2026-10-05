@@ -3,3 +3,4 @@ langchain-core==0.3.78
 langchain-community==0.3.31
 langchain-ollama==0.3.8
 statsmodels==0.14.6
+pydantic==2.11.9
