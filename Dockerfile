@@ -5,6 +5,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py .
 COPY prediction_lab.py ems_contracts.py ./
+COPY contracts ./contracts
+COPY routing ./routing
+COPY memory ./memory
+COPY llm ./llm
+COPY planner ./planner
 COPY static ./static
 COPY scripts ./scripts
 
