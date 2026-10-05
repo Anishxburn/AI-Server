@@ -41,7 +41,7 @@ AI_COMPARE_MODEL = os.getenv("AI_COMPARE_MODEL", DEEPSEEK_MODEL).strip()
 AI_COMPARE_MODELS = [model.strip() for model in os.getenv("AI_COMPARE_MODELS", "").split(",") if model.strip()]
 if not AI_COMPARE_MODELS and AI_COMPARE_MODEL:
     AI_COMPARE_MODELS = [AI_COMPARE_MODEL]
-AI_COMPARE_MODEL_SHOW_TO_USER = os.getenv("AI_COMPARE_MODEL_SHOW_TO_USER", "true").lower() in {"1", "true", "yes", "on"}
+AI_COMPARE_MODEL_SHOW_TO_USER = os.getenv("AI_COMPARE_MODEL_SHOW_TO_USER", "false").lower() in {"1", "true", "yes", "on"}
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 OLLAMA_GENERATE_TIMEOUT = int(os.getenv("OLLAMA_GENERATE_TIMEOUT", "120"))
 OLLAMA_EMBEDDING_TIMEOUT = int(os.getenv("OLLAMA_EMBEDDING_TIMEOUT", "30"))
@@ -4068,9 +4068,10 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       .inspectors summary { cursor: pointer; font-size: 12px; font-weight: 700; }
       .answer-block { border-left: 3px solid #0ea5e9; padding: 8px 10px; margin-top: 8px; white-space: pre-wrap; font-size: 12px; line-height: 1.5; }
       .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
-      .chart-item { border: 1px solid #dbe3ef; padding: 10px; min-width: 0; }
+      .chart-item { border: 1px solid #dbe3ef; padding: 10px; min-width: 0; max-width: 100%; }
       .chart-item strong { font-size: 12px; }
-      .chart-item canvas { display: block; width: 100%; height: 220px; margin-top: 8px; }
+      .chart-canvas-wrap { position: relative; height: 260px; max-height: 260px; width: 100%; margin-top: 8px; overflow: hidden; }
+      .chart-item canvas { display: block; width: 100% !important; height: 260px !important; max-height: 260px !important; }
       .chart-item details { margin-top: 8px; font-size: 12px; }
       .chart-item summary { cursor: pointer; }
       .chart-item table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 12px; }
@@ -4174,7 +4175,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         </div>`).join("")}</div>`;
       }
       function renderInspectors(events) {
-        const answers = events.filter(e => e.event === "mcp_answer_refine_response_debug");
+        const answers = events.filter(e => e.event === "mcp_answer_refine_response_debug" && e.role !== "compare");
         const payloads = events.filter(e => e.event === "mcp_tool_request_payload_debug" || e.event === "mcp_tool_response_payload_debug");
         const answerHtml = answers.map((item, index) => `<div class="answer-block"><strong>${escapeHtml(item.role || "model")} - ${escapeHtml(item.model || "unknown model")}</strong><br>${escapeHtml(item.answer || "")}</div>`).join("");
         const payloadHtml = payloads.map(item => `<details><summary>${escapeHtml(item.event.replace("_debug", ""))} · ${escapeHtml(item.tool || "")}</summary><pre>${escapeHtml(JSON.stringify(item, null, 2))}</pre></details>`).join("");
@@ -4203,7 +4204,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
             `<tr><td>${escapeHtml(label)}</td><td>${escapeHtml(series.data?.[index] ?? "")}</td></tr>`
           ).join("");
           return `<div class="chart-item"><strong>${escapeHtml(chart.title || "Chart")}</strong>
-            <canvas data-spec="${escapeHtml(JSON.stringify(chart))}" aria-label="${escapeHtml(chart.title || "Chart preview")}"></canvas>
+            <div class="chart-canvas-wrap"><canvas data-spec="${escapeHtml(JSON.stringify(chart))}" aria-label="${escapeHtml(chart.title || "Chart preview")}"></canvas></div>
             <details><summary>View chart values</summary><table><thead><tr><th>Period</th><th>${escapeHtml(series.unit || "Value")}</th></tr></thead><tbody>${valueRows}</tbody></table></details>
           </div>`;
         }).join("");

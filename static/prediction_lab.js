@@ -9,6 +9,8 @@
   window.renderDashboardChart = (canvas, spec) => {
     charts.forEach((chart, node) => { if (!node.isConnected) { chart.destroy(); charts.delete(node); } });
     if (charts.has(canvas)) charts.get(canvas).destroy();
+    canvas.style.height = '260px';
+    canvas.height = 260;
     const type = spec.type === 'donut' ? 'doughnut' : spec.type;
     const datasets = spec.series.map((series, index) => ({
       label: series.name || series.label || 'Value', data: series.data,
