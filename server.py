@@ -13,6 +13,7 @@ import statistics
 import time
 import traceback
 import uuid
+from pathlib import Path
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
@@ -22,6 +23,8 @@ from urllib.request import Request, urlopen
 from langchain_core.runnables import RunnableLambda
 import psycopg
 from psycopg.rows import dict_row
+from prediction_lab import PredictionService, daily_dataset
+from ems_contracts import measurement_context, metric_clarification, percentage_difference, question_metrics, result_problem
 
 
 HOST = os.getenv("CHATBOT_HOST", "127.0.0.1")
@@ -44,9 +47,15 @@ RAG_MATCH_LIMIT = int(os.getenv("RAG_MATCH_LIMIT", "5"))
 RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.2"))
 TRACE_LIMIT = int(os.getenv("CHATBOT_TRACE_LIMIT", "25"))
 AI_DEBUG_DASHBOARD_ENABLED = os.getenv("AI_DEBUG_DASHBOARD_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
-AI_DEBUG_DASHBOARD_KEY = os.getenv("AI_DEBUG_DASHBOARD_KEY", "").strip()
-AI_REFINE_MCP_WITH_MODEL = os.getenv("AI_REFINE_MCP_WITH_MODEL", "true").lower() in {"1", "true", "yes", "on"}
+AI_REFINE_MCP_WITH_MODEL = True
 AI_CHARTS_ENABLED = os.getenv("AI_CHARTS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+STATIC_DIRECTORY = Path(__file__).resolve().parent / "static"
+PREDICTION_SERVICE = PredictionService(
+    os.getenv("AI_PREDICTION_DATA_DIR", str(Path(__file__).resolve().parent / "data")),
+    os.getenv("AI_PREDICTION_SOURCE_URL", "").strip(),
+    os.getenv("AI_PREDICTION_SOURCE_TOKEN", "").strip(),
+    json.loads(os.getenv("AI_PREDICTION_SITES_JSON", "[]")),
+)
 DAXVIEW_MCP_ENABLED = os.getenv("DAXVIEW_MCP_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 DAXVIEW_MCP_URL = os.getenv("DAXVIEW_MCP_URL", "").strip()
 DAXVIEW_MCP_AUTH_TOKEN = os.getenv("DAXVIEW_MCP_AUTH_TOKEN", "").strip()
@@ -527,7 +536,7 @@ def log_event(event: str, **fields: object) -> None:
         for name, value in fields.items()
     }
     record = {"event": event, **safe_fields}
-    if AI_DEBUG_DASHBOARD_ENABLED and AI_DEBUG_DASHBOARD_KEY:
+    if AI_DEBUG_DASHBOARD_ENABLED:
         TRACES.appendleft(
             {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -538,7 +547,7 @@ def log_event(event: str, **fields: object) -> None:
 
 
 def debug_trace_event(event: str, **fields: object) -> None:
-    if not (AI_DEBUG_DASHBOARD_ENABLED and AI_DEBUG_DASHBOARD_KEY):
+    if not AI_DEBUG_DASHBOARD_ENABLED:
         return
     TRACES.appendleft(
         {
@@ -567,7 +576,7 @@ def redact_debug_value(value):
                 redacted[key] = redact_debug_value(item)
         return redacted
     if isinstance(value, list):
-        return [redact_debug_value(item) for item in value[:20]]
+        return [redact_debug_value(item) for item in value[:1000]]
     return value
 
 
@@ -774,6 +783,8 @@ def select_historical_operations(message: str) -> list[str]:
     for tool_name, phrases in DAXVIEW_TOOL_KEYWORDS.items():
         if any(phrase in lowered for phrase in phrases):
             operations.append(tool_name)
+    if "current" in question_metrics(message) and "telemetry_timeseries" not in operations:
+        operations.append("telemetry_timeseries")
     if wants_device_usage_ranking(message):
         if "telemetry_top_consumers" not in operations:
             operations.append("telemetry_top_consumers")
@@ -796,7 +807,9 @@ def select_historical_operations(message: str) -> list[str]:
         term in lowered for term in ("compare", "comparison", "difference", "top consumer", "energy summary")
     ):
         operations = [name for name in operations if name != "site_energy_summary"]
-    if "demand_peak_summary" in operations and "site_energy_summary" in operations:
+    if "demand_peak_summary" in operations and "site_energy_summary" in operations and not any(
+        term in lowered for term in ("daily energy", "energy consumption", "energy usage", "site energy", "kwh")
+    ):
         operations.remove("site_energy_summary")
     if "demand_peak_summary" in operations and any(
         phrase in lowered for phrase in ("details", "breakdown", "devices", "which meter", "which meters")
@@ -859,20 +872,10 @@ def requested_device_id(message: str) -> int | None:
 
 
 def requested_metric(message: str) -> str:
-    lowered = message.lower()
-    if "voltage" in lowered or "sag" in lowered or "swell" in lowered:
-        return "voltage"
-    if "power factor" in lowered:
-        return "power_factor"
-    if "thd" in lowered or "harmonic" in lowered:
-        return "thd"
-    if "demand" in lowered:
-        return "demand"
-    if "current" in lowered:
-        return "current"
-    if "frequency" in lowered:
-        return "frequency"
-    return "energy"
+    if metric_clarification(message):
+        raise ValueError(metric_clarification(message))
+    metrics = question_metrics(message)
+    return metrics[0] if metrics else "energy"
 
 
 def default_historical_range() -> dict:
@@ -962,9 +965,9 @@ def requested_historical_range(message: str) -> dict:
     elif "this week" in lowered:
         start = (local_now - timedelta(days=local_now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
     elif "today" in lowered:
-        start = end.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = local_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
     elif "yesterday" in lowered:
-        today_start = end.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
         start = today_start - timedelta(days=1)
         end = today_start
     else:
@@ -1015,7 +1018,7 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
     if device_id:
         args["device_id"] = int(device_id)
 
-    range_args = requested_historical_range(message)
+    range_args = context.get("_time_window") or requested_historical_range(message)
     if operation_id in {
         "telemetry_top_consumers",
         "site_energy_summary",
@@ -1199,7 +1202,22 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
 def call_authorized_historical_tool(operation_id: str, authorization_id: str, arguments: dict, request_id: str) -> dict:
     if operation_id not in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
         raise ValueError("historical operation is not allowlisted")
-    return call_daxview_mcp_tool(operation_id, {"authorization_id": authorization_id, **arguments}, request_id)
+    result = call_daxview_mcp_tool(operation_id, {"authorization_id": authorization_id, **arguments}, request_id)
+    issue = result_problem(mcp_structured_result(result)) or result_problem(result)
+    if issue:
+        raise RuntimeError(f"{operation_id} could not return valid data: {issue}")
+    if AI_DEBUG_DASHBOARD_ENABLED and operation_id == "site_energy_summary" and arguments.get("bucket") == "day":
+        try:
+            data = historical_result_data(result)
+            rows = first_list(data, ("buckets", "rows", "series", "data"))
+            PREDICTION_SERVICE.store.save_dataset(daily_dataset({
+                "name": f"Site {arguments.get('site_id')} - authorized energy history",
+                "site_id": arguments.get("site_id"), "device_id": arguments.get("device_id"),
+                "unit": data.get("unit") or "kWh", "rows": rows, "source": "authorized_mcp_snapshot",
+            }))
+        except Exception as error:
+            log_event("prediction_snapshot_skipped", request_id=request_id, reason=str(error))
+    return result
 
 
 def first_dict_with_list(value, list_keys: tuple[str, ...]) -> dict | None:
@@ -1434,7 +1452,11 @@ def ranked_consumer_rows(data: dict) -> tuple[list[tuple[dict, float]], list[dic
         if not math.isfinite(amount):
             unmeasured.append(row)
             continue
-        measured.append((row, amount))
+        factor = {"Wh": 0.001, "kWh": 1.0, "MWh": 1000.0}.get(row.get("unit") or data.get("unit") or "kWh")
+        if factor is None or amount < 0:
+            unmeasured.append(row)
+            continue
+        measured.append(({**row, "unit": "kWh"}, amount * factor))
     measured.sort(key=lambda item: item[1], reverse=True)
     return measured, unmeasured
 
@@ -1625,6 +1647,11 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
                     amount = extreme(complete_values.values())
                     days = ", ".join(sorted(day for day, value in complete_values.items() if value == amount))
                     lines.append(f"{title}: {days} at {format_energy_value(amount, conversion_factor, display_unit, precision)}.")
+            if wants_highest and wants_lowest and any(term in message.lower() for term in ("percent", "%", "difference", "compare")):
+                highest, lowest = max(complete_values.values()), min(complete_values.values())
+                change = percentage_difference(highest, lowest)
+                lines.append(f"Highest minus lowest: {format_energy_value(highest - lowest, conversion_factor, display_unit, precision)}.")
+                lines.append(f"The highest day was {change:.2f}% above the lowest day (reference: lowest day)." if change is not None else "Percentage difference is unavailable because the lowest-day reference is zero.")
         else:
             lines.append("Highest and lowest daily energy are unavailable because no complete daily readings were returned for this period.")
     wants_difference = any(phrase in message.lower() for phrase in ("difference", "compare", "comparison", "between"))
@@ -2272,6 +2299,9 @@ Keep the answer concise but useful:
 User question:
 {message}
 
+Measurement definitions (preserve units and aggregation):
+{json.dumps(measurement_context(message))}
+
 Requested parts:
 {question_plan}
 
@@ -2301,9 +2331,11 @@ def run_mcp_refine_model(prompt: str, request_id: str, model: str, fallback_answ
         )
     except (TimeoutError, URLError, json.JSONDecodeError) as error:
         log_event("mcp_answer_refine_error", request_id=request_id, model=model, role=role, error=str(error))
+        debug_trace_event("mcp_answer_refine_fallback", request_id=request_id, model=model, role=role, reason="model_request_failed")
         return fallback_answer
     reply = clean_final_answer(str(data.get("response", "")).strip())
     if not reply:
+        debug_trace_event("mcp_answer_refine_fallback", request_id=request_id, model=model, role=role, reason="empty_model_answer")
         return fallback_answer
     log_event("mcp_answer_refine_response", request_id=request_id, model=model, role=role, duration_ms=round((time.perf_counter() - started_at) * 1000))
     debug_trace_event(
@@ -2378,9 +2410,10 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
                 labels.append(label)
                 values.append(value)
         unit = data.get("unit") or (data.get("display") or {}).get("unit") if isinstance(data.get("display"), dict) else data.get("unit") or "kWh"
-        return build_chart_spec("line", "Site Energy Summary", labels, values, unit or "kWh", "Energy")
+        return build_chart_spec("bar", "Daily Site Energy", labels, values, unit or "kWh", "Energy")
     if operation_id == "telemetry_top_consumers":
-        rows = first_list(data, ("rows", "items", "results", "top_consumers", "consumers", "devices"))
+        ranked, _ = ranked_consumer_rows(data)
+        rows = [dict(row, value=value) for row, value in ranked]
         labels = []
         values = []
         for row in rows[:10]:
@@ -2390,7 +2423,7 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
             if value is not None:
                 labels.append(chart_label(row, "device"))
                 values.append(value)
-        return build_chart_spec("bar", "Top Energy Consumers", labels, values, data.get("unit") or "kWh", "Consumption")
+        return build_chart_spec("bar", "Top Energy Consumers", labels, values, "kWh", "Consumption")
     if operation_id == "alarm_frequency_summary":
         rows = first_list(data, ("rows", "alarms", "items"))
         labels = []
@@ -2411,7 +2444,7 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
             if value is not None:
                 labels.append(label)
                 values.append(value)
-        return build_chart_spec("donut", "Active Alarm Summary", labels, values, "alarm(s)", "Alarms")
+        return build_chart_spec("bar", "Active Alarm Counts (total includes severities)", labels, values, "alarm(s)", "Alarms")
     if operation_id == "meter_status_summary":
         labels = []
         values = []
@@ -2448,6 +2481,15 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
                 labels = [str(data.get("peak_time") or data.get("timestamp") or "Peak demand")]
                 values = [value]
         return build_chart_spec("bar", "Peak Demand", labels, values, data.get("unit") or "kW", "Demand")
+    if operation_id == "telemetry_timeseries":
+        rows = first_list(data, ("rows", "series", "buckets", "data", "points"))
+        pairs = [(str(row.get("timestamp") or row.get("date") or row.get("bucket") or ""),
+                  chart_value(row, ("value", "average", "avg", "reading")))
+                 for row in rows[:1000] if isinstance(row, dict)]
+        pairs = sorted((label, value) for label, value in pairs if label and value is not None)
+        metric = (arguments or {}).get("metric", "Telemetry")
+        return build_chart_spec("line", f"{str(metric).title()} History", [p[0] for p in pairs],
+                                [p[1] for p in pairs], str(data.get("unit") or ""), str(metric))
     if operation_id == "energy_forecast":
         rows = first_list(data, ("forecast", "rows", "series", "items"))
         labels = []
@@ -2562,6 +2604,10 @@ def resolve_follow_up_message(turn_id: str, message: str, context: dict, convers
     previous_message = str(previous["user_message"])
     previous_context = previous.get("context") if isinstance(previous.get("context"), dict) else {}
     merged_context = {**previous_context, **context}
+    if context.get("site_id") and str(context["site_id"]) != str(previous_context.get("site_id")):
+        merged_context = dict(context)
+    if has_time_scope(message):
+        merged_context.pop("_time_window", None)
     if not merged_context.get("device_id") and requested_device_id(message) is None:
         previous_device_id = requested_device_id(previous_message)
         if previous_device_id is not None:
@@ -2696,7 +2742,10 @@ def run_authorized_energy_prediction(turn_id: str, arguments: dict, request_id: 
     normalized = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else source_args
     if not authorization_id:
         raise RuntimeError("DaxView did not authorize site_energy_summary for prediction")
-    source = call_authorized_historical_tool("site_energy_summary", str(authorization_id), normalized, request_id)
+    try:
+        source = call_authorized_historical_tool("site_energy_summary", str(authorization_id), normalized, request_id)
+    except RuntimeError as error:
+        raise PredictionSourceError(str(error)) from error
     structured = mcp_structured_result(source)
     if structured.get("status") == "error" or source.get("isError"):
         raise PredictionSourceError(str(structured.get("error_code") or "MCP_TOOL_ERROR"))
@@ -2716,6 +2765,9 @@ def run_authorized_energy_prediction(turn_id: str, arguments: dict, request_id: 
 
 def run_daxview_integration_turn(turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> dict:
     message, context = resolve_follow_up_message(turn_id, message, context, session_id, request_id)
+    clarification = metric_clarification(message)
+    if clarification:
+        return {"provider": "daxview-question-filter", "reply": clarification}
     operation_ids = select_historical_operations(message)
     debug_trace_event(
         "daxview_tool_selection_debug",
@@ -2728,11 +2780,21 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         return langchain_chat_response(message, request_id, session_id)
     if "demand_peak_summary" in operation_ids and needs_device_choice(message) and not context.get("device_id"):
         return build_device_choice_response(turn_id, message, context, request_id)
+    context = dict(context)
+    context.setdefault("_time_window", completed_daily_range(message) or requested_historical_range(message))
+    if requested_device_id(message):
+        context["device_id"] = requested_device_id(message)
+    save_resolved_turn_context(turn_id, context)
     results = []
     errors = []
+    steps = []
     for operation_id in operation_ids:
+        metrics = question_metrics(message) if operation_id == "telemetry_timeseries" else []
+        steps.extend((operation_id, metric) for metric in metrics or [None])
+    for operation_id, metric in steps:
         try:
-            arguments = build_historical_arguments(operation_id, context, message)
+            step_context = {**context, "metric": metric} if metric else context
+            arguments = build_historical_arguments(operation_id, step_context, message)
         except ValueError as error:
             return {
                 "provider": "daxview-question-filter",
@@ -2789,6 +2851,8 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         failed_tools = ", ".join(str(item["operation_id"]) for item in errors)
         deterministic_reply = f"{deterministic_reply}\n\nUnavailable detail: {failed_tools} could not be retrieved for this request."
     refined_reply = refine_historical_answer_with_model(message, results, deterministic_reply, request_id)
+    if errors and "Unavailable detail:" not in refined_reply:
+        refined_reply += f"\n\nUnavailable detail: {failed_tools} could not be retrieved for this request."
     charts = build_charts_from_historical_results(results)
     preview_charts = charts if charts else build_charts_from_historical_results(results, preview=True)
     debug_trace_event(
@@ -2804,6 +2868,15 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         "charts": charts,
         "debug_charts": preview_charts,
     }
+
+
+def save_resolved_turn_context(turn_id: str, context: dict) -> None:
+    if not DATABASE_URL:
+        return
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE daxview_turns SET context = %s WHERE id = %s", (json.dumps(context), turn_id))
+        conn.commit()
 
 
 def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> None:
@@ -3111,7 +3184,11 @@ def retrieve_daxview_context(message: str, request_id: str) -> dict:
     errors = []
     for tool_name in tools:
         try:
-            results.append({"tool": tool_name, "result": call_daxview_mcp_tool(tool_name, {}, request_id)})
+            result = call_daxview_mcp_tool(tool_name, {}, request_id)
+            issue = result_problem(result) or result_problem(mcp_structured_result(result))
+            if issue:
+                raise RuntimeError(issue)
+            results.append({"tool": tool_name, "result": result})
         except Exception as error:
             errors.append({"tool": tool_name, "error": str(error)})
             log_event("mcp_tool_error", request_id=request_id, tool=tool_name, error=str(error))
@@ -3533,6 +3610,9 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AI MCP Trace Dashboard</title>
+    <link rel="stylesheet" href="/debug/assets/prediction_lab.css" />
+    <script src="/debug/assets/chart.umd.js"></script>
+    <script src="/debug/assets/lucide.min.js"></script>
     <style>
       :root { color-scheme: light; font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
       body { margin: 0; background: #f5f7fb; color: #172033; }
@@ -3613,7 +3693,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       <button type="button" data-view="traces" class="active">Traces</button>
       <button type="button" data-view="predictions">Predictions</button>
     </nav>
-    <main>
+    <main id="trace-workspace">
       <section class="panel">
         <h2>Recent Requests</h2>
         <div class="toolbar"><input id="filter" placeholder="Filter request/tool/error..." /></div>
@@ -3624,12 +3704,8 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         <div id="timeline" class="timeline"><div class="empty">Select a request.</div></div>
       </section>
     </main>
+    __PREDICTION_WORKSPACE__
     <script>
-      let debugKey = sessionStorage.getItem("ai_debug_key") || "";
-      if (!debugKey) {
-        debugKey = prompt("Enter AI debug dashboard key") || "";
-        if (debugKey) sessionStorage.setItem("ai_debug_key", debugKey);
-      }
       let grouped = [];
       let selected = null;
       let activeView = "traces";
@@ -3649,7 +3725,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         {key: "plan", label: "Data Plan", match: e => /data_plan/i.test(e.event || "")},
         {key: "mcp", label: "MCP Tool", match: e => /mcp_tool/i.test(e.event || "")},
         {key: "retrieval", label: "Knowledge", match: e => /retrieve|context|embedding/i.test(e.event || "")},
-        {key: "model", label: "AI Model", match: e => /ollama|agent|synthesizer/i.test(e.event || "")},
+        {key: "model", label: "AI Model", match: e => /ollama|agent|synthesizer|mcp_answer_refine/i.test(e.event || "")},
         {key: "response", label: "Response", match: e => /response|completed|api_to_ui/i.test(e.event || "")},
       ];
       function durationMs(events) {
@@ -3712,6 +3788,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         const final = events.find(event => event.event === "ai_final_response_debug");
         const failed = events.find(event => event.event === "daxview_job_failed");
         const unavailable = events.find(event => event.event === "energy_prediction_unavailable");
+        const fallback = events.find(event => event.event === "mcp_answer_refine_fallback");
         const answer = outcome?.answer || final?.answer || "";
         const charts = outcome?.charts || final?.charts || [];
         const error = outcome?.error || failed?.error || "";
@@ -3736,6 +3813,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         else if (chartExpected && !charts.length && outcome?.charts_enabled === false) state = "Chart generation is disabled in the AI Server configuration.";
         else if (chartExpected && !charts.length) state = "No numeric chart data was available for this answer.";
         return `<section class="outcome"><h3>Outcome preview</h3>
+          ${fallback ? `<div class="outcome-state">Model refinement unavailable; showing the calculated fallback.</div>` : ""}
           ${answer ? `<div class="outcome-answer">${escapeHtml(answer)}</div>` : ""}
           ${chartItems ? `<div class="chart-grid">${chartItems}</div>` : ""}
           ${state ? `<div class="outcome-state ${unavailableCode || error ? "fail" : ""}">${escapeHtml(state)}</div>` : ""}
@@ -3743,49 +3821,10 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       }
       function drawCharts() {
         document.querySelectorAll("canvas[data-spec]").forEach(canvas => {
-          let spec;
-          try { spec = JSON.parse(canvas.dataset.spec); } catch { return; }
-          const ctx = canvas.getContext("2d");
-          if (!ctx) return;
-          const scale = window.devicePixelRatio || 1;
-          const width = Math.max(canvas.clientWidth, 280);
-          const height = 220;
-          canvas.width = width * scale;
-          canvas.height = height * scale;
-          ctx.scale(scale, scale);
-          const series = spec.series?.[0];
-          const values = (series?.data || []).map(Number).filter(Number.isFinite);
-          const labels = (spec.labels || []).slice(0, values.length);
-          if (!values.length) return;
-          const colors = ["#0284c7", "#16a34a", "#e11d48", "#d97706", "#0891b2", "#4f46e5"];
-          ctx.font = "11px system-ui";
-          ctx.fillStyle = "#475569";
-          if (spec.type === "donut") {
-            const total = values.reduce((sum, value) => sum + Math.max(value, 0), 0) || 1;
-            let angle = -Math.PI / 2;
-            values.forEach((value, i) => {
-              const next = angle + Math.max(value, 0) / total * Math.PI * 2;
-              ctx.beginPath(); ctx.arc(width / 2, 92, 62, angle, next); ctx.arc(width / 2, 92, 34, next, angle, true);
-              ctx.closePath(); ctx.fillStyle = colors[i % colors.length]; ctx.fill(); angle = next;
-              ctx.fillStyle = "#334155"; ctx.fillText(`${labels[i] || "Item"}: ${value}`, 12, 178 + i * 14);
-            });
-            return;
-          }
-          const max = Math.max(...values, 1);
-          const left = 42, right = 12, top = 12, bottom = 46;
-          const plotW = width - left - right, plotH = height - top - bottom;
-          ctx.strokeStyle = "#cbd5e1"; ctx.beginPath(); ctx.moveTo(left, top); ctx.lineTo(left, top + plotH); ctx.lineTo(width - right, top + plotH); ctx.stroke();
-          if (spec.type === "line") {
-            ctx.strokeStyle = colors[0]; ctx.lineWidth = 2; ctx.beginPath();
-            values.forEach((value, i) => { const x = left + (values.length === 1 ? plotW / 2 : i * plotW / (values.length - 1)); const y = top + plotH - value / max * plotH; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }); ctx.stroke();
-            values.forEach((value, i) => { const x = left + (values.length === 1 ? plotW / 2 : i * plotW / (values.length - 1)); const y = top + plotH - value / max * plotH; ctx.fillStyle = colors[0]; ctx.beginPath(); ctx.arc(x, y, 3, 0, Math.PI * 2); ctx.fill(); });
-          } else {
-            const slot = plotW / values.length, barW = Math.max(4, slot * 0.62);
-            values.forEach((value, i) => { const barH = value / max * plotH; ctx.fillStyle = colors[i % colors.length]; ctx.fillRect(left + i * slot + (slot - barW) / 2, top + plotH - barH, barW, barH); });
-          }
-          const step = Math.max(1, Math.ceil(labels.length / 6));
-          labels.forEach((label, i) => { if (i % step === 0) { const x = left + (values.length === 1 ? plotW / 2 : i * plotW / Math.max(values.length - 1, 1)); ctx.save(); ctx.translate(x, height - 8); ctx.rotate(-0.3); ctx.fillStyle = "#475569"; ctx.fillText(String(label).slice(0, 18), -12, 0); ctx.restore(); } });
-          ctx.fillStyle = "#64748b"; ctx.fillText(series?.unit || "", 4, 12);
+          try {
+            const spec = JSON.parse(canvas.dataset.spec);
+            if (window.renderDashboardChart) window.renderDashboardChart(canvas, spec);
+          } catch (error) { console.error("Chart preview failed", error); }
         });
       }
       function groupTraces(traces) {
@@ -3798,7 +3837,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         return [...map.entries()].map(([id, events]) => ({id, events: events.slice().reverse()}));
       }
       async function load() {
-        const res = await fetch("/debug/traces", {headers: {"X-Debug-Key": debugKey}});
+        const res = await fetch("/debug/traces");
         if (!res.ok) {
           document.querySelector("#requests").innerHTML = '<div class="empty">Unauthorized or debug dashboard disabled.</div>';
           return;
@@ -3872,11 +3911,17 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       function escapeHtml(value) {
         return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
       }
-      document.querySelector("#refresh").addEventListener("click", load);
+      document.querySelector("#refresh").addEventListener("click", () => activeView === "predictions" ? window.PredictionLab.show() : load());
       document.querySelector("#filter").addEventListener("input", renderRequests);
       document.querySelectorAll(".tabs button").forEach(button => button.addEventListener("click", () => {
         activeView = button.dataset.view;
         document.querySelectorAll(".tabs button").forEach(tab => tab.classList.toggle("active", tab === button));
+        document.querySelector("#trace-workspace").hidden = activeView === "predictions";
+        document.querySelector("#prediction-workspace").hidden = activeView !== "predictions";
+        if (activeView === "predictions") {
+          window.PredictionLab.show();
+          return;
+        }
         selected = activeView === "predictions"
           ? grouped.find(group => group.events.some(event =>
               event.event === "energy_prediction_debug" || (event.operation_ids || []).includes("energy_forecast")))?.id || null
@@ -3888,6 +3933,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       load();
       setInterval(load, 10000);
     </script>
+    <script src="/debug/assets/prediction_lab.js"></script>
   </body>
 </html>"""
 
@@ -3956,16 +4002,18 @@ def langchain_direct_mcp_answer(state: dict) -> dict:
         return state
     direct_answer = answer_from_mcp_if_direct_count_question(state["message"], state["mcp_context"])
     if direct_answer:
-        state["reply"] = direct_answer
-        state["provider"] = "daxview-mcp-direct"
-        state["model"] = None
+        results = [{"operation_id": item.get("tool", "mcp"), "arguments": {}, "result": item.get("result", {})}
+                   for item in state["mcp_context"].get("results", [])]
+        state["reply"] = refine_historical_answer_with_model(state["message"], results, direct_answer, state["request_id"])
+        state["provider"] = "daxview-mcp-refined"
+        state["model"] = CHAT_MODEL
         state["decision_model"] = "Daxview MCP direct extractor"
         state["agent_answers"] = [
             {
                 "agent": "Daxview MCP Direct Extractor",
                 "role": "Read structured MCP data and answer deterministic count/status questions.",
                 "model": "deterministic",
-                "answer": direct_answer,
+                "answer": state["reply"],
             }
         ]
     return state
@@ -4448,10 +4496,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _debug_allowed(self) -> bool:
-        if not AI_DEBUG_DASHBOARD_ENABLED or not AI_DEBUG_DASHBOARD_KEY:
-            return False
-        supplied_key = self.headers.get("X-Debug-Key", "").strip()
-        return hmac.compare_digest(supplied_key, AI_DEBUG_DASHBOARD_KEY)
+        return AI_DEBUG_DASHBOARD_ENABLED
 
     def _read_json(self) -> dict:
         content_length = int(self.headers.get("Content-Length", "0"))
@@ -4863,11 +4908,39 @@ class ChatHandler(BaseHTTPRequestHandler):
             if not AI_DEBUG_DASHBOARD_ENABLED:
                 self._send_html(404, "<h1>Debug dashboard disabled</h1>")
                 return
-            self._send_html(200, DEBUG_DASHBOARD_HTML)
+            self._send_html(200, DEBUG_DASHBOARD_HTML.replace("__PREDICTION_WORKSPACE__", (STATIC_DIRECTORY / "prediction_lab.html").read_text(encoding="utf-8")))
+            return
+        if path.startswith("/debug/assets/"):
+            files = {
+                "prediction_lab.js": ("prediction_lab.js", "text/javascript"),
+                "prediction_lab.css": ("prediction_lab.css", "text/css"),
+                "chart.umd.js": ("vendor/chart.umd.js", "text/javascript"),
+                "lucide.min.js": ("vendor/lucide.min.js", "text/javascript"),
+            }
+            item = files.get(path.removeprefix("/debug/assets/"))
+            if not self._debug_allowed() or not item:
+                self._send_json(404, {"error": "Not found"})
+                return
+            body = (STATIC_DIRECTORY / item[0]).read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", item[1])
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if path == "/debug/predictions" or path.startswith("/debug/predictions/"):
+            if not self._debug_allowed():
+                self._send_json(404, {"error": "Dashboard disabled"})
+                return
+            try:
+                result = PREDICTION_SERVICE.get(path.removeprefix("/debug/predictions").strip("/"), parse_qs(parsed.query))
+                self._send_json(200, result)
+            except ValueError as error:
+                self._send_json(400, {"error": str(error)})
             return
         if path == "/debug/traces":
             if not self._debug_allowed():
-                self._send_json(401, json_error("unauthorized", "Debug dashboard is disabled or the debug key is invalid.", False))
+                self._send_json(404, json_error("disabled", "Debug dashboard is disabled.", False))
                 return
             self._send_json(200, {"traces": list(TRACES)})
             return
@@ -4875,6 +4948,17 @@ class ChatHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path.startswith("/debug/"):
+            if not self._debug_allowed():
+                self._send_json(404, {"error": "Dashboard disabled"})
+                return
+            origin = self.headers.get("Origin")
+            if origin and urlparse(origin).netloc != self.headers.get("Host"):
+                self._send_json(403, {"error": "Dashboard requests must use the same origin."})
+                return
+            if int(self.headers.get("Content-Length", "0")) > 2_000_000:
+                self._send_json(413, {"error": "Upload limit is 2 MB."})
+                return
         try:
             request = self._read_json()
         except (ValueError, json.JSONDecodeError):
@@ -4882,6 +4966,13 @@ class ChatHandler(BaseHTTPRequestHandler):
             return
 
         if self.handle_daxview_post(path, request):
+            return
+        if path.startswith("/debug/predictions/"):
+            try:
+                result = PREDICTION_SERVICE.post(path.removeprefix("/debug/predictions/"), request)
+                self._send_json(202 if "job_id" in result else 200, result)
+            except (ValueError, TypeError) as error:
+                self._send_json(400, {"error": str(error)})
             return
 
         if path == "/knowledge":

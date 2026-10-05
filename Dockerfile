@@ -4,6 +4,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py .
+COPY prediction_lab.py ems_contracts.py ./
+COPY static ./static
 COPY scripts ./scripts
 
 ENV CHATBOT_HOST=0.0.0.0

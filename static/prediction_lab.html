@@ -1,0 +1,45 @@
+<section id="prediction-workspace" hidden>
+  <div class="lab-heading"><div><h2>Prediction Lab</h2><p>Daily energy <span class="lab-unit">kWh</span></p></div>
+    <div class="lab-actions"><button id="lab-sample" class="secondary" type="button"><i data-lucide="flask-conical"></i>Load sample</button>
+    <button id="lab-download" type="button" disabled title="Download forecast CSV"><i data-lucide="download"></i>Export</button></div>
+  </div>
+  <div id="lab-notice" role="status" hidden></div>
+  <div class="lab-layout">
+    <aside class="lab-controls">
+      <form id="lab-import-form">
+        <h3>Import history</h3>
+        <label>Dataset name<input id="lab-name" value="Energy history" maxlength="120" required></label>
+        <label>Daily energy CSV<input id="lab-file" type="file" accept=".csv,text/csv" required></label>
+        <div class="lab-field-pair"><label>Site ID<input id="lab-import-site" type="number" min="1"></label>
+          <label>Unit<select id="lab-unit"><option>kWh</option><option>MWh</option><option>Wh</option></select></label></div>
+        <label>Reading type<select id="lab-reading-kind"><option value="interval_energy">Daily interval energy</option><option value="cumulative">Cumulative register</option></select></label>
+        <button type="submit"><i data-lucide="upload"></i>Import CSV</button>
+      </form>
+      <form id="lab-extract-form">
+        <h3>Extract from DaxView</h3>
+        <p id="lab-source-state" class="lab-muted">Checking data source...</p>
+        <label>Site<select id="lab-site" required></select></label>
+        <div class="lab-field-pair"><label>History<select id="lab-history"><option value="30">30 days</option><option value="60">60 days</option><option value="90" selected>90 days</option><option value="180">180 days</option><option value="365">365 days</option></select></label>
+          <label>Device ID<input id="lab-device" type="number" min="1" placeholder="Whole site"></label></div>
+        <button id="lab-extract" type="submit" disabled><i data-lucide="database"></i>Extract history</button>
+      </form>
+      <form id="lab-forecast-form">
+        <h3>Run prediction</h3>
+        <label>Dataset<select id="lab-dataset" required><option value="">No saved datasets</option></select></label>
+        <label>Algorithm<select id="lab-method"><option value="auto">Best backtest result</option><option value="weekly">Same-weekday average</option><option value="smoothing">Seasonal exponential smoothing</option></select></label>
+        <label>Forecast days<input id="lab-horizon" type="number" min="1" max="14" value="7" required></label>
+        <button id="lab-run" type="submit" disabled><i data-lucide="play"></i>Run prediction</button>
+      </form>
+    </aside>
+    <div class="lab-results">
+      <div class="lab-result-title"><div><h3 id="lab-title">No dataset selected</h3><p id="lab-provenance" class="lab-muted"></p></div>
+        <label class="lab-run-picker">Saved runs<select id="lab-runs"><option value="">Select a run</option></select></label></div>
+      <div id="lab-metrics" class="lab-metrics"></div>
+      <div id="lab-empty" class="lab-empty">No historical readings loaded.</div>
+      <div id="lab-chart-region" hidden><div class="lab-chart"><canvas id="lab-chart" aria-label="Historical energy and forecast" role="img"></canvas></div>
+        <p id="lab-band-note" class="lab-muted"></p></div>
+      <div id="lab-models" class="lab-table-region" hidden><h3>Historical validation</h3><div class="lab-scroll"><table><thead><tr><th>Algorithm</th><th>MAE (kWh)</th><th>WAPE</th><th>Folds</th><th>Result</th></tr></thead><tbody id="lab-model-rows"></tbody></table></div></div>
+      <div id="lab-readings" class="lab-table-region" hidden><h3>Readings</h3><div class="lab-scroll lab-readings-scroll"><table><thead><tr><th>Date</th><th>Type</th><th>Energy (kWh)</th><th>Error band (kWh)</th></tr></thead><tbody id="lab-reading-rows"></tbody></table></div></div>
+    </div>
+  </div>
+</section>

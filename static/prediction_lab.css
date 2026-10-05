@@ -1,0 +1,41 @@
+[hidden] { display: none !important; }
+#prediction-workspace { background: #fff; min-height: calc(100vh - 120px); }
+.lab-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 22px 24px; border-bottom: 1px solid #dfe6e5; }
+.lab-heading h2 { font-size: 22px; margin: 0; }
+.lab-heading p { font-size: 13px; margin: 7px 0 0; color: #586269; }
+.lab-unit { color: #007f66; margin-left: 8px; font-weight: 600; }
+.lab-actions { display: flex; gap: 8px; }
+#prediction-workspace button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; background: #087f69; border-color: #087f69; font-size: 13px; min-height: 36px; }
+#prediction-workspace button.secondary { color: #344148; background: white; border-color: #c9d3d5; }
+#prediction-workspace button:disabled { opacity: .45; cursor: default; }
+#prediction-workspace svg { width: 16px; height: 16px; flex: none; }
+.lab-layout { display: grid; grid-template-columns: 285px minmax(0, 1fr); }
+.lab-controls { background: #f8faf9; border-right: 1px solid #dfe6e5; padding: 0 20px; }
+.lab-controls form { padding: 20px 0; border-bottom: 1px solid #dfe6e5; }
+#prediction-workspace h3 { font-size: 14px; margin: 0 0 14px; }
+#prediction-workspace label { display: block; color: #45555d; font-size: 12px; margin-bottom: 12px; }
+#prediction-workspace input, #prediction-workspace select { display: block; width: 100%; min-width: 0; min-height: 35px; box-sizing: border-box; margin-top: 6px; border: 1px solid #cbd5d8; border-radius: 4px; padding: 7px 8px; background: white; color: #182e35; font: inherit; font-size: 13px; }
+#prediction-workspace input[type=file] { padding: 6px; font-size: 11px; }
+.lab-field-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.lab-results { padding: 24px; min-width: 0; }
+.lab-result-title { display: flex; align-items: start; justify-content: space-between; gap: 16px; }
+.lab-result-title h3 { overflow-wrap: anywhere; font-size: 17px !important; margin-bottom: 6px !important; }
+.lab-run-picker { width: 220px; flex: none; }
+.lab-muted { font-size: 12px; line-height: 1.5; color: #67757b; margin: 6px 0 12px; overflow-wrap: anywhere; }
+.lab-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid #dfe6e5; border-bottom: 1px solid #dfe6e5; margin: 18px 0 22px; }
+.lab-stat { padding: 16px 14px 16px 0; }
+.lab-stat span { color: #67757b; font-size: 12px; display: block; }
+.lab-stat strong { display: block; font-size: 20px; margin: 6px 0; overflow-wrap: anywhere; }
+.lab-chart { position: relative; height: 330px; width: 100%; }
+.lab-empty { min-height: 220px; display: grid; place-items: center; color: #6a797f; font-size: 14px; border-bottom: 1px solid #e2e8e7; }
+.lab-table-region { padding-top: 24px; margin-top: 18px; border-top: 1px solid #dfe6e5; }
+.lab-scroll { overflow: auto; }
+.lab-readings-scroll { max-height: 300px; }
+#prediction-workspace table { border-collapse: collapse; width: 100%; font-size: 12px; white-space: nowrap; }
+#prediction-workspace th { text-align: left; color: #54676f; font-weight: 600; background: #f4f7f6; position: sticky; top: 0; }
+#prediction-workspace td, #prediction-workspace th { padding: 10px 12px; border-bottom: 1px solid #e5ebe9; }
+.lab-selected { color: #047b5e; font-weight: 600; }
+#lab-notice { margin: 0; padding: 12px 24px; color: #22664f; background: #eaf7f0; font-size: 13px; overflow-wrap: anywhere; }
+#lab-notice[data-error=true] { color: #a63132; background: #fff0ef; }
+@media (max-width: 1000px) { .lab-layout { grid-template-columns: 250px minmax(0, 1fr); } .lab-metrics { grid-template-columns: 1fr 1fr; } .lab-result-title { flex-direction: column; } .lab-run-picker { width: 100%; } }
+@media (max-width: 700px) { .lab-layout { grid-template-columns: 1fr; } .lab-controls { border-right: 0; display: grid; grid-template-columns: 1fr; } .lab-heading { padding: 18px 16px; flex-wrap: wrap; } .lab-results { padding: 20px 16px; } .lab-chart { height: 280px; } .lab-stat strong { font-size: 18px; } }

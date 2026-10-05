@@ -8,6 +8,7 @@ import re
 import statistics
 import unittest
 from unittest.mock import Mock
+from ems_contracts import question_metrics, metric_clarification, percentage_difference
 
 
 SOURCE = Path(__file__).resolve().parents[1] / "server.py"
@@ -38,6 +39,10 @@ def load_functions():
         "__builtins__": __builtins__, "date": date, "datetime": datetime,
         "timedelta": timedelta, "timezone": timezone, "math": math,
         "re": re, "statistics": statistics,
+        "question_metrics": question_metrics, "metric_clarification": metric_clarification,
+        "percentage_difference": percentage_difference,
+        "requested_historical_range": Mock(return_value={"start": "start", "end": "end", "timezone": "Asia/Kuala_Lumpur"}),
+        "save_resolved_turn_context": Mock(),
         "DAXVIEW_TOOL_KEYWORDS": next(
             ast.literal_eval(node.value)
             for node in TREE.body
