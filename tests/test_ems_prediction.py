@@ -21,7 +21,7 @@ NAMES = (
     "requested_top_limit", "requested_forecast_days", "requested_energy_extrema", "format_number", "format_time_window",
     "reading_detail",
     "requested_question_parts", "completed_daily_range", "wants_device_usage_ranking", "wants_all_devices",
-    "wants_lowest_consumer", "wants_top_lowest_sum",
+    "wants_lowest_consumer", "wants_top_lowest_sum", "wants_device_inventory", "wants_device_capability_discovery",
     "select_historical_operations", "build_historical_arguments", "requested_device_id",
     "parse_datetime", "local_bucket_date", "first_list", "first_value", "predict_daily_energy",
     "is_follow_up_message", "resolve_follow_up_message", "needs_ems_library",
@@ -29,11 +29,11 @@ NAMES = (
     "run_authorized_energy_prediction", "run_daxview_integration_turn",
     "build_charts_from_historical_results", "summarize_site_energy",
     "ensure_historical_answer_coverage", "ranked_consumer_rows", "summarize_top_consumers",
-    "summarize_historical_answers", "summarize_demand_peak", "device_selection_prompt_from_result",
+    "summarize_historical_answers", "summarize_demand_peak", "summarize_site_devices", "device_selection_prompt_from_result",
     "build_device_choice_response",
     "daxview_history_event",
     "wants_highest_demand_device", "choose_historical_operations",
-    "resolved_plan_for_result",
+    "resolved_plan_for_result", "readable_historical_errors",
 )
 
 
@@ -126,6 +126,37 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertIn("Highest energy-consuming device: Top Meter at 100.00 kWh", answer)
         self.assertIn("Lowest energy-consuming device: Low Meter at 25.00 kWh", answer)
         self.assertIn("Combined total of those two devices: 125.00 kWh", answer)
+
+    def test_invalid_metric_error_is_readable(self):
+        answer = self.env["readable_historical_errors"]([
+            {"operation_id": "telemetry_timeseries", "metric": "current", "error": "telemetry_timeseries could not return valid data: INVALID_METRIC"}
+        ])
+        self.assertIn("current", answer)
+        self.assertIn("metric name is not supported", answer)
+
+    def test_device_inventory_routes_to_site_device_list(self):
+        question = "List me out devices that is in this site"
+        self.assertTrue(self.env["wants_device_inventory"](question))
+        self.assertEqual(self.env["select_historical_operations"](question), ["site_device_list"])
+
+    def test_voltage_current_testing_discovers_devices_first(self):
+        question = "List devices at this site that have data, then tell me which one is best to use for voltage/current trend testing."
+        self.assertTrue(self.env["wants_device_capability_discovery"](question))
+        self.assertEqual(self.env["select_historical_operations"](question), ["site_device_list"])
+
+    def test_device_summary_surfaces_returned_parameters(self):
+        answer = self.env["summarize_site_devices"]({
+            "devices": [{
+                "device_id": 519,
+                "device_name": "AC kWh",
+                "status": "online",
+                "device_type": "Virtual",
+                "has_data": True,
+                "supported_metrics": ["energy", "voltage", "current"],
+            }]
+        })
+        self.assertIn("AC kWh", answer)
+        self.assertIn("Parameters: energy, voltage, current", answer)
 
     def test_ranking_sorts_numeric_usage_and_joins_current_status(self):
         self.env["historical_result_data"] = lambda result: result["data"]

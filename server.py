@@ -126,7 +126,7 @@ EMS_KEYWORDS = {
     "overvoltage", "undervoltage", "current", "frequency", "thd", "power quality",
     "event", "alarm", "fault", "disturbance", "waveform", "rms", "l-n", "l-l",
     "daxview", "site summary", "summary for this site", "summary of this site",
-    "this site", "device summary", "inventory", "open alarms",
+    "this site", "device", "devices", "device id", "device summary", "inventory", "open alarms",
 }
 
 DAXVIEW_TOOL_KEYWORDS = {
@@ -157,6 +157,10 @@ DAXVIEW_TOOL_KEYWORDS = {
     "site_device_list": {
         "list all devices", "devices under this site", "all meters", "installed meters",
         "device list", "meters in this building", "devices have data",
+        "list devices", "list me out devices", "list me out all the device",
+        "list me out all the devices", "list device id", "list all device id",
+        "which device", "which one is best", "best to use for voltage",
+        "best to use for current", "voltage/current trend testing",
     },
     "telemetry_timeseries": {
         "trend", "timeseries", "time series", "chart", "plot", "hourly",
@@ -176,7 +180,8 @@ DAXVIEW_TOOL_KEYWORDS = {
     },
     "data_availability_summary": {
         "data coverage", "missing data", "no energy data", "data availability",
-        "data complete", "missing energy",
+        "data complete", "missing energy", "check data availability",
+        "availability for voltage", "availability for current",
     },
     "alarm_detail_lookup": {
         "alarm id", "alarm detail", "alarm details", "explain this alarm",
@@ -264,6 +269,7 @@ DAXVIEW_GLOBAL_SCOPE_PHRASES = {
     "all", "overall", "global", "entire", "every", "current", "today",
     "now", "latest", "system wide", "system-wide", "whole site",
     "all sites", "all meters", "all devices", "all buildings",
+    "this site", "selected site", "current site",
 }
 
 DAXVIEW_TARGET_SCOPE_PATTERNS = (
@@ -817,15 +823,37 @@ def wants_all_devices(message: str) -> bool:
     return bool(re.search(r"\b(?:all|every)\s+(?:(?:of\s+)?the\s+)?devices?\b", message, re.IGNORECASE))
 
 
+def wants_device_inventory(message: str) -> bool:
+    lowered = message.lower()
+    if wants_device_usage_ranking(message) or wants_highest_demand_device(message):
+        return False
+    return bool(
+        re.search(r"\b(?:list|show|get|give)\b.*\b(?:devices?|meters?|device\s*ids?)\b", lowered)
+        or re.search(r"\bwhich\s+(?:devices?|meters?)\b.*\b(?:have data|available|online|offline|status|best|suitable)\b", lowered)
+        or re.search(r"\b(?:devices?|meters?)\b.*\b(?:in|under|for)\s+(?:this|selected|current)\s+site\b", lowered)
+        or re.search(r"\b(?:best|suitable)\b.*\b(?:voltage|current|trend|testing)\b", lowered)
+    )
+
+
+def wants_device_capability_discovery(message: str) -> bool:
+    lowered = message.lower()
+    return wants_device_inventory(message) and bool(re.search(r"\b(?:voltage|current|telemetry|trend|data|capabilit|parameter|testing)\b", lowered))
+
+
 def select_historical_operations(message: str) -> list[str]:
     lowered = message.lower()
     operations = []
     for tool_name, phrases in DAXVIEW_TOOL_KEYWORDS.items():
         if any(phrase in lowered for phrase in phrases):
             operations.append(tool_name)
+    if wants_device_inventory(message) and "site_device_list" not in operations:
+        operations.append("site_device_list")
     if "current" in question_metrics(message) and "telemetry_timeseries" not in operations:
         operations.append("telemetry_timeseries")
+    if wants_device_capability_discovery(message) and requested_device_id(message) is None:
+        operations = [name for name in operations if name != "telemetry_timeseries"]
     if wants_device_usage_ranking(message):
+        operations = [name for name in operations if name != "site_device_list"]
         if "telemetry_top_consumers" not in operations:
             operations.append("telemetry_top_consumers")
         if not re.search(r"\b(?:daily|site energy|site-wide|overall|total site|site total|site usage)\b", lowered):
@@ -2010,12 +2038,26 @@ def summarize_site_devices(data: dict) -> str:
         device_id = device.get("device_id") or device.get("id") or device.get("meter_id") or "unknown"
         device_type = device.get("device_type") or device.get("type") or device.get("model")
         last_seen = device.get("last_updated") or device.get("last_seen") or device.get("last_telemetry_at")
+        metrics = first_value(device, (
+            "supported_metrics", "metrics", "metric_names", "telemetry_metrics",
+            "parameters", "parameter_names", "available_parameters", "capabilities",
+        ))
         details = [f"ID {device_id}", status.title()]
         if device_type:
             details.append(str(device_type))
+        if device.get("has_data") is not None:
+            details.append(f"has data {device.get('has_data')}")
         if last_seen:
             details.append(f"last seen {last_seen}")
         lines.append(f"- {index}. {name} ({', '.join(details)})")
+        if metrics:
+            if isinstance(metrics, list):
+                metric_text = ", ".join(str(item) for item in metrics[:12])
+                if len(metrics) > 12:
+                    metric_text += f", +{len(metrics) - 12} more"
+            else:
+                metric_text = str(metrics)
+            lines.append(f"  Parameters: {metric_text}")
 
     if len(devices) > 10:
         lines.append(f"Showing 10 of {len(devices)} device(s).")
@@ -2899,6 +2941,26 @@ def historical_argument_clarification(error: ValueError, operation_id: str) -> s
     return "Choose a site and time range before I access DaxView historical data."
 
 
+def readable_historical_errors(errors: list[dict]) -> str:
+    if not errors:
+        return ""
+    parts = []
+    for item in errors:
+        operation = str(item.get("operation_id") or "DaxView tool")
+        metric = item.get("metric")
+        error = str(item.get("error") or "")
+        label = f"{operation} for {metric}" if metric else operation
+        if "INVALID_METRIC" in error:
+            parts.append(f"{label} was rejected by DaxView because that metric name is not supported by the telemetry tool.")
+        elif "NO_DATA" in error:
+            parts.append(f"{label} returned no data for the requested scope and time range.")
+        elif "UNAVAILABLE" in error:
+            parts.append(f"{label} is currently unavailable from DaxView.")
+        else:
+            parts.append(f"{label} could not be retrieved: {error}")
+    return " ".join(parts)
+
+
 def device_selection_prompt_from_result(mcp_result: dict) -> tuple[str, list[dict]]:
     data = historical_result_data(mcp_result)
     devices = first_list(data, ("devices", "rows", "items", "meters"))
@@ -3191,20 +3253,30 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
                 }
             )
         except Exception as error:
-            errors.append({"operation_id": operation_id, "error": str(error)})
-            log_event("daxview_tool_step_failed", request_id=request_id, turn_id=turn_id, operation_id=operation_id, error=str(error))
-            if len(operation_ids) == 1:
+            metric_label = f":{metric}" if metric else ""
+            errors.append({"operation_id": operation_id, "metric": metric, "error": str(error)})
+            log_event("daxview_tool_step_failed", request_id=request_id, turn_id=turn_id, operation_id=operation_id, metric=metric, error=str(error))
+            if len(operation_ids) == 1 and len(steps) == 1:
                 raise
     if not results:
-        error_detail = "; ".join(f"{item['operation_id']}: {item['error']}" for item in errors)
-        raise RuntimeError(error_detail or "No DaxView MCP tool returned data")
+        error_detail = "; ".join(
+            f"{item['operation_id']}{':' + str(item.get('metric')) if item.get('metric') else ''}: {item['error']}"
+            for item in errors
+        )
+        return {
+            "provider": "daxview-historical-mcp",
+            "reply": readable_historical_errors(errors) or error_detail or "No DaxView MCP tool returned data.",
+            "charts": [],
+            "debug_charts": [],
+            "resolved_plan": resolved_plan_for_result("error", operation_ids, context, results, errors),
+        }
     deterministic_reply = summarize_historical_answers(message, results, request_id)
     if errors:
-        failed_tools = ", ".join(str(item["operation_id"]) for item in errors)
-        deterministic_reply = f"{deterministic_reply}\n\nUnavailable detail: {failed_tools} could not be retrieved for this request."
+        failed_tools = readable_historical_errors(errors)
+        deterministic_reply = f"{deterministic_reply}\n\nUnavailable detail: {failed_tools}"
     refined_reply = refine_historical_answer_with_model(message, results, deterministic_reply, request_id)
     if errors and "Unavailable detail:" not in refined_reply:
-        refined_reply += f"\n\nUnavailable detail: {failed_tools} could not be retrieved for this request."
+        refined_reply += f"\n\nUnavailable detail: {failed_tools}"
     charts = build_charts_from_historical_results(results)
     preview_charts = charts if charts else build_charts_from_historical_results(results, preview=True)
     debug_trace_event(
