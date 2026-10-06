@@ -846,6 +846,10 @@ def select_historical_operations(message: str) -> list[str]:
     for tool_name, phrases in DAXVIEW_TOOL_KEYWORDS.items():
         if any(phrase in lowered for phrase in phrases):
             operations.append(tool_name)
+    if wants_available_parameters_follow_up(message):
+        if "data_availability_summary" not in operations:
+            operations.append("data_availability_summary")
+        operations = [name for name in operations if name != "telemetry_timeseries"]
     if wants_device_inventory(message) and "site_device_list" not in operations:
         operations.append("site_device_list")
     if "current" in question_metrics(message) and "telemetry_timeseries" not in operations:
@@ -2223,6 +2227,9 @@ def summarize_demand_peak(data: dict, message: str, arguments: dict | None = Non
     latest_time = first_value(source, ("latest_at", "latest_timestamp", "last_seen"))
     if latest is not None:
         lines.append(f"Latest returned demand: {format_number(latest, 2)} kW" + (f" at {latest_time}" if latest_time else " (timestamp unavailable)"))
+    if source.get("source") == "manual calculation from telemetry_timeseries":
+        sample_count = source.get("sample_count")
+        lines.append(f"Calculation source: manual max from demand telemetry" + (f" ({sample_count} samples)." if sample_count else "."))
     if any(term in message.lower() for term in ("live", "real-time", "realtime", "current value")):
         lines.append("Live value: not provided by this historical demand tool; the latest returned value is not verified live.")
     return "\n".join(lines)
@@ -2396,20 +2403,14 @@ def refine_historical_answer_with_model(message: str, results: list[dict], deter
         compare_answer = ensure_historical_answer_coverage(message, results, deterministic_answer, compare_answer, request_id)
         debug_trace_event("mcp_answer_compare_selected", request_id=request_id, model=model, role="compare")
         comparison_answers.append((model, compare_answer))
-    if not comparison_answers:
-        return primary_answer
-    if not AI_COMPARE_MODEL_SHOW_TO_USER:
+    if comparison_answers:
         log_event(
             "mcp_answer_compare_hidden",
             request_id=request_id,
             primary_model=CHAT_MODEL,
             compare_models=[model for model, _ in comparison_answers],
         )
-        return primary_answer
-    return "\n\n".join(
-        [f"Primary model ({CHAT_MODEL})\n{primary_answer}"]
-        + [f"Alternative model view ({model})\n{answer}" for model, answer in comparison_answers]
-    )
+    return primary_answer
 
 
 def ensure_historical_answer_coverage(
@@ -2871,11 +2872,47 @@ def previous_daxview_turn(conversation_id: str, current_turn_id: str) -> dict | 
     )
 
 
+def first_device_id_from_text(text: str) -> int | None:
+    if not text:
+        return None
+    patterns = (
+        r"^\s*1\.\s+.+?\(ID\s+(\d+)\)",
+        r"Highest energy-consuming device:.+?\(ID\s+(\d+)\)",
+        r"Highest demand devices?.+?\(ID\s+(\d+)\)",
+        r"\b(?:device|meter)\s+ID\s+(\d+)\b",
+        r"\(ID\s+(\d+)\)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def wants_available_parameters_follow_up(message: str) -> bool:
+    lowered = message.lower()
+    return bool(
+        re.search(r"\b(?:continue|based on this|other parameter|other parameters|available parameter|available parameters|what else|anything else)\b", lowered)
+        and re.search(r"\b(?:device|parameter|metric|voltage|current|telemetry|available|continue)\b", lowered)
+    )
+
+
+def follow_up_metric_from_message(message: str) -> str | None:
+    metrics = question_metrics(message)
+    if metrics:
+        return metrics[0]
+    lowered = message.lower()
+    if re.search(r"\b(?:parameter|parameters|metric|metrics|available|what else)\b", lowered):
+        return "energy"
+    return None
+
+
 def resolve_follow_up_message(turn_id: str, message: str, context: dict, conversation_id: str, request_id: str) -> tuple[str, dict]:
     previous = previous_daxview_turn(conversation_id, turn_id)
     if not previous or not previous.get("user_message"):
         return message, context
     previous_message = str(previous["user_message"])
+    previous_answer = str(previous.get("assistant_reply") or "")
     previous_context = previous.get("context") if isinstance(previous.get("context"), dict) else {}
     previous_plan = previous.get("resolved_plan") if isinstance(previous.get("resolved_plan"), dict) else {}
     reusable = previous_plan.get("status") in {"ok", "no_data"} or not previous_plan
@@ -2893,9 +2930,29 @@ def resolve_follow_up_message(turn_id: str, message: str, context: dict, convers
     if requested_device_id(message) is not None:
         merged_context["device_id"] = requested_device_id(message)
     if not site_changed and not merged_context.get("device_id") and requested_device_id(message) is None:
-        previous_device_id = requested_device_id(previous_message)
+        previous_device_id = requested_device_id(previous_message) or first_device_id_from_text(previous_answer)
         if previous_device_id is not None:
             merged_context["device_id"] = previous_device_id
+    if wants_available_parameters_follow_up(message):
+        if not merged_context.get("device_id"):
+            inferred_device_id = first_device_id_from_text(previous_answer) or requested_device_id(previous_message)
+            if inferred_device_id:
+                merged_context["device_id"] = inferred_device_id
+        if follow_up_metric_from_message(message):
+            merged_context["metric"] = follow_up_metric_from_message(message)
+        if not has_time_scope(message):
+            merged_context.setdefault("_time_window", previous_context.get("_time_window") or default_historical_range())
+        resolved = message
+        if not select_historical_operations(resolved):
+            resolved = f"Check data availability and available telemetry parameters for device ID {merged_context.get('device_id', '')}".strip()
+        log_event(
+            "daxview_follow_up_resolved",
+            request_id=request_id,
+            turn_id=turn_id,
+            previous_turn_id=str(previous.get("id")),
+            inferred_device_id=merged_context.get("device_id"),
+        )
+        return resolved, merged_context
     if not is_follow_up_message(message) and (select_historical_operations(message) or not AI_CHAT_MEMORY_ENABLED):
         return message, merged_context
     if select_historical_operations(message):
@@ -3144,6 +3201,78 @@ def run_authorized_energy_prediction(turn_id: str, arguments: dict, request_id: 
     return {"structuredContent": {"data": prediction}}
 
 
+def demand_peak_needs_manual_fallback(mcp_result: dict) -> bool:
+    issue = result_problem(mcp_structured_result(mcp_result)) or result_problem(mcp_result)
+    if issue and "NO_DATA" in str(issue).upper():
+        return True
+    data = historical_result_data(mcp_result)
+    peak_keys = ("peak_kw", "max_demand_kw", "maximum_demand_kw", "peak_demand_kw", "max_kw")
+    if first_value(data, peak_keys) is not None:
+        return False
+    rows = first_list(data, ("rows", "items", "results", "data", "series", "buckets"))
+    return not any(isinstance(row, dict) and first_value(row, peak_keys) is not None for row in rows)
+
+
+def calculate_demand_peak_from_telemetry(mcp_result: dict, arguments: dict) -> dict | None:
+    data = historical_result_data(mcp_result, ("rows", "items", "results", "data", "series", "buckets", "points"))
+    rows = first_list(data, ("rows", "items", "results", "data", "series", "buckets", "points"))
+    candidates = []
+    value_keys = (
+        "demand_kw", "kw", "value_kw", "reading_kw", "value", "average",
+        "avg", "max", "maximum", "reading", "demand",
+    )
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        value = chart_value(row, value_keys)
+        if value is not None:
+            candidates.append((value, row))
+    if not candidates:
+        return None
+    peak, row = max(candidates, key=lambda item: item[0])
+    return {
+        "status": "ok",
+        "data": {
+            "peak_kw": round(float(peak), 4),
+            "peak_time": first_value(row, ("timestamp", "time", "bucket", "date", "start_time", "started_at")),
+            "source": "manual calculation from telemetry_timeseries",
+            "sample_count": len(candidates),
+            "calculation": "max(demand telemetry values)",
+            "start_time": arguments.get("start_time"),
+            "end_time": arguments.get("end_time"),
+            "device_id": arguments.get("device_id"),
+            "site_id": arguments.get("site_id"),
+            "building_id": arguments.get("building_id"),
+        },
+    }
+
+
+def try_manual_demand_peak_fallback(turn_id: str, arguments: dict, request_id: str) -> dict:
+    telemetry_args = dict(arguments)
+    telemetry_args["metric"] = "demand"
+    telemetry_args["bucket"] = telemetry_args.get("bucket") or "1h"
+    telemetry_args["aggregation"] = telemetry_args.get("aggregation") or "auto"
+    telemetry_args["limit"] = int(telemetry_args.get("limit") or 1000)
+    plan = request_daxview_data_plan(turn_id, "telemetry_timeseries", telemetry_args, request_id)
+    authorization_id = plan.get("authorization_id")
+    normalized = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else telemetry_args
+    if not authorization_id:
+        raise RuntimeError("Daxview did not return a data authorization for telemetry_timeseries")
+    telemetry_result = call_authorized_historical_tool("telemetry_timeseries", str(authorization_id), normalized, request_id)
+    calculated = calculate_demand_peak_from_telemetry(telemetry_result, normalized)
+    if not calculated:
+        raise RuntimeError("telemetry_timeseries returned no demand values that can be used for manual max-demand calculation")
+    return {
+        "operation_id": "demand_peak_summary",
+        "arguments": arguments,
+        "result": {"structuredContent": calculated},
+        "fallback": {
+            "source_tool": "telemetry_timeseries",
+            "arguments": {key: value for key, value in normalized.items() if key != "authorization_id"},
+        },
+    }
+
+
 def run_daxview_integration_turn(turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> dict:
     message, context = resolve_follow_up_message(turn_id, message, context, session_id, request_id)
     clarification = metric_clarification(message)
@@ -3245,6 +3374,12 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
             if not authorization_id:
                 raise RuntimeError(f"Daxview did not return a data authorization for {operation_id}")
             result = call_authorized_historical_tool(operation_id, str(authorization_id), normalized_arguments, request_id)
+            if operation_id == "demand_peak_summary" and demand_peak_needs_manual_fallback(result):
+                try:
+                    results.append(try_manual_demand_peak_fallback(turn_id, normalized_arguments, request_id))
+                    continue
+                except Exception as fallback_error:
+                    errors.append({"operation_id": "telemetry_timeseries", "metric": "demand", "error": str(fallback_error)})
             results.append(
                 {
                     "operation_id": operation_id,
@@ -5505,6 +5640,8 @@ class ChatHandler(BaseHTTPRequestHandler):
         if not message:
             self._send_json(400, {"error": "message is required"})
             return
+        if not session_id:
+            session_id = str(uuid.uuid4())
 
         request_id = str(uuid.uuid4())
         started_at = time.perf_counter()
@@ -5514,6 +5651,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             log_event("api_to_ui_error", request_id=request_id, error=str(error))
             self._send_json(503, {"error": str(error), "provider": "ollama"})
             return
+        response_payload["session_id"] = session_id
 
         trace = {
             "request_id": request_id,

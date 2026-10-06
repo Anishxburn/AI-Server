@@ -8,7 +8,7 @@ import re
 import statistics
 import unittest
 from unittest.mock import Mock
-from ems_contracts import question_metrics, metric_clarification, percentage_difference
+from ems_contracts import question_metrics, metric_clarification, percentage_difference, result_problem
 from contracts.tool_schemas import validate_tool_arguments
 
 
@@ -22,8 +22,9 @@ NAMES = (
     "reading_detail",
     "requested_question_parts", "completed_daily_range", "wants_device_usage_ranking", "wants_all_devices",
     "wants_lowest_consumer", "wants_top_lowest_sum", "wants_device_inventory", "wants_device_capability_discovery",
+    "wants_available_parameters_follow_up", "first_device_id_from_text", "follow_up_metric_from_message",
     "select_historical_operations", "build_historical_arguments", "requested_device_id",
-    "parse_datetime", "local_bucket_date", "first_list", "first_value", "predict_daily_energy",
+    "parse_datetime", "local_bucket_date", "first_dict_with_list", "first_list", "first_value", "predict_daily_energy",
     "is_follow_up_message", "resolve_follow_up_message", "needs_ems_library",
     "build_compliance_context", "has_time_scope", "first_regex_int", "needs_device_choice",
     "run_authorized_energy_prediction", "run_daxview_integration_turn",
@@ -33,7 +34,9 @@ NAMES = (
     "build_device_choice_response",
     "daxview_history_event",
     "wants_highest_demand_device", "choose_historical_operations",
-    "resolved_plan_for_result", "readable_historical_errors",
+    "resolved_plan_for_result", "readable_historical_errors", "refine_historical_answer_with_model",
+    "chart_number", "chart_value", "mcp_structured_result", "historical_result_data",
+    "demand_peak_needs_manual_fallback", "calculate_demand_peak_from_telemetry",
 )
 
 
@@ -46,10 +49,16 @@ def load_functions():
         "re": re, "statistics": statistics,
         "question_metrics": question_metrics, "metric_clarification": metric_clarification,
         "percentage_difference": percentage_difference,
+        "result_problem": result_problem,
         "validate_tool_arguments": validate_tool_arguments,
         "AI_CHAT_MEMORY_ENABLED": False,
         "AI_PLANNER_ENABLED": False,
         "AI_PLANNER_SHADOW_MODE": False,
+        "AI_REFINE_MCP_WITH_MODEL": True,
+        "AI_COMPARE_MODEL_ENABLED": False,
+        "AI_COMPARE_MODEL_SHOW_TO_USER": False,
+        "AI_COMPARE_MODELS": ["deepseek-r1:1.5b"],
+        "CHAT_MODEL": "qwen3:8b",
         "DAXVIEW_ALLOWED_HISTORICAL_TOOLS": next(
             ast.literal_eval(node.value)
             for node in TREE.body
@@ -157,6 +166,39 @@ class EmsPredictionTests(unittest.TestCase):
         })
         self.assertIn("AC kWh", answer)
         self.assertIn("Parameters: energy, voltage, current", answer)
+
+    def test_follow_up_infers_device_from_previous_ranked_answer(self):
+        self.env["AI_CHAT_MEMORY_ENABLED"] = True
+        self.env["previous_daxview_turn"] = Mock(return_value={
+            "id": "previous",
+            "user_message": "What is the top 5 highest consumption device for 3 days",
+            "assistant_reply": "1. UMG 604-PRO (ID 604): 8973282.19 kWh\n2. UMG 96S (ID 96): 878747.59 kWh",
+            "context": {"site_id": 17, "_time_window": {"start": "start", "end": "end", "timezone": "Asia/Kuala_Lumpur"}},
+            "resolved_plan": {"status": "ok", "slots": {"site_id": 17}},
+        })
+        self.env["log_event"] = Mock()
+        message, context = self.env["resolve_follow_up_message"](
+            "current",
+            "Can u continue to get me other parameter that is available for this device",
+            {"site_id": 17},
+            "conversation",
+            "request",
+        )
+        self.assertEqual(context["device_id"], 604)
+        self.assertEqual(context["metric"], "energy")
+        self.assertIn("data_availability_summary", self.env["select_historical_operations"](message))
+
+    def test_comparison_answer_never_injected_into_user_answer(self):
+        self.env["AI_COMPARE_MODEL_ENABLED"] = True
+        self.env["AI_COMPARE_MODEL_SHOW_TO_USER"] = True
+        self.env["build_mcp_refine_prompt"] = Mock(return_value="prompt")
+        self.env["run_mcp_refine_model"] = Mock(side_effect=["Primary only", "Alternative text"])
+        self.env["ensure_historical_answer_coverage"] = Mock(side_effect=lambda message, results, deterministic, answer, request: answer)
+        self.env["log_event"] = Mock()
+        self.env["debug_trace_event"] = Mock()
+        answer = self.env["refine_historical_answer_with_model"]("q", [], "fallback", "request")
+        self.assertEqual(answer, "Primary only")
+        self.assertNotIn("Alternative", answer)
 
     def test_ranking_sorts_numeric_usage_and_joins_current_status(self):
         self.env["historical_result_data"] = lambda result: result["data"]
@@ -445,6 +487,28 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertIn("Peak demand: 42.00 kW", answer)
         self.assertIn("Latest returned demand: 15.00 kW", answer)
         self.assertIn("Live value: not provided", answer)
+
+    def test_demand_no_data_triggers_manual_fallback(self):
+        self.assertTrue(self.env["demand_peak_needs_manual_fallback"]({
+            "structuredContent": {"status": "error", "error_code": "NO_DATA"}
+        }))
+        self.assertFalse(self.env["demand_peak_needs_manual_fallback"]({
+            "structuredContent": {"data": {"peak_kw": 42}}
+        }))
+
+    def test_manual_demand_fallback_calculates_peak_from_telemetry(self):
+        result = self.env["calculate_demand_peak_from_telemetry"](
+            {"structuredContent": {"data": {"rows": [
+                {"timestamp": "2026-10-01T08:00:00+08:00", "value": 12.5},
+                {"timestamp": "2026-10-01T09:00:00+08:00", "value": 44.25},
+                {"timestamp": "2026-10-01T10:00:00+08:00", "value": 18.0},
+            ]}}},
+            {"site_id": 17, "start_time": "start", "end_time": "end"},
+        )
+        self.assertEqual(result["data"]["peak_kw"], 44.25)
+        self.assertEqual(result["data"]["peak_time"], "2026-10-01T09:00:00+08:00")
+        self.assertEqual(result["data"]["sample_count"], 3)
+        self.assertEqual(result["data"]["source"], "manual calculation from telemetry_timeseries")
 
     def test_standards_are_not_added_to_routine_site_answer(self):
         self.assertEqual(self.env["build_compliance_context"]("Show site energy for the last 7 days", ["site_energy_summary"]), [])
