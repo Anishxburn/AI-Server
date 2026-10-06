@@ -3388,11 +3388,17 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
                 }
             )
         except Exception as error:
+            if operation_id == "demand_peak_summary":
+                try:
+                    results.append(try_manual_demand_peak_fallback(turn_id, arguments, request_id))
+                    continue
+                except Exception as fallback_error:
+                    errors.append({"operation_id": "telemetry_timeseries", "metric": "demand", "error": str(fallback_error)})
             metric_label = f":{metric}" if metric else ""
             errors.append({"operation_id": operation_id, "metric": metric, "error": str(error)})
             log_event("daxview_tool_step_failed", request_id=request_id, turn_id=turn_id, operation_id=operation_id, metric=metric, error=str(error))
             if len(operation_ids) == 1 and len(steps) == 1:
-                raise
+                break
     if not results:
         error_detail = "; ".join(
             f"{item['operation_id']}{':' + str(item.get('metric')) if item.get('metric') else ''}: {item['error']}"
