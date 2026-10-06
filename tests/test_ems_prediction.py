@@ -200,6 +200,19 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertEqual(answer, "Primary only")
         self.assertNotIn("Alternative", answer)
 
+    def test_generic_model_reply_falls_back_to_mcp_draft(self):
+        self.env["log_event"] = Mock()
+        deterministic = "Site devices returned by DaxView MCP:\n1. AC kWh (ID 519): online"
+        model_answer = "It seems like you might be testing the system or looking for a response to an empty input."
+        answer = self.env["ensure_historical_answer_coverage"](
+            "List all devices",
+            [{"operation_id": "site_device_list", "result": {"structuredContent": {"data": {"devices": []}}}}],
+            deterministic,
+            model_answer,
+            "request",
+        )
+        self.assertEqual(answer, deterministic)
+
     def test_ranking_sorts_numeric_usage_and_joins_current_status(self):
         self.env["historical_result_data"] = lambda result: result["data"]
         self.env["first_value"] = lambda row, keys: next((row[key] for key in keys if row.get(key) is not None), None)

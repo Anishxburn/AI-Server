@@ -2418,6 +2418,16 @@ def ensure_historical_answer_coverage(
 ) -> str:
     if not model_answer:
         return deterministic_answer
+    generic_failure_patterns = (
+        r"\bempty input\b",
+        r"\btesting the system\b",
+        r"\bhow can i assist you today\b",
+        r"\bplease let me know if you have any questions\b",
+        r"\bneed help with something specific\b",
+    )
+    if results and any(re.search(pattern, model_answer, flags=re.IGNORECASE) for pattern in generic_failure_patterns):
+        log_event("historical_answer_coverage_fallback", request_id=request_id, missing_items="generic_model_reply")
+        return deterministic_answer
     top_result = next((item for item in results if item.get("operation_id") == "telemetry_top_consumers"), None)
     if top_result and wants_device_usage_ranking(message):
         top_data = historical_result_data(top_result["result"])
@@ -5646,8 +5656,6 @@ class ChatHandler(BaseHTTPRequestHandler):
         if not message:
             self._send_json(400, {"error": "message is required"})
             return
-        if not session_id:
-            session_id = str(uuid.uuid4())
 
         request_id = str(uuid.uuid4())
         started_at = time.perf_counter()
@@ -5657,7 +5665,6 @@ class ChatHandler(BaseHTTPRequestHandler):
             log_event("api_to_ui_error", request_id=request_id, error=str(error))
             self._send_json(503, {"error": str(error), "provider": "ollama"})
             return
-        response_payload["session_id"] = session_id
 
         trace = {
             "request_id": request_id,
