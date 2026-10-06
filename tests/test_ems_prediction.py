@@ -30,13 +30,14 @@ NAMES = (
     "run_authorized_energy_prediction", "run_daxview_integration_turn",
     "build_charts_from_historical_results", "summarize_site_energy",
     "ensure_historical_answer_coverage", "ranked_consumer_rows", "summarize_top_consumers",
-    "summarize_historical_answers", "summarize_demand_peak", "summarize_site_devices", "device_selection_prompt_from_result",
+    "summarize_historical_answer", "summarize_historical_answers", "summarize_demand_peak", "summarize_site_devices", "device_selection_prompt_from_result",
     "build_device_choice_response",
     "daxview_history_event",
     "wants_highest_demand_device", "choose_historical_operations",
     "resolved_plan_for_result", "readable_historical_errors", "refine_historical_answer_with_model",
     "chart_number", "chart_value", "mcp_structured_result", "historical_result_data",
     "demand_peak_needs_manual_fallback", "calculate_demand_peak_from_telemetry",
+    "try_top_consumers_breakdown_fallback",
 )
 
 
@@ -240,6 +241,40 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertIn("High meter (ID 1): offline", answer)
         self.assertIn("Missing meter (ID 3)", answer)
         self.assertIn("usage not returned, so not ranked", answer)
+
+    def test_top_consumers_falls_back_to_device_energy_breakdown(self):
+        self.env["resolve_follow_up_message"] = Mock(side_effect=lambda turn, message, context, conversation, request: (message, context))
+        self.env["request_daxview_data_plan"] = Mock(side_effect=[
+            {"authorization_id": "top-auth", "arguments": {"site_id": 17, "start": "start", "end": "end", "timezone": "Asia/Kuala_Lumpur", "limit": 5}},
+            {"authorization_id": "breakdown-auth", "arguments": {"site_id": 17, "start": "start", "end": "end", "timezone": "Asia/Kuala_Lumpur", "limit": 5}},
+        ])
+        self.env["call_authorized_historical_tool"] = Mock(side_effect=[
+            RuntimeError("telemetry_top_consumers could not return valid data: DAXVIEW_UNAVAILABLE"),
+            {"data": {"rows": [
+                {"device_id": 1, "device_name": "High meter", "energy_kwh": 30},
+                {"device_id": 2, "device_name": "Low meter", "energy_kwh": 12},
+            ], "unit": "kWh"}},
+        ])
+        self.env["format_time_window"] = lambda data, arguments: "last 3 days"
+        self.env["format_number"] = lambda value, precision=2: f"{value:.2f}"
+        self.env["reading_detail"] = lambda *args: None
+        self.env["refine_historical_answer_with_model"] = Mock(side_effect=lambda message, results, draft, request: draft)
+        self.env["build_charts_from_historical_results"] = Mock(return_value=[])
+        self.env["debug_trace_event"] = Mock()
+        self.env["save_resolved_turn_context"] = Mock()
+        result = self.env["run_daxview_integration_turn"](
+            "turn", "What is the top 5 highest consumption device for 3 days", {"site_id": 17}, "request", "conversation"
+        )
+        self.assertIn("High meter", result["reply"])
+        self.assertIn("30.00 kWh", result["reply"])
+        self.assertEqual(result["resolved_plan"]["status"], "ok")
+        self.assertEqual(result["resolved_plan"]["tools"][0]["tool"], "telemetry_top_consumers")
+        self.env["call_authorized_historical_tool"].assert_any_call(
+            "device_energy_breakdown",
+            "breakdown-auth",
+            {"site_id": 17, "start": "start", "end": "end", "timezone": "Asia/Kuala_Lumpur", "limit": 5},
+            "request",
+        )
 
     def test_model_cannot_drop_ranked_device(self):
         self.env["historical_result_data"] = lambda result: result["data"]

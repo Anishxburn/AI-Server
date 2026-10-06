@@ -1625,7 +1625,9 @@ def ranked_consumer_rows(data: dict) -> tuple[list[tuple[dict, float]], list[dic
             continue
         value = first_value(row, (
             "value", "kwh", "total_kwh", "consumption", "energy",
-            "consumption_delta", "stored_consumption_delta_sum",
+            "energy_kwh", "total_energy", "total_energy_kwh", "device_energy_kwh",
+            "contribution_kwh", "usage_kwh", "consumption_delta",
+            "stored_consumption_delta_sum",
         ))
         try:
             amount = float(value)
@@ -2667,7 +2669,12 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
         for row in rows[:10]:
             if not isinstance(row, dict):
                 continue
-            value = chart_value(row, ("value", "kwh", "total_kwh", "consumption", "energy", "consumption_delta"))
+            value = chart_value(row, (
+                "value", "kwh", "total_kwh", "consumption", "energy",
+                "energy_kwh", "total_energy", "total_energy_kwh",
+                "device_energy_kwh", "contribution_kwh", "usage_kwh",
+                "consumption_delta",
+            ))
             if value is not None:
                 labels.append(chart_label(row, "device"))
                 values.append(value)
@@ -3283,6 +3290,30 @@ def try_manual_demand_peak_fallback(turn_id: str, arguments: dict, request_id: s
     }
 
 
+def try_top_consumers_breakdown_fallback(turn_id: str, arguments: dict, request_id: str) -> dict:
+    breakdown_args = {
+        key: arguments[key]
+        for key in ("site_id", "building_id", "start", "end", "timezone", "limit")
+        if key in arguments
+    }
+    breakdown_args["limit"] = int(breakdown_args.get("limit") or 20)
+    plan = request_daxview_data_plan(turn_id, "device_energy_breakdown", breakdown_args, request_id)
+    authorization_id = plan.get("authorization_id")
+    normalized = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else breakdown_args
+    if not authorization_id:
+        raise RuntimeError("Daxview did not return a data authorization for device_energy_breakdown")
+    result = call_authorized_historical_tool("device_energy_breakdown", str(authorization_id), normalized, request_id)
+    return {
+        "operation_id": "telemetry_top_consumers",
+        "arguments": {**normalized, "limit": int(normalized.get("limit") or breakdown_args["limit"])},
+        "result": result,
+        "fallback": {
+            "source_tool": "device_energy_breakdown",
+            "arguments": {key: value for key, value in normalized.items() if key != "authorization_id"},
+        },
+    }
+
+
 def run_daxview_integration_turn(turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> dict:
     message, context = resolve_follow_up_message(turn_id, message, context, session_id, request_id)
     clarification = metric_clarification(message)
@@ -3398,6 +3429,12 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
                 }
             )
         except Exception as error:
+            if operation_id == "telemetry_top_consumers":
+                try:
+                    results.append(try_top_consumers_breakdown_fallback(turn_id, arguments, request_id))
+                    continue
+                except Exception as fallback_error:
+                    errors.append({"operation_id": "device_energy_breakdown", "error": str(fallback_error)})
             if operation_id == "demand_peak_summary":
                 try:
                     results.append(try_manual_demand_peak_fallback(turn_id, arguments, request_id))
