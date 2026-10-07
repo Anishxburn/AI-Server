@@ -115,7 +115,7 @@ class EmsPredictionTests(unittest.TestCase):
         arguments = self.env["build_historical_arguments"]("telemetry_timeseries", {"site_id": 17}, question)
         self.assertEqual(arguments["device_id"], 519)
         self.assertEqual(arguments["metric"], "energy")
-        self.assertIn("value_mode", arguments)
+        self.assertNotIn("value_mode", arguments)
 
     def test_device_ranking_uses_consumers_and_status_not_site_daily_totals(self):
         question = "Which devices contributed most to energy use during that period? Show the top five and tell me which are offline."

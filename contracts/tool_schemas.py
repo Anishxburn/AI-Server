@@ -69,7 +69,7 @@ class TelemetryTimeseries(TimeScope):
     metric: Literal["energy", "demand", "current", "voltage", "power_factor", "frequency", "thd"] | str
     bucket: str = "1d"
     aggregation: str = "auto"
-    value_mode: str = "auto"
+    value_mode: str | None = None
     limit: int = 500
 
 

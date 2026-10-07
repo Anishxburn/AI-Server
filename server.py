@@ -1294,7 +1294,8 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
         args["end_time"] = args.pop("end")
         args["bucket"] = str(context.get("bucket") or ("1h" if "hour" in message.lower() else "1d"))
         args["aggregation"] = str(context.get("aggregation") or "auto")
-        args["value_mode"] = str(context.get("value_mode") or "auto")
+        if context.get("value_mode"):
+            args["value_mode"] = str(context["value_mode"])
         args["limit"] = int(context.get("limit") or 500)
     elif operation_id == "active_alarm_summary":
         args["limit"] = int(context.get("limit") or 50)
@@ -1418,6 +1419,7 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
             "limit",
             "metric",
             "aggregation",
+            "value_mode",
             "forecast_start",
             "forecast_end",
             "training_days",
@@ -3387,7 +3389,6 @@ def try_manual_demand_peak_fallback(turn_id: str, arguments: dict, request_id: s
     telemetry_args["metric"] = "demand"
     telemetry_args["bucket"] = telemetry_args.get("bucket") or "1h"
     telemetry_args["aggregation"] = telemetry_args.get("aggregation") or "auto"
-    telemetry_args["value_mode"] = telemetry_args.get("value_mode") or "auto"
     telemetry_args["limit"] = int(telemetry_args.get("limit") or 1000)
     plan = request_daxview_data_plan(turn_id, "telemetry_timeseries", telemetry_args, request_id)
     authorization_id = plan.get("authorization_id")
