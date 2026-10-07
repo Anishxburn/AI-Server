@@ -22,8 +22,9 @@ NAMES = (
     "reading_detail",
     "requested_question_parts", "completed_daily_range", "wants_device_usage_ranking", "wants_all_devices",
     "wants_lowest_consumer", "wants_top_lowest_sum", "wants_device_inventory", "wants_device_capability_discovery",
-    "wants_available_parameters_follow_up", "explicit_mcp_tool_request", "first_device_id_from_text", "follow_up_metric_from_message",
-    "select_historical_operations", "build_historical_arguments", "requested_device_id",
+    "wants_available_parameters_follow_up", "select_historical_operations_without_device_timeseries",
+    "wants_device_metric_timeseries", "explicit_mcp_tool_request", "first_device_id_from_text", "follow_up_metric_from_message",
+    "select_historical_operations", "build_historical_arguments", "requested_device_id", "requested_metric",
     "parse_datetime", "local_bucket_date", "first_dict_with_list", "first_list", "first_value", "predict_daily_energy",
     "format_coverage_note", "is_follow_up_message", "resolve_follow_up_message", "needs_ems_library",
     "build_compliance_context", "has_time_scope", "first_regex_int", "needs_device_choice",
@@ -102,6 +103,19 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertEqual(self.env["select_historical_operations"](question), ["site_energy_summary"])
         self.assertEqual(self.env["requested_energy_extrema"](question), (True, True))
         self.assertEqual(len(self.env["requested_question_parts"](question)), 2)
+
+    def test_device_energy_question_uses_timeseries_not_site_summary(self):
+        question = "What is the energy consumption for device ID 519 for the last 7 days? Show value and unit."
+        self.assertEqual(self.env["select_historical_operations"](question), ["telemetry_timeseries"])
+        self.env["requested_historical_range"] = Mock(return_value={
+            "start": "2026-10-01T00:00:00+00:00",
+            "end": "2026-10-08T00:00:00+00:00",
+            "timezone": "Asia/Kuala_Lumpur",
+        })
+        arguments = self.env["build_historical_arguments"]("telemetry_timeseries", {"site_id": 17}, question)
+        self.assertEqual(arguments["device_id"], 519)
+        self.assertEqual(arguments["metric"], "energy")
+        self.assertIn("value_mode", arguments)
 
     def test_device_ranking_uses_consumers_and_status_not_site_daily_totals(self):
         question = "Which devices contributed most to energy use during that period? Show the top five and tell me which are offline."

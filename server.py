@@ -855,6 +855,27 @@ def wants_device_capability_discovery(message: str) -> bool:
     return wants_device_inventory(message) and bool(re.search(r"\b(?:voltage|current|telemetry|trend|data|capabilit|parameter|testing)\b", lowered))
 
 
+def wants_device_metric_timeseries(message: str) -> bool:
+    if requested_device_id(message) is None:
+        return False
+    lowered = message.lower()
+    if "demand_peak_summary" in select_historical_operations_without_device_timeseries(message):
+        return False
+    return bool(
+        question_metrics(message)
+        or re.search(r"\b(?:energy|kwh|consumption|usage|demand|kw|voltage|current|power factor|frequency|thd)\b", lowered)
+    )
+
+
+def select_historical_operations_without_device_timeseries(message: str) -> list[str]:
+    lowered = message.lower()
+    operations = []
+    for tool_name, phrases in DAXVIEW_TOOL_KEYWORDS.items():
+        if any(phrase in lowered for phrase in phrases):
+            operations.append(tool_name)
+    return operations
+
+
 def explicit_mcp_tool_request(message: str) -> str | None:
     lowered = message.lower()
     match = re.search(r"\b(?:test|call|run|use)\s+(?:the\s+)?(?:mcp\s+)?tool\s+([a-z_][a-z0-9_]*)\b", lowered)
@@ -871,10 +892,11 @@ def select_historical_operations(message: str) -> list[str]:
     if explicit_tool:
         return [explicit_tool]
     lowered = message.lower()
-    operations = []
-    for tool_name, phrases in DAXVIEW_TOOL_KEYWORDS.items():
-        if any(phrase in lowered for phrase in phrases):
-            operations.append(tool_name)
+    operations = select_historical_operations_without_device_timeseries(message)
+    if wants_device_metric_timeseries(message):
+        operations = [name for name in operations if name != "site_energy_summary"]
+        if "telemetry_timeseries" not in operations:
+            operations.append("telemetry_timeseries")
     if wants_available_parameters_follow_up(message):
         if "data_availability_summary" not in operations:
             operations.append("data_availability_summary")
