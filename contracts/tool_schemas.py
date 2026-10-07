@@ -69,7 +69,22 @@ class TelemetryTimeseries(TimeScope):
     metric: Literal["energy", "demand", "current", "voltage", "power_factor", "frequency", "thd"] | str
     bucket: str = "1d"
     aggregation: str = "auto"
+    value_mode: str = "auto"
     limit: int = 500
+
+
+class TelemetryMetricCatalog(SiteScope):
+    device_id: int | None = None
+    start_time: str | None = None
+    end_time: str | None = None
+    timezone: str = "Asia/Kuala_Lumpur"
+    limit: int = 100
+
+
+class LatestTelemetrySnapshot(SiteScope):
+    device_id: int | None = None
+    metrics: list[str] | None = None
+    limit: int = 100
 
 
 class ActiveAlarmSummary(SiteScope):
@@ -111,6 +126,7 @@ class TariffCostSummary(TimeScope):
 
 
 class DeviceEnergyBreakdown(WindowScope):
+    group_by: str = "device"
     limit: int = 20
 
 
@@ -137,6 +153,8 @@ TOOL_SCHEMAS: dict[str, type[StrictModel]] = {
     "site_metadata_summary": SiteMetadataSummary,
     "site_device_list": SiteDeviceList,
     "telemetry_timeseries": TelemetryTimeseries,
+    "telemetry_metric_catalog": TelemetryMetricCatalog,
+    "latest_telemetry_snapshot": LatestTelemetrySnapshot,
     "active_alarm_summary": ActiveAlarmSummary,
     "meter_status_summary": MeterStatusSummary,
     "energy_comparison_summary": EnergyComparisonSummary,

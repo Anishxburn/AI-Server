@@ -90,6 +90,8 @@ DAXVIEW_ALLOWED_HISTORICAL_TOOLS = {
     "site_metadata_summary",
     "site_device_list",
     "telemetry_timeseries",
+    "telemetry_metric_catalog",
+    "latest_telemetry_snapshot",
     "active_alarm_summary",
     "meter_status_summary",
     "energy_comparison_summary",
@@ -166,6 +168,16 @@ DAXVIEW_TOOL_KEYWORDS = {
         "trend", "timeseries", "time series", "chart", "plot", "hourly",
         "voltage trend", "power factor", "thd trend", "kwh trend",
     },
+    "telemetry_metric_catalog": {
+        "available metrics", "available metric", "supported metrics", "supported metric",
+        "metric catalog", "telemetry catalog", "what data can i get",
+        "what metrics", "which metrics", "which devices support", "supports voltage",
+        "supports current", "can i get voltage", "can i get current",
+    },
+    "latest_telemetry_snapshot": {
+        "latest reading", "latest readings", "latest telemetry", "current reading",
+        "current value", "latest value", "now reading", "snapshot",
+    },
     "active_alarm_summary": {
         "active alarm", "active alarms", "current alarm", "current alarms",
         "open alarm", "open alarms", "unresolved alarm", "critical alarms",
@@ -224,6 +236,8 @@ DAXVIEW_TOOL_DESCRIPTIONS = {
     "site_metadata_summary": "Return site/building/device/meter metadata counts.",
     "site_device_list": "List devices/meters in the scoped site/building.",
     "telemetry_timeseries": "Return a device metric trend such as voltage/current/energy.",
+    "telemetry_metric_catalog": "Discover available telemetry metrics and coverage by device.",
+    "latest_telemetry_snapshot": "Return latest persisted telemetry readings by device/metric.",
     "active_alarm_summary": "Return currently active/open alarms.",
     "meter_status_summary": "Return device/meter online/offline/stale state.",
     "energy_comparison_summary": "Compare two energy periods.",
@@ -1199,6 +1213,7 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
         "site_energy_summary",
         "alarm_frequency_summary",
         "telemetry_timeseries",
+        "telemetry_metric_catalog",
         "energy_comparison_summary",
         "data_availability_summary",
         "power_quality_summary",
@@ -1221,6 +1236,18 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
             args.update(completed_daily_range(message) or {})
     elif operation_id == "site_device_list":
         args["limit"] = int(context.get("limit") or 100)
+    elif operation_id == "telemetry_metric_catalog":
+        if "start" in args:
+            args["start_time"] = args.pop("start")
+            args["end_time"] = args.pop("end")
+        args["limit"] = int(context.get("limit") or 100)
+    elif operation_id == "latest_telemetry_snapshot":
+        metrics = question_metrics(message)
+        if context.get("metric"):
+            metrics = [str(context["metric"])]
+        if metrics:
+            args["metrics"] = metrics
+        args["limit"] = int(context.get("limit") or 100)
     elif operation_id == "telemetry_timeseries":
         if not device_id:
             raise ValueError("device_id is required for telemetry timeseries")
@@ -1229,6 +1256,7 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
         args["end_time"] = args.pop("end")
         args["bucket"] = str(context.get("bucket") or ("1h" if "hour" in message.lower() else "1d"))
         args["aggregation"] = str(context.get("aggregation") or "auto")
+        args["value_mode"] = str(context.get("value_mode") or "auto")
         args["limit"] = int(context.get("limit") or 500)
     elif operation_id == "active_alarm_summary":
         args["limit"] = int(context.get("limit") or 50)
@@ -1284,6 +1312,7 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
         args["start_time"] = args.pop("start")
         args["end_time"] = args.pop("end")
     elif operation_id == "device_energy_breakdown":
+        args["group_by"] = str(context.get("group_by") or "device")
         args["limit"] = int(context.get("limit") or 20)
     elif operation_id == "energy_forecast":
         forecast_days = requested_forecast_days(message) or int(context.get("forecast_days") or 7)
@@ -2147,6 +2176,9 @@ def summarize_generic_tool(operation_id: str, data: dict) -> str:
             "rows",
             "items",
             "devices",
+            "metrics",
+            "available_metrics",
+            "readings",
             "alarms",
             "series",
             "forecast",
