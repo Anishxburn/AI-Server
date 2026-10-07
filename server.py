@@ -3365,6 +3365,7 @@ def try_manual_demand_peak_fallback(turn_id: str, arguments: dict, request_id: s
     telemetry_args["metric"] = "demand"
     telemetry_args["bucket"] = telemetry_args.get("bucket") or "1h"
     telemetry_args["aggregation"] = telemetry_args.get("aggregation") or "auto"
+    telemetry_args["value_mode"] = telemetry_args.get("value_mode") or "auto"
     telemetry_args["limit"] = int(telemetry_args.get("limit") or 1000)
     plan = request_daxview_data_plan(turn_id, "telemetry_timeseries", telemetry_args, request_id)
     authorization_id = plan.get("authorization_id")
