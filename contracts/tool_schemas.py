@@ -104,7 +104,7 @@ class EnergyComparisonSummary(SiteScope):
 
 
 class DataAvailabilitySummary(TimeScope):
-    metric: str
+    metric: str | None = None
     device_id: int | None = None
 
 
@@ -125,7 +125,7 @@ class TariffCostSummary(TimeScope):
     device_id: int | None = None
 
 
-class DeviceEnergyBreakdown(WindowScope):
+class DeviceEnergyBreakdown(TimeScope):
     group_by: str = "device"
     limit: int = 20
 
@@ -137,12 +137,12 @@ class EnergyForecast(SiteScope):
     timezone: str = "Asia/Kuala_Lumpur"
 
 
-class AnomalyDetectionSummary(WindowScope):
+class AnomalyDetectionSummary(TimeScope):
     device_id: int | None = None
     limit: int = 20
 
 
-class ReportSummary(WindowScope):
+class ReportSummary(TimeScope):
     pass
 
 

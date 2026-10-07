@@ -854,7 +854,21 @@ def wants_device_capability_discovery(message: str) -> bool:
     return wants_device_inventory(message) and bool(re.search(r"\b(?:voltage|current|telemetry|trend|data|capabilit|parameter|testing)\b", lowered))
 
 
+def explicit_mcp_tool_request(message: str) -> str | None:
+    lowered = message.lower()
+    match = re.search(r"\b(?:test|call|run|use)\s+(?:the\s+)?(?:mcp\s+)?tool\s+([a-z_][a-z0-9_]*)\b", lowered)
+    if match and match.group(1) in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
+        return match.group(1)
+    for tool_name in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
+        if re.search(rf"\b(?:test|call|run|use)\s+{re.escape(tool_name)}\b", lowered):
+            return tool_name
+    return None
+
+
 def select_historical_operations(message: str) -> list[str]:
+    explicit_tool = explicit_mcp_tool_request(message)
+    if explicit_tool:
+        return [explicit_tool]
     lowered = message.lower()
     operations = []
     for tool_name, phrases in DAXVIEW_TOOL_KEYWORDS.items():
@@ -1219,6 +1233,7 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
         "power_quality_summary",
         "demand_peak_summary",
         "tariff_cost_summary",
+        "device_energy_breakdown",
         "energy_forecast",
         "anomaly_detection_summary",
         "report_summary",
@@ -1296,7 +1311,8 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
             args["period_a_start"] = prev_start.isoformat()
             args["period_a_end"] = start
     elif operation_id == "data_availability_summary":
-        args["metric"] = context.get("metric") or requested_metric(message)
+        if context.get("metric") or question_metrics(message):
+            args["metric"] = context.get("metric") or requested_metric(message)
         args["start_time"] = args.pop("start")
         args["end_time"] = args.pop("end")
     elif operation_id == "alarm_detail_lookup":
@@ -1312,6 +1328,8 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
         args["start_time"] = args.pop("start")
         args["end_time"] = args.pop("end")
     elif operation_id == "device_energy_breakdown":
+        args["start_time"] = args.pop("start")
+        args["end_time"] = args.pop("end")
         args["group_by"] = str(context.get("group_by") or "device")
         args["limit"] = int(context.get("limit") or 20)
     elif operation_id == "energy_forecast":
@@ -1325,7 +1343,12 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
         args["forecast_end"] = (forecast_start + timedelta(days=forecast_days)).isoformat()
         args["training_days"] = history_days
     elif operation_id == "anomaly_detection_summary":
+        args["start_time"] = args.pop("start")
+        args["end_time"] = args.pop("end")
         args["limit"] = int(context.get("limit") or 20)
+    elif operation_id == "report_summary":
+        args["start_time"] = args.pop("start")
+        args["end_time"] = args.pop("end")
     return validate_tool_arguments(operation_id, args)
 
 
@@ -3325,9 +3348,13 @@ def try_manual_demand_peak_fallback(turn_id: str, arguments: dict, request_id: s
 def try_top_consumers_breakdown_fallback(turn_id: str, arguments: dict, request_id: str) -> dict:
     breakdown_args = {
         key: arguments[key]
-        for key in ("site_id", "building_id", "start", "end", "timezone", "limit")
+        for key in ("site_id", "building_id", "start", "end", "start_time", "end_time", "timezone", "limit")
         if key in arguments
     }
+    if "start" in breakdown_args:
+        breakdown_args["start_time"] = breakdown_args.pop("start")
+    if "end" in breakdown_args:
+        breakdown_args["end_time"] = breakdown_args.pop("end")
     breakdown_args["limit"] = int(breakdown_args.get("limit") or 20)
     plan = request_daxview_data_plan(turn_id, "device_energy_breakdown", breakdown_args, request_id)
     authorization_id = plan.get("authorization_id")

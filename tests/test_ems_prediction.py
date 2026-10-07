@@ -22,7 +22,7 @@ NAMES = (
     "reading_detail",
     "requested_question_parts", "completed_daily_range", "wants_device_usage_ranking", "wants_all_devices",
     "wants_lowest_consumer", "wants_top_lowest_sum", "wants_device_inventory", "wants_device_capability_discovery",
-    "wants_available_parameters_follow_up", "first_device_id_from_text", "follow_up_metric_from_message",
+    "wants_available_parameters_follow_up", "explicit_mcp_tool_request", "first_device_id_from_text", "follow_up_metric_from_message",
     "select_historical_operations", "build_historical_arguments", "requested_device_id",
     "parse_datetime", "local_bucket_date", "first_dict_with_list", "first_list", "first_value", "predict_daily_energy",
     "is_follow_up_message", "resolve_follow_up_message", "needs_ems_library",
@@ -463,6 +463,27 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertIn("demand_peak_summary", self.env["select_historical_operations"](message))
         self.assertFalse(self.env["needs_device_choice"](message))
         self.assertEqual(context["site_id"], 17)
+
+    def test_explicit_mcp_tool_request_uses_only_named_tool(self):
+        question = "Test MCP tool telemetry_metric_catalog for this site and show devices and metrics"
+        self.assertEqual(self.env["explicit_mcp_tool_request"](question), "telemetry_metric_catalog")
+        self.assertEqual(self.env["select_historical_operations"](question), ["telemetry_metric_catalog"])
+
+    def test_device_energy_breakdown_uses_new_time_scope(self):
+        self.env["requested_historical_range"] = Mock(return_value={
+            "start": "2026-10-01T00:00:00+00:00",
+            "end": "2026-10-02T00:00:00+00:00",
+            "timezone": "Asia/Kuala_Lumpur",
+        })
+        arguments = self.env["build_historical_arguments"](
+            "device_energy_breakdown",
+            {"site_id": 17},
+            "Break down this site's energy by device for last 7 days",
+        )
+        self.assertIn("start_time", arguments)
+        self.assertIn("end_time", arguments)
+        self.assertNotIn("start", arguments)
+        self.assertNotIn("end", arguments)
 
     def test_displayed_device_id_does_not_trigger_choice_again(self):
         question = "(ID 519, Online, Virtual) I want max demand for this device for the last 7 days"
