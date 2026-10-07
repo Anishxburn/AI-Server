@@ -51,6 +51,7 @@ RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.2"))
 TRACE_LIMIT = int(os.getenv("CHATBOT_TRACE_LIMIT", "25"))
 AI_DEBUG_DASHBOARD_ENABLED = os.getenv("AI_DEBUG_DASHBOARD_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 AI_REFINE_MCP_WITH_MODEL = os.getenv("AI_REFINE_MCP_WITH_MODEL", "true").lower() in {"1", "true", "yes", "on"}
+AI_MCP_FALLBACKS_ENABLED = os.getenv("AI_MCP_FALLBACKS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 AI_CHARTS_ENABLED = os.getenv("AI_CHARTS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 AI_PLANNER_ENABLED = os.getenv("AI_PLANNER_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 AI_PLANNER_SHADOW_MODE = os.getenv("AI_PLANNER_SHADOW_MODE", "false").lower() in {"1", "true", "yes", "on"}
@@ -3519,7 +3520,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
             if not authorization_id:
                 raise RuntimeError(f"Daxview did not return a data authorization for {operation_id}")
             result = call_authorized_historical_tool(operation_id, str(authorization_id), normalized_arguments, request_id)
-            if operation_id == "demand_peak_summary" and demand_peak_needs_manual_fallback(result):
+            if AI_MCP_FALLBACKS_ENABLED and operation_id == "demand_peak_summary" and demand_peak_needs_manual_fallback(result):
                 try:
                     results.append(try_manual_demand_peak_fallback(turn_id, normalized_arguments, request_id))
                     continue
@@ -3533,13 +3534,13 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
                 }
             )
         except Exception as error:
-            if operation_id == "telemetry_top_consumers":
+            if AI_MCP_FALLBACKS_ENABLED and operation_id == "telemetry_top_consumers":
                 try:
                     results.append(try_top_consumers_breakdown_fallback(turn_id, arguments, request_id))
                     continue
                 except Exception as fallback_error:
                     errors.append({"operation_id": "device_energy_breakdown", "error": str(fallback_error)})
-            if operation_id == "demand_peak_summary":
+            if AI_MCP_FALLBACKS_ENABLED and operation_id == "demand_peak_summary":
                 try:
                     results.append(try_manual_demand_peak_fallback(turn_id, arguments, request_id))
                     continue

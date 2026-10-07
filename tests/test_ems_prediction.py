@@ -56,6 +56,7 @@ def load_functions():
         "AI_PLANNER_ENABLED": False,
         "AI_PLANNER_SHADOW_MODE": False,
         "AI_REFINE_MCP_WITH_MODEL": True,
+        "AI_MCP_FALLBACKS_ENABLED": True,
         "AI_COMPARE_MODEL_ENABLED": False,
         "AI_COMPARE_MODEL_SHOW_TO_USER": False,
         "AI_COMPARE_MODELS": ["deepseek-r1:1.5b"],
@@ -275,6 +276,26 @@ class EmsPredictionTests(unittest.TestCase):
             {"site_id": 17, "start_time": "start", "end_time": "end", "timezone": "Asia/Kuala_Lumpur", "limit": 5},
             "request",
         )
+
+    def test_top_consumers_can_disable_fallback_for_raw_mcp_testing(self):
+        self.env["AI_MCP_FALLBACKS_ENABLED"] = False
+        self.env["resolve_follow_up_message"] = Mock(side_effect=lambda turn, message, context, conversation, request: (message, context))
+        self.env["request_daxview_data_plan"] = Mock(return_value={
+            "authorization_id": "top-auth",
+            "arguments": {"site_id": 17, "start": "start", "end": "end", "timezone": "Asia/Kuala_Lumpur", "limit": 5},
+        })
+        self.env["call_authorized_historical_tool"] = Mock(
+            side_effect=RuntimeError("telemetry_top_consumers could not return valid data: BACKEND_UNAVAILABLE")
+        )
+        self.env["log_event"] = Mock()
+        self.env["debug_trace_event"] = Mock()
+        self.env["save_resolved_turn_context"] = Mock()
+        result = self.env["run_daxview_integration_turn"](
+            "turn", "List out top 5 highest energy consumption device and it value", {"site_id": 17}, "request", "conversation"
+        )
+        self.assertIn("telemetry_top_consumers is currently unavailable", result["reply"])
+        self.assertNotIn("device_energy_breakdown", result["reply"])
+        self.env["request_daxview_data_plan"].assert_called_once()
 
     def test_generic_summary_prioritizes_values_before_metadata_overflow(self):
         answer = self.env["summarize_generic_tool"]("latest_telemetry_snapshot", {
