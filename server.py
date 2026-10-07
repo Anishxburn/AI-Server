@@ -1434,7 +1434,24 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
     )
     try:
         with urlopen(request, timeout=DAXVIEW_MCP_TIMEOUT) as response:
-            return json.loads(response.read().decode("utf-8"))
+            plan = json.loads(response.read().decode("utf-8"))
+            log_event(
+                "daxview_data_plan_response",
+                request_id=request_id,
+                turn_id=turn_id,
+                operation_id=operation_id,
+                has_authorization=bool(plan.get("authorization_id")),
+                arguments=redact_debug_value(plan.get("arguments") if isinstance(plan.get("arguments"), dict) else {}),
+            )
+            debug_trace_event(
+                "daxview_data_plan_response_debug",
+                request_id=request_id,
+                turn_id=turn_id,
+                operation_id=operation_id,
+                has_authorization=bool(plan.get("authorization_id")),
+                arguments=redact_debug_value(plan.get("arguments") if isinstance(plan.get("arguments"), dict) else {}),
+            )
+            return plan
     except HTTPError as error:
         body = error.read().decode("utf-8", errors="replace")[:1000]
         safe_body = body
