@@ -2213,17 +2213,57 @@ def summarize_generic_tool(operation_id: str, data: dict) -> str:
     )
     if rows:
         lines.append("Rows:")
+        preferred_row_keys = (
+            "device_id",
+            "device_name",
+            "name",
+            "metric",
+            "canonical_metric",
+            "source_metric",
+            "value",
+            "reading",
+            "latest_value",
+            "latest",
+            "kwh",
+            "total_kwh",
+            "energy_kwh",
+            "kw",
+            "demand_kw",
+            "peak_kw",
+            "current",
+            "current_a",
+            "voltage",
+            "voltage_v",
+            "unit",
+            "reading_unit",
+            "timestamp",
+            "time",
+            "last_seen",
+            "last_timestamp",
+            "sample_count",
+            "coverage_percent",
+        )
         for index, row in enumerate(rows[:10], 1):
             if not isinstance(row, dict):
                 lines.append(f"{index}. {row}")
                 continue
             parts = []
-            for key, value in row.items():
+            used_keys = set()
+            for key in preferred_row_keys:
+                value = row.get(key)
                 if value is None or isinstance(value, (dict, list)):
                     continue
                 parts.append(f"{key}={value}")
-                if len(parts) >= 6:
+                used_keys.add(key)
+                if len(parts) >= 10:
                     break
+            if len(parts) < 10:
+                for key, value in row.items():
+                    if key in used_keys or value is None or isinstance(value, (dict, list)):
+                        continue
+                    parts.append(f"{key}={value}")
+                    if len(parts) >= 10:
+                        break
             lines.append(f"{index}. " + ", ".join(parts))
         if len(rows) > 10:
             lines.append(f"Showing 10 of {len(rows)} row(s).")
@@ -3359,6 +3399,11 @@ def try_top_consumers_breakdown_fallback(turn_id: str, arguments: dict, request_
     plan = request_daxview_data_plan(turn_id, "device_energy_breakdown", breakdown_args, request_id)
     authorization_id = plan.get("authorization_id")
     normalized = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else breakdown_args
+    normalized = dict(normalized)
+    if "start" in normalized:
+        normalized["start_time"] = normalized.pop("start")
+    if "end" in normalized:
+        normalized["end_time"] = normalized.pop("end")
     if not authorization_id:
         raise RuntimeError("Daxview did not return a data authorization for device_energy_breakdown")
     result = call_authorized_historical_tool("device_energy_breakdown", str(authorization_id), normalized, request_id)

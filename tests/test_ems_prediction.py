@@ -25,12 +25,12 @@ NAMES = (
     "wants_available_parameters_follow_up", "explicit_mcp_tool_request", "first_device_id_from_text", "follow_up_metric_from_message",
     "select_historical_operations", "build_historical_arguments", "requested_device_id",
     "parse_datetime", "local_bucket_date", "first_dict_with_list", "first_list", "first_value", "predict_daily_energy",
-    "is_follow_up_message", "resolve_follow_up_message", "needs_ems_library",
+    "format_coverage_note", "is_follow_up_message", "resolve_follow_up_message", "needs_ems_library",
     "build_compliance_context", "has_time_scope", "first_regex_int", "needs_device_choice",
     "run_authorized_energy_prediction", "run_daxview_integration_turn",
     "build_charts_from_historical_results", "summarize_site_energy",
     "ensure_historical_answer_coverage", "ranked_consumer_rows", "summarize_top_consumers",
-    "summarize_historical_answer", "summarize_historical_answers", "summarize_demand_peak", "summarize_site_devices", "device_selection_prompt_from_result",
+    "summarize_generic_tool", "summarize_historical_answer", "summarize_historical_answers", "summarize_demand_peak", "summarize_site_devices", "device_selection_prompt_from_result",
     "build_device_choice_response",
     "daxview_history_event",
     "wants_highest_demand_device", "choose_historical_operations",
@@ -272,9 +272,28 @@ class EmsPredictionTests(unittest.TestCase):
         self.env["call_authorized_historical_tool"].assert_any_call(
             "device_energy_breakdown",
             "breakdown-auth",
-            {"site_id": 17, "start": "start", "end": "end", "timezone": "Asia/Kuala_Lumpur", "limit": 5},
+            {"site_id": 17, "start_time": "start", "end_time": "end", "timezone": "Asia/Kuala_Lumpur", "limit": 5},
             "request",
         )
+
+    def test_generic_summary_prioritizes_values_before_metadata_overflow(self):
+        answer = self.env["summarize_generic_tool"]("latest_telemetry_snapshot", {
+            "readings": [{
+                "site_id": 17,
+                "building_id": 11,
+                "device_id": 410,
+                "device_name": "UMG Meter",
+                "metric": "voltage",
+                "canonical_metric": "voltage",
+                "source_metric": "Voltage L1",
+                "timestamp": "2026-10-07T06:00:00+00:00",
+                "value": 241.2,
+                "unit": "V",
+            }]
+        })
+        self.assertIn("value=241.2", answer)
+        self.assertIn("unit=V", answer)
+        self.assertIn("timestamp=2026-10-07T06:00:00+00:00", answer)
 
     def test_model_cannot_drop_ranked_device(self):
         self.env["historical_result_data"] = lambda result: result["data"]
