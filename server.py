@@ -1290,6 +1290,7 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
         if not device_id:
             raise ValueError("device_id is required for telemetry timeseries")
         args["metric"] = context.get("metric") or requested_metric(message)
+        args["phase"] = str(context.get("phase") or "all")
         args["start_time"] = args.pop("start")
         args["end_time"] = args.pop("end")
         args["bucket"] = str(context.get("bucket") or ("1h" if "hour" in message.lower() else "1d"))
@@ -1418,6 +1419,7 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
             "bucket",
             "limit",
             "metric",
+            "phase",
             "aggregation",
             "value_mode",
             "forecast_start",
@@ -3406,6 +3408,7 @@ def calculate_demand_peak_from_telemetry(mcp_result: dict, arguments: dict) -> d
 def try_manual_demand_peak_fallback(turn_id: str, arguments: dict, request_id: str) -> dict:
     telemetry_args = dict(arguments)
     telemetry_args["metric"] = "demand"
+    telemetry_args["phase"] = telemetry_args.get("phase") or "all"
     telemetry_args["bucket"] = telemetry_args.get("bucket") or "1h"
     telemetry_args["aggregation"] = telemetry_args.get("aggregation") or "auto"
     telemetry_args["limit"] = int(telemetry_args.get("limit") or 1000)

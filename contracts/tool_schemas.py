@@ -67,6 +67,7 @@ class SiteDeviceList(SiteScope):
 class TelemetryTimeseries(TimeScope):
     device_id: int
     metric: Literal["energy", "demand", "current", "voltage", "power_factor", "frequency", "thd"] | str
+    phase: str = "all"
     bucket: str = "1d"
     aggregation: str = "auto"
     value_mode: str | None = None
