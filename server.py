@@ -1481,8 +1481,6 @@ def call_authorized_historical_tool(operation_id: str, authorization_id: str, ar
     if operation_id not in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
         raise ValueError("historical operation is not allowlisted")
     arguments = validate_tool_arguments(operation_id, arguments)
-    if operation_id == "telemetry_timeseries" and arguments.get("value_mode") == "auto":
-        arguments.pop("value_mode", None)
     result = call_daxview_mcp_tool(operation_id, {"authorization_id": authorization_id, **arguments}, request_id)
     issue = result_problem(mcp_structured_result(result)) or result_problem(result)
     if issue:
