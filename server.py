@@ -3904,6 +3904,14 @@ def initialize_mcp_session() -> None:
     if response.get("error"):
         raise RuntimeError(response["error"])
     DAXVIEW_MCP_SESSION_ID = headers.get("Mcp-Session-Id") or headers.get("mcp-session-id")
+    if DAXVIEW_MCP_SESSION_ID:
+        mcp_post(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {},
+            }
+        )
 
 
 def mcp_json_rpc(method: str, params: dict | None = None, request_id: str | int | None = None) -> dict:
