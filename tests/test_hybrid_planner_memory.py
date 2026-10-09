@@ -59,11 +59,14 @@ class HybridPlannerMemoryTests(unittest.TestCase):
         time_scope = {**base, "start_time": window["start"], "end_time": window["end"], "timezone": "Asia/Kuala_Lumpur"}
         examples = {
             "telemetry_top_consumers": {**window, "limit": 5},
+            "device_energy_ranking": {**time_scope, "metric": "energy", "limit": 5},
             "site_energy_summary": {**window, "bucket": "day"},
             "alarm_frequency_summary": {**window, "limit": 5},
             "site_metadata_summary": base,
             "site_device_list": {**base, "limit": 100},
             "telemetry_timeseries": {**time_scope, "device_id": 12, "metric": "voltage", "bucket": "1h", "aggregation": "auto", "limit": 500},
+            "telemetry_metric_catalog": {**time_scope, "limit": 100},
+            "latest_telemetry_snapshot": {**base, "device_id": 12, "metrics": ["energy"], "limit": 100},
             "active_alarm_summary": {**base, "limit": 50},
             "meter_status_summary": {**base, "limit": 100},
             "energy_comparison_summary": {**base, "period_a_start": window["start"], "period_a_end": window["end"], "period_b_start": "2026-10-02T00:00:00+00:00", "period_b_end": "2026-10-03T00:00:00+00:00", "timezone": "Asia/Kuala_Lumpur"},
@@ -72,10 +75,10 @@ class HybridPlannerMemoryTests(unittest.TestCase):
             "power_quality_summary": {**time_scope, "limit": 100},
             "demand_peak_summary": time_scope,
             "tariff_cost_summary": time_scope,
-            "device_energy_breakdown": {**window, "limit": 20},
+            "device_energy_breakdown": {**time_scope, "limit": 20},
             "energy_forecast": {**base, "forecast_start": "2026-10-06T00:00:00+00:00", "forecast_end": "2026-10-13T00:00:00+00:00", "training_days": 35, "timezone": "Asia/Kuala_Lumpur"},
-            "anomaly_detection_summary": {**window, "limit": 20},
-            "report_summary": window,
+            "anomaly_detection_summary": {**time_scope, "limit": 20},
+            "report_summary": time_scope,
         }
         return dict(examples[tool])
 

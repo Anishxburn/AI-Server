@@ -48,6 +48,11 @@ class TelemetryTopConsumers(WindowScope):
     limit: int = 5
 
 
+class DeviceEnergyRanking(TimeScope):
+    metric: str = "energy"
+    limit: int = 5
+
+
 class SiteEnergySummary(WindowScope):
     bucket: Literal["hour", "day", "week", "month"] | str = "day"
 
@@ -149,6 +154,7 @@ class ReportSummary(TimeScope):
 
 TOOL_SCHEMAS: dict[str, type[StrictModel]] = {
     "telemetry_top_consumers": TelemetryTopConsumers,
+    "device_energy_ranking": DeviceEnergyRanking,
     "site_energy_summary": SiteEnergySummary,
     "alarm_frequency_summary": AlarmFrequencySummary,
     "site_metadata_summary": SiteMetadataSummary,
