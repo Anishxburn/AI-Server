@@ -83,10 +83,13 @@ DAXVIEW_API_PASSWORD = os.getenv("DAXVIEW_API_PASSWORD", "").strip()
 DAXVIEW_API_TIMEOUT = int(os.getenv("DAXVIEW_API_TIMEOUT", "20"))
 DAXVIEW_API_DEBUG_RESPONSE = os.getenv("DAXVIEW_API_DEBUG_RESPONSE", "false").lower() in {"1", "true", "yes", "on"}
 DAXVIEW_API_DEBUG_RESPONSE_LIMIT = int(os.getenv("DAXVIEW_API_DEBUG_RESPONSE_LIMIT", "4000"))
+DAXVIEW_API_PROVIDER = os.getenv("DAXVIEW_API_PROVIDER", "ai-direct").strip().lower()
+DAXVIEW_API_DEVICES_PATH = os.getenv("DAXVIEW_API_DEVICES_PATH", "/ai/direct/devices/").strip()
 DAXVIEW_API_ENERGY_RANKING_PATH = os.getenv(
     "DAXVIEW_API_ENERGY_RANKING_PATH",
-    "/core/billing/sites/{site_id}/demand/daily/",
+    "/ai/direct/energy-ranking/",
 ).strip()
+DAXVIEW_API_TELEMETRY_PATH = os.getenv("DAXVIEW_API_TELEMETRY_PATH", "/ai/direct/telemetry/").strip()
 DAXVIEW_DEPLOYMENT_ID = os.getenv("DAXVIEW_DEPLOYMENT_ID", "v2-dev")
 AI_SERVER_API_KEY = os.getenv("AI_SERVER_API_KEY", "").strip()
 AI_SERVER_API_KEY_PREVIOUS = os.getenv("AI_SERVER_API_KEY_PREVIOUS", "").strip()
@@ -1673,7 +1676,8 @@ def run_daxview_api_operation(operation_id: str, arguments: dict, request_id: st
             "building_id": arguments.get("building_id"),
             "limit": arguments.get("limit"),
         }
-        payload = call_daxview_api("GET", "/core/devices/", request_id, query=query)
+        path = DAXVIEW_API_DEVICES_PATH if DAXVIEW_API_PROVIDER == "ai-direct" else "/core/devices/"
+        payload = call_daxview_api("GET", daxview_api_path(path), request_id, query=query)
         data = normalize_api_devices(payload, arguments)
         return {"structuredContent": {"status": "ok", "operation_id": operation_id, "data": data}}
     if operation_id in {"device_energy_breakdown", "device_energy_ranking", "telemetry_top_consumers"}:
@@ -1692,6 +1696,25 @@ def run_daxview_api_operation(operation_id: str, arguments: dict, request_id: st
         payload = call_daxview_api("GET", path, request_id, query=query)
         data = normalize_api_energy_ranking(payload, arguments)
         return {"structuredContent": {"status": "ok", "operation_id": "device_energy_ranking", "data": data}}
+    if operation_id == "telemetry_timeseries":
+        query = {
+            "site_id": arguments.get("site_id"),
+            "building_id": arguments.get("building_id"),
+            "device_id": arguments.get("device_id"),
+            "metric": arguments.get("metric"),
+            "phase": arguments.get("phase"),
+            "from": arguments.get("start_time"),
+            "to": arguments.get("end_time"),
+            "start_time": arguments.get("start_time"),
+            "end_time": arguments.get("end_time"),
+            "timezone": arguments.get("timezone"),
+            "bucket": arguments.get("bucket"),
+            "aggregation": arguments.get("aggregation"),
+            "value_mode": arguments.get("value_mode"),
+            "limit": arguments.get("limit"),
+        }
+        payload = call_daxview_api("GET", daxview_api_path(DAXVIEW_API_TELEMETRY_PATH), request_id, query=query)
+        return {"structuredContent": {"status": "ok", "operation_id": operation_id, "data": payload.get("data") if isinstance(payload.get("data"), dict) else payload}}
     raise ValueError(f"DaxView API provider does not support {operation_id} yet")
 
 
