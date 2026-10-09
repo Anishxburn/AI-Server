@@ -39,6 +39,7 @@ NAMES = (
     "chart_number", "chart_value", "mcp_structured_result", "historical_result_data",
     "demand_peak_needs_manual_fallback", "calculate_demand_peak_from_telemetry",
     "try_top_consumers_breakdown_fallback",
+    "first_nested_list", "normalize_api_device", "normalize_api_devices", "normalize_api_energy_ranking", "run_daxview_api_operation",
 )
 
 
@@ -58,6 +59,8 @@ def load_functions():
         "AI_PLANNER_SHADOW_MODE": False,
         "AI_REFINE_MCP_WITH_MODEL": True,
         "AI_MCP_FALLBACKS_ENABLED": True,
+        "DAXVIEW_API_ENABLED": False,
+        "DAXVIEW_API_ENERGY_RANKING_PATH": "/core/billing/sites/{site_id}/demand/daily/",
         "AI_COMPARE_MODEL_ENABLED": False,
         "AI_COMPARE_MODEL_SHOW_TO_USER": False,
         "AI_COMPARE_MODELS": ["deepseek-r1:1.5b"],
@@ -166,6 +169,29 @@ class EmsPredictionTests(unittest.TestCase):
         question = "List me out devices that is in this site"
         self.assertTrue(self.env["wants_device_inventory"](question))
         self.assertEqual(self.env["select_historical_operations"](question), ["site_device_list"])
+
+    def test_api_device_list_normalizes_common_response_shapes(self):
+        data = self.env["normalize_api_devices"](
+            {"results": [
+                {"id": 519, "name": "AC kWh", "site_id": 17, "status": "online"},
+                {"id": 520, "name": "Other Site", "site_id": 99, "status": "offline"},
+            ]},
+            {"site_id": 17, "limit": 10},
+        )
+        self.assertEqual(data["device_count"], 1)
+        self.assertEqual(data["devices"][0]["device_id"], 519)
+        self.assertEqual(data["devices"][0]["device_name"], "AC kWh")
+
+    def test_api_energy_ranking_normalizes_and_sorts_rows(self):
+        data = self.env["normalize_api_energy_ranking"](
+            {"rows": [
+                {"deviceId": 2, "deviceName": "Low meter", "energy_kwh": 10},
+                {"deviceId": 1, "deviceName": "High meter", "energy_kwh": 20},
+            ]},
+            {"site_id": 17, "limit": 2},
+        )
+        self.assertEqual([row["device_id"] for row in data["rankings"]], [1, 2])
+        self.assertEqual(data["rankings"][0]["value"], 20.0)
 
     def test_voltage_current_testing_discovers_devices_first(self):
         question = "List devices at this site that have data, then tell me which one is best to use for voltage/current trend testing."
