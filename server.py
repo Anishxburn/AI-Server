@@ -4633,7 +4633,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>AI MCP Trace Dashboard</title>
+    <title>AI Data Trace Dashboard</title>
     <link rel="stylesheet" href="/debug/assets/prediction_lab.css" />
     <script src="/debug/assets/chart.umd.js"></script>
     <script src="/debug/assets/lucide.min.js"></script>
@@ -4709,8 +4709,8 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
   <body>
     <header>
       <div>
-        <h1>AI MCP Trace Dashboard</h1>
-        <div class="meta">DaxView -> AI Server -> Data Plan -> MCP -> AI Server -> DaxView</div>
+        <h1>AI Data Trace Dashboard</h1>
+        <div class="meta">DaxView -> AI Server -> API or MCP provider -> AI Server -> DaxView</div>
       </div>
       <button id="refresh">Refresh</button>
     </header>
@@ -4748,6 +4748,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       const flowStages = [
         {key: "incoming", label: "DaxView In", match: e => /daxview|api_to_ui/i.test(e.event || "") || e.job_id},
         {key: "plan", label: "Data Plan", match: e => /data_plan/i.test(e.event || "")},
+        {key: "api", label: "API Call", match: e => /daxview_api/i.test(e.event || "")},
         {key: "mcp", label: "MCP Tool", match: e => /mcp_tool/i.test(e.event || "")},
         {key: "retrieval", label: "Knowledge", match: e => /retrieve|context|embedding/i.test(e.event || "")},
         {key: "model", label: "AI Model", match: e => /ollama|agent|synthesizer|mcp_answer_refine/i.test(e.event || "")},
@@ -4799,13 +4800,13 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       }
       function renderInspectors(events) {
         const answers = events.filter(e => e.event === "mcp_answer_refine_response_debug" && e.role !== "compare");
-        const payloads = events.filter(e => e.event === "mcp_tool_request_payload_debug" || e.event === "mcp_tool_response_payload_debug");
+        const payloads = events.filter(e => e.event === "mcp_tool_request_payload_debug" || e.event === "mcp_tool_response_payload_debug" || e.event === "daxview_api_response_debug");
         const answerHtml = answers.map((item, index) => `<div class="answer-block"><strong>${escapeHtml(item.role || "model")} - ${escapeHtml(item.model || "unknown model")}</strong><br>${escapeHtml(item.answer || "")}</div>`).join("");
         const payloadHtml = payloads.map(item => `<details><summary>${escapeHtml(item.event.replace("_debug", ""))} · ${escapeHtml(item.tool || "")}</summary><pre>${escapeHtml(JSON.stringify(item, null, 2))}</pre></details>`).join("");
         if (!answerHtml && !payloadHtml) return "";
         return `<section class="inspectors">
           ${answerHtml ? `<div><h3>Model answers</h3>${answerHtml}</div>` : ""}
-          ${payloadHtml ? `<div><h3>MCP payloads</h3>${payloadHtml}</div>` : ""}
+          ${payloadHtml ? `<div><h3>Data payloads</h3>${payloadHtml}</div>` : ""}
         </section>`;
       }
       function renderOutcome(events) {
@@ -5558,6 +5559,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "conversation_store": bool(DATABASE_URL),
                     "job_queue": True,
                     "mcp_client": DAXVIEW_MCP_ENABLED,
+                    "api_client": DAXVIEW_API_ENABLED,
                     "supported_manifest_versions": ["2026-09-14"],
                 },
             )
