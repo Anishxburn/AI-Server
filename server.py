@@ -133,7 +133,7 @@ EMS_KEYWORDS = {
 }
 
 DAXVIEW_TOOL_KEYWORDS = {
-    "device_energy_ranking": {
+    "device_energy_breakdown": {
         "top consumer", "top consumers", "most energy", "highest usage",
         "highest consumption", "largest load", "biggest consumer",
         "top consuming", "energy-consuming", "energy consuming", "top devices",
@@ -909,8 +909,8 @@ def select_historical_operations(message: str) -> list[str]:
         operations = [name for name in operations if name != "telemetry_timeseries"]
     if wants_device_usage_ranking(message):
         operations = [name for name in operations if name != "site_device_list"]
-        if "device_energy_ranking" not in operations:
-            operations.append("device_energy_ranking")
+        if "device_energy_breakdown" not in operations:
+            operations.append("device_energy_breakdown")
         if not re.search(r"\b(?:daily|site energy|site-wide|overall|total site|site total|site usage)\b", lowered):
             operations = [name for name in operations if name != "site_energy_summary"]
         if any(term in lowered for term in ("offline", "online", "status")) or wants_all_devices(message):
@@ -921,11 +921,11 @@ def select_historical_operations(message: str) -> list[str]:
     if "alarm_frequency_summary" in operations and not any(
         term in lowered for term in ("energy", "kwh", "consumption", "usage", "demand")
     ):
-        operations = [name for name in operations if name not in {"device_energy_ranking", "telemetry_top_consumers", "site_energy_summary"}]
+        operations = [name for name in operations if name not in {"device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers", "site_energy_summary"}]
     if "site_energy_summary" in operations and any(requested_energy_extrema(message)) and not any(
         term in lowered for term in ("top consumer", "top device", "by device", "which device")
     ) and not wants_device_usage_ranking(message):
-        operations = [name for name in operations if name not in {"device_energy_ranking", "telemetry_top_consumers"}]
+        operations = [name for name in operations if name not in {"device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers"}]
     if "energy_forecast" in operations and not any(
         term in lowered for term in ("compare", "comparison", "difference", "top consumer", "energy summary")
     ):
@@ -967,7 +967,7 @@ def select_historical_operations(message: str) -> list[str]:
     ):
         operations.append("energy_comparison_summary")
     if "report_summary" in operations:
-        for tool_name in ("site_energy_summary", "device_energy_ranking", "telemetry_top_consumers", "alarm_frequency_summary"):
+        for tool_name in ("site_energy_summary", "device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers", "alarm_frequency_summary"):
             if tool_name in operations:
                 operations.remove(tool_name)
     deduped = []
@@ -1361,7 +1361,8 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
         args["start_time"] = args.pop("start")
         args["end_time"] = args.pop("end")
         args["group_by"] = str(context.get("group_by") or "device")
-        args["limit"] = int(context.get("limit") or 20)
+        ranking_limit = requested_top_limit(message) if wants_device_usage_ranking(message) else None
+        args["limit"] = 100 if wants_all_devices(message) else ranking_limit or int(context.get("limit") or 20)
     elif operation_id == "energy_forecast":
         forecast_days = requested_forecast_days(message) or int(context.get("forecast_days") or 7)
         forecast_days = min(max(forecast_days, 1), 14)
@@ -2418,7 +2419,7 @@ def summarize_historical_answer(
             return f"DaxView historical data is currently unavailable for this {scope}."
         return f"DaxView could not return {operation_id}: {issue}."
     data = historical_result_data(mcp_result)
-    if operation_id in {"device_energy_ranking", "telemetry_top_consumers"}:
+    if operation_id in {"device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers"} and wants_device_usage_ranking(message):
         return summarize_top_consumers(data, arguments, message)
     if operation_id == "site_energy_summary":
         return summarize_site_energy(data, message, arguments)
@@ -2464,7 +2465,7 @@ def summarize_historical_answers(
             item.get("arguments"),
         )
 
-    top_result = next((item for item in results if item["operation_id"] in {"device_energy_ranking", "telemetry_top_consumers"}), None)
+    top_result = next((item for item in results if item["operation_id"] in {"device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers"}), None)
     device_result = next((item for item in results if item["operation_id"] == "site_device_list"), None)
     if top_result and device_result and wants_device_usage_ranking(message):
         top_data = historical_result_data(top_result["result"])
@@ -2510,6 +2511,7 @@ def summarize_historical_answers(
         operation_id = item["operation_id"]
         title = {
             "device_energy_ranking": "Top energy-consuming devices",
+            "device_energy_breakdown": "Top energy-consuming devices" if wants_device_usage_ranking(message) else "Device energy breakdown",
             "telemetry_top_consumers": "Top energy-consuming devices",
             "site_energy_summary": "Site energy summary",
             "alarm_frequency_summary": "Alarm frequency summary",
@@ -2575,7 +2577,7 @@ def ensure_historical_answer_coverage(
     if results and any(re.search(pattern, model_answer, flags=re.IGNORECASE) for pattern in generic_failure_patterns):
         log_event("historical_answer_coverage_fallback", request_id=request_id, missing_items="generic_model_reply")
         return deterministic_answer
-    top_result = next((item for item in results if item.get("operation_id") in {"device_energy_ranking", "telemetry_top_consumers"}), None)
+    top_result = next((item for item in results if item.get("operation_id") in {"device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers"}), None)
     if top_result and wants_device_usage_ranking(message):
         top_data = historical_result_data(top_result["result"])
         measured, _ = ranked_consumer_rows(top_data)
@@ -2633,6 +2635,7 @@ def ensure_historical_answer_coverage(
             "alarm_frequency_summary": r"\b(?:alarm|alert)\b",
             "active_alarm_summary": r"\b(?:alarm|alert)\b",
             "device_energy_ranking": r"\b(?:device|meter|consumer|umg)\b",
+            "device_energy_breakdown": r"\b(?:device|meter|consumer|umg|energy)\b",
             "telemetry_top_consumers": r"\b(?:device|meter|consumer|umg)\b",
             "demand_peak_summary": r"\b(?:demand|peak)\b",
             "energy_forecast": r"\b(?:forecast|predict|estimate)\b",
@@ -2807,7 +2810,7 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
                 values.append(value)
         unit = data.get("unit") or (data.get("display") or {}).get("unit") if isinstance(data.get("display"), dict) else data.get("unit") or "kWh"
         return build_chart_spec("bar", "Daily Site Energy", labels, values, unit or "kWh", "Energy")
-    if operation_id in {"device_energy_ranking", "telemetry_top_consumers"}:
+    if operation_id in {"device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers"}:
         ranked, _ = ranked_consumer_rows(data)
         rows = [dict(row, value=value) for row, value in ranked]
         labels = []

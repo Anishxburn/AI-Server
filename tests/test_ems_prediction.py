@@ -122,15 +122,15 @@ class EmsPredictionTests(unittest.TestCase):
         question = "Which devices contributed most to energy use during that period? Show the top five and tell me which are offline."
         self.assertEqual(
             self.env["select_historical_operations"](question),
-            ["device_energy_ranking", "site_device_list"],
+            ["device_energy_breakdown", "site_device_list"],
         )
         all_question = "List out all the devices and rank them based on usage"
         self.assertEqual(
             self.env["select_historical_operations"](all_question),
-            ["device_energy_ranking", "site_device_list"],
+            ["device_energy_breakdown", "site_device_list"],
         )
         self.env["requested_historical_range"] = Mock(return_value={"start": "start", "end": "end", "timezone": "Asia/Kuala_Lumpur"})
-        args = self.env["build_historical_arguments"]("device_energy_ranking", {"site_id": 17}, all_question)
+        args = self.env["build_historical_arguments"]("device_energy_breakdown", {"site_id": 17}, all_question)
         self.assertEqual(args["limit"], 100)
         self.assertEqual(args["start_time"], "start")
         self.assertEqual(args["end_time"], "end")
@@ -239,7 +239,7 @@ class EmsPredictionTests(unittest.TestCase):
         self.env["format_number"] = lambda value, precision=2: f"{value:.2f}"
         self.env["reading_detail"] = lambda *args: None
         results = [
-            {"operation_id": "device_energy_ranking", "arguments": {"limit": 5}, "result": {"data": {
+            {"operation_id": "device_energy_breakdown", "arguments": {"limit": 5}, "result": {"data": {
                 "unit": "kWh", "rows": [
                     {"device_id": 2, "device_name": "Low meter", "value": 10},
                     {"device_id": 1, "device_name": "High meter", "value": 20},
@@ -262,17 +262,16 @@ class EmsPredictionTests(unittest.TestCase):
 
     def test_top_consumers_falls_back_to_device_energy_breakdown(self):
         self.env["resolve_follow_up_message"] = Mock(side_effect=lambda turn, message, context, conversation, request: (message, context))
-        self.env["request_daxview_data_plan"] = Mock(side_effect=[
-            {"authorization_id": "top-auth", "arguments": {"site_id": 17, "start": "start", "end": "end", "timezone": "Asia/Kuala_Lumpur", "limit": 5}},
-            {"authorization_id": "breakdown-auth", "arguments": {"site_id": 17, "start": "start", "end": "end", "timezone": "Asia/Kuala_Lumpur", "limit": 5}},
-        ])
-        self.env["call_authorized_historical_tool"] = Mock(side_effect=[
-            RuntimeError("device_energy_ranking could not return valid data: DAXVIEW_UNAVAILABLE"),
+        self.env["request_daxview_data_plan"] = Mock(return_value={
+            "authorization_id": "breakdown-auth",
+            "arguments": {"site_id": 17, "start_time": "start", "end_time": "end", "timezone": "Asia/Kuala_Lumpur", "group_by": "device", "limit": 5},
+        })
+        self.env["call_authorized_historical_tool"] = Mock(return_value=
             {"data": {"rows": [
                 {"device_id": 1, "device_name": "High meter", "energy_kwh": 30},
                 {"device_id": 2, "device_name": "Low meter", "energy_kwh": 12},
             ], "unit": "kWh"}},
-        ])
+        )
         self.env["format_time_window"] = lambda data, arguments: "last 3 days"
         self.env["format_number"] = lambda value, precision=2: f"{value:.2f}"
         self.env["reading_detail"] = lambda *args: None
@@ -286,11 +285,11 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertIn("High meter", result["reply"])
         self.assertIn("30.00 kWh", result["reply"])
         self.assertEqual(result["resolved_plan"]["status"], "ok")
-        self.assertEqual(result["resolved_plan"]["tools"][0]["tool"], "device_energy_ranking")
+        self.assertEqual(result["resolved_plan"]["tools"][0]["tool"], "device_energy_breakdown")
         self.env["call_authorized_historical_tool"].assert_any_call(
             "device_energy_breakdown",
             "breakdown-auth",
-            {"site_id": 17, "start_time": "start", "end_time": "end", "timezone": "Asia/Kuala_Lumpur", "limit": 5},
+            {"site_id": 17, "start_time": "start", "end_time": "end", "timezone": "Asia/Kuala_Lumpur", "group_by": "device", "limit": 5},
             "request",
         )
 
@@ -310,8 +309,7 @@ class EmsPredictionTests(unittest.TestCase):
         result = self.env["run_daxview_integration_turn"](
             "turn", "List out top 5 highest energy consumption device and it value", {"site_id": 17}, "request", "conversation"
         )
-        self.assertIn("device_energy_ranking is currently unavailable", result["reply"])
-        self.assertNotIn("device_energy_breakdown", result["reply"])
+        self.assertIn("device_energy_breakdown is currently unavailable", result["reply"])
         self.env["request_daxview_data_plan"].assert_called_once()
 
     def test_generic_summary_prioritizes_values_before_metadata_overflow(self):

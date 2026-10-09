@@ -7,7 +7,7 @@
   inherit_from_previous: ["device", "tools", "metric"]
   slots: {time_phrase: "today"}
 - question: "top consumers last week"
-  tools: ["device_energy_ranking"]
+  tools: ["device_energy_breakdown"]
   slots: {time_phrase: "last week", metric: "energy"}
 - question: "show building 3"
   tools: []

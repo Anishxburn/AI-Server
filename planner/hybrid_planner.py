@@ -76,7 +76,7 @@ JSON: {{"intent":"data_query","is_follow_up":false,"tools":["demand_peak_summary
 User: what about today?
 JSON: {{"intent":"follow_up","is_follow_up":true,"tools":[],"slots":{{"time_phrase":"today"}},"inherit_from_previous":["device","tools","metric"],"clarification":null,"confidence":0.84}}
 User: top consumers last week and active alarms
-JSON: {{"intent":"data_query","is_follow_up":false,"tools":["device_energy_ranking","active_alarm_summary"],"slots":{{"time_phrase":"last week","metric":"energy","limit":5}},"inherit_from_previous":[],"clarification":null,"confidence":0.9}}
+JSON: {{"intent":"data_query","is_follow_up":false,"tools":["device_energy_breakdown","active_alarm_summary"],"slots":{{"time_phrase":"last week","metric":"energy","limit":5}},"inherit_from_previous":[],"clarification":null,"confidence":0.9}}
 User: berapa max demand hari ini
 JSON: {{"intent":"data_query","is_follow_up":false,"tools":["demand_peak_summary"],"slots":{{"time_phrase":"today","metric":"demand"}},"inherit_from_previous":[],"clarification":null,"confidence":0.82}}
 User: show building 3
