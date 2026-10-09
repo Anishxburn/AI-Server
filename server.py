@@ -2,7 +2,6 @@
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
-import base64
 import hashlib
 import hmac
 import json
@@ -74,22 +73,6 @@ DAXVIEW_MCP_PROTOCOL_VERSION = os.getenv("DAXVIEW_MCP_PROTOCOL_VERSION", "2025-0
 DAXVIEW_MCP_DEBUG_RESPONSE = os.getenv("DAXVIEW_MCP_DEBUG_RESPONSE", "false").lower() in {"1", "true", "yes", "on"}
 DAXVIEW_MCP_DEBUG_RESPONSE_LIMIT = int(os.getenv("DAXVIEW_MCP_DEBUG_RESPONSE_LIMIT", "4000"))
 DAXVIEW_MCP_SESSION_ID = None
-DAXVIEW_API_ENABLED = os.getenv("DAXVIEW_API_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
-DAXVIEW_API_BASE_URL = os.getenv("DAXVIEW_API_BASE_URL", "https://event.daxview.com/api").strip().rstrip("/")
-DAXVIEW_API_AUTH_TOKEN = os.getenv("DAXVIEW_API_AUTH_TOKEN", "").strip()
-DAXVIEW_API_SESSION_COOKIE = os.getenv("DAXVIEW_API_SESSION_COOKIE", "").strip()
-DAXVIEW_API_USERNAME = os.getenv("DAXVIEW_API_USERNAME", "").strip()
-DAXVIEW_API_PASSWORD = os.getenv("DAXVIEW_API_PASSWORD", "").strip()
-DAXVIEW_API_TIMEOUT = int(os.getenv("DAXVIEW_API_TIMEOUT", "20"))
-DAXVIEW_API_DEBUG_RESPONSE = os.getenv("DAXVIEW_API_DEBUG_RESPONSE", "false").lower() in {"1", "true", "yes", "on"}
-DAXVIEW_API_DEBUG_RESPONSE_LIMIT = int(os.getenv("DAXVIEW_API_DEBUG_RESPONSE_LIMIT", "4000"))
-DAXVIEW_API_PROVIDER = os.getenv("DAXVIEW_API_PROVIDER", "ai-direct").strip().lower()
-DAXVIEW_API_DEVICES_PATH = os.getenv("DAXVIEW_API_DEVICES_PATH", "/ai/direct/devices/").strip()
-DAXVIEW_API_ENERGY_RANKING_PATH = os.getenv(
-    "DAXVIEW_API_ENERGY_RANKING_PATH",
-    "/ai/direct/energy-ranking/",
-).strip()
-DAXVIEW_API_TELEMETRY_PATH = os.getenv("DAXVIEW_API_TELEMETRY_PATH", "/ai/direct/telemetry/").strip()
 DAXVIEW_DEPLOYMENT_ID = os.getenv("DAXVIEW_DEPLOYMENT_ID", "v2-dev")
 AI_SERVER_API_KEY = os.getenv("AI_SERVER_API_KEY", "").strip()
 AI_SERVER_API_KEY_PREVIOUS = os.getenv("AI_SERVER_API_KEY_PREVIOUS", "").strip()
@@ -1032,6 +1015,16 @@ def plan_turn_with_llm(message: str, history: list[dict], context: dict, request
     plan = parse_planner_response(data, DAXVIEW_ALLOWED_HISTORICAL_TOOLS)
     latency_ms = round((time.perf_counter() - started_at) * 1000)
     log_event("planner_response", request_id=request_id, model=PLANNER_MODEL, latency_ms=latency_ms, tools=plan.tools, confidence=plan.confidence)
+    debug_trace_event(
+        "planner_intention_debug",
+        request_id=request_id,
+        model=PLANNER_MODEL,
+        latency_ms=latency_ms,
+        tools=plan.tools,
+        confidence=plan.confidence,
+        slots=getattr(plan.slots, "__dict__", {}),
+        clarification=getattr(plan.clarification, "__dict__", None) if getattr(plan, "clarification", None) else None,
+    )
     return plan, latency_ms
 
 
@@ -1059,6 +1052,14 @@ def planner_slot_context(message: str, context: dict, plan) -> dict:
 def choose_historical_operations(message: str, context: dict, turn_id: str, session_id: str, request_id: str) -> tuple[list[str], dict, dict | None]:
     regex_operations = select_historical_operations(message)
     if not (AI_PLANNER_ENABLED or AI_PLANNER_SHADOW_MODE):
+        debug_trace_event(
+            "planner_intention_debug",
+            request_id=request_id,
+            planner_enabled=False,
+            regex_tools=regex_operations,
+            selected_tools=regex_operations,
+            context=context,
+        )
         return regex_operations, context, None
     history = load_conversation_history(session_id, turn_id) if AI_CHAT_MEMORY_ENABLED else []
     try:
@@ -1081,12 +1082,33 @@ def choose_historical_operations(message: str, context: dict, turn_id: str, sess
                 "slots": planned_context,
             }
         if plan.clarification and plan.clarification.question:
+            debug_trace_event(
+                "planner_decision_debug",
+                request_id=request_id,
+                status="clarification",
+                regex_tools=regex_operations,
+                planner_tools=planned_tools,
+                selected_tools=[],
+                context=planned_context,
+                clarification=plan.clarification.question,
+            )
             return [], {**planned_context, "_planner_clarification": plan.clarification.question}, {
                 "status": "clarification",
                 "tools": [],
                 "slots": planned_context,
             }
-        return planned_tools or regex_operations, planned_context, {
+        selected_tools = planned_tools or regex_operations
+        debug_trace_event(
+            "planner_decision_debug",
+            request_id=request_id,
+            status="ok",
+            regex_tools=regex_operations,
+            planner_tools=planned_tools,
+            selected_tools=selected_tools,
+            context=planned_context,
+            confidence=plan.confidence,
+        )
+        return selected_tools, planned_context, {
             "status": "ok",
             "tools": [{"tool": tool, "arguments": {}} for tool in planned_tools],
             "slots": planned_context,
@@ -1456,16 +1478,25 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
         operation_id=operation_id,
         arguments=safe_arguments,
     )
+    debug_trace_event(
+        "daxview_fetch_stage_debug",
+        request_id=request_id,
+        turn_id=turn_id,
+        operation_id=operation_id,
+        stage="data_plan_request",
+        arguments=safe_arguments,
+    )
     try:
         with urlopen(request, timeout=DAXVIEW_MCP_TIMEOUT) as response:
             plan = json.loads(response.read().decode("utf-8"))
+            normalized_arguments = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else {}
             log_event(
                 "daxview_data_plan_response",
                 request_id=request_id,
                 turn_id=turn_id,
                 operation_id=operation_id,
                 has_authorization=bool(plan.get("authorization_id")),
-                arguments=redact_debug_value(plan.get("arguments") if isinstance(plan.get("arguments"), dict) else {}),
+                arguments=redact_debug_value(normalized_arguments),
             )
             debug_trace_event(
                 "daxview_data_plan_response_debug",
@@ -1473,7 +1504,22 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
                 turn_id=turn_id,
                 operation_id=operation_id,
                 has_authorization=bool(plan.get("authorization_id")),
-                arguments=redact_debug_value(plan.get("arguments") if isinstance(plan.get("arguments"), dict) else {}),
+                arguments=redact_debug_value(normalized_arguments),
+                changed_arguments={
+                    key: {"requested": safe_arguments.get(key), "planned": normalized_arguments.get(key)}
+                    for key in sorted(set(safe_arguments) | set(normalized_arguments))
+                    if safe_arguments.get(key) != normalized_arguments.get(key)
+                    and key not in {"authorization_id"}
+                },
+            )
+            debug_trace_event(
+                "daxview_fetch_stage_debug",
+                request_id=request_id,
+                turn_id=turn_id,
+                operation_id=operation_id,
+                stage="data_plan_authorized" if plan.get("authorization_id") else "data_plan_missing_authorization",
+                has_authorization=bool(plan.get("authorization_id")),
+                arguments=redact_debug_value(normalized_arguments),
             )
             return plan
     except HTTPError as error:
@@ -1496,6 +1542,15 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
             status=error.code,
             response=safe_body,
         )
+        debug_trace_event(
+            "daxview_fetch_stage_debug",
+            request_id=request_id,
+            turn_id=turn_id,
+            operation_id=operation_id,
+            stage="data_plan_error",
+            status=error.code,
+            response=safe_body,
+        )
         raise
 
 
@@ -1503,10 +1558,42 @@ def call_authorized_historical_tool(operation_id: str, authorization_id: str, ar
     if operation_id not in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
         raise ValueError("historical operation is not allowlisted")
     arguments = validate_tool_arguments(operation_id, arguments)
+    debug_trace_event(
+        "daxview_fetch_stage_debug",
+        request_id=request_id,
+        operation_id=operation_id,
+        stage="mcp_tool_call_start",
+        arguments=redact_debug_value(arguments),
+    )
     result = call_daxview_mcp_tool(operation_id, {"authorization_id": authorization_id, **arguments}, request_id)
-    issue = result_problem(mcp_structured_result(result)) or result_problem(result)
+    structured = mcp_structured_result(result)
+    data = structured.get("data") if isinstance(structured.get("data"), dict) else {}
+    debug_trace_event(
+        "daxview_mcp_structured_result_debug",
+        request_id=request_id,
+        operation_id=operation_id,
+        status=structured.get("status"),
+        error_code=structured.get("error_code") or structured.get("code"),
+        message=structured.get("message") or structured.get("detail") or structured.get("error"),
+        data_keys=sorted(data.keys()) if isinstance(data, dict) else [],
+        row_count=len(first_list(data, ("rows", "items", "results", "buckets", "series", "rankings", "devices"))) if isinstance(data, dict) else None,
+    )
+    issue = result_problem(structured) or result_problem(result)
     if issue:
+        debug_trace_event(
+            "daxview_fetch_stage_debug",
+            request_id=request_id,
+            operation_id=operation_id,
+            stage="mcp_tool_invalid_data",
+            issue=issue,
+        )
         raise RuntimeError(f"{operation_id} could not return valid data: {issue}")
+    debug_trace_event(
+        "daxview_fetch_stage_debug",
+        request_id=request_id,
+        operation_id=operation_id,
+        stage="mcp_tool_valid_data",
+    )
     if AI_DEBUG_DASHBOARD_ENABLED and operation_id == "site_energy_summary" and arguments.get("bucket") == "day":
         try:
             data = historical_result_data(result)
@@ -1519,203 +1606,6 @@ def call_authorized_historical_tool(operation_id: str, authorization_id: str, ar
         except Exception as error:
             log_event("prediction_snapshot_skipped", request_id=request_id, reason=str(error))
     return result
-
-
-def daxview_api_headers() -> dict:
-    headers = {"Accept": "application/json"}
-    if DAXVIEW_API_AUTH_TOKEN:
-        headers["Authorization"] = f"Bearer {DAXVIEW_API_AUTH_TOKEN}"
-    if DAXVIEW_API_SESSION_COOKIE:
-        headers["Cookie"] = DAXVIEW_API_SESSION_COOKIE
-    return headers
-
-
-def daxview_api_path(path: str, **values) -> str:
-    return "/" + path.format(**values).lstrip("/")
-
-
-def daxview_api_url(path: str, query: dict | None = None) -> str:
-    url = f"{DAXVIEW_API_BASE_URL}{path}"
-    if not query:
-        return url
-    from urllib.parse import urlencode
-    pairs = [(key, str(value)) for key, value in query.items() if value is not None]
-    return f"{url}?{urlencode(pairs)}" if pairs else url
-
-
-def call_daxview_api(method: str, path: str, request_id: str, query: dict | None = None, payload: dict | None = None) -> dict:
-    if not DAXVIEW_API_ENABLED:
-        raise RuntimeError("DaxView API provider is disabled")
-    if not DAXVIEW_API_BASE_URL:
-        raise RuntimeError("DAXVIEW_API_BASE_URL is not configured")
-    headers = daxview_api_headers()
-    data = None
-    if payload is not None:
-        headers["Content-Type"] = "application/json"
-        data = json.dumps(payload).encode("utf-8")
-    if DAXVIEW_API_USERNAME and DAXVIEW_API_PASSWORD and "Authorization" not in headers:
-        token = base64.b64encode(f"{DAXVIEW_API_USERNAME}:{DAXVIEW_API_PASSWORD}".encode("utf-8")).decode("ascii")
-        headers["Authorization"] = f"Basic {token}"
-    url = daxview_api_url(path, query)
-    log_event("daxview_api_request", request_id=request_id, method=method.upper(), path=path)
-    request = Request(url, data=data, headers=headers, method=method.upper())
-    try:
-        with urlopen(request, timeout=DAXVIEW_API_TIMEOUT) as response:
-            body = response.read().decode("utf-8", errors="replace")
-            if not body:
-                return {}
-            try:
-                parsed = json.loads(body)
-            except json.JSONDecodeError:
-                parsed = {"raw": body}
-            if DAXVIEW_API_DEBUG_RESPONSE:
-                log_event(
-                    "daxview_api_response_debug",
-                    request_id=request_id,
-                    path=path,
-                    sample=debug_json_sample(parsed, DAXVIEW_API_DEBUG_RESPONSE_LIMIT),
-                )
-            return parsed if isinstance(parsed, dict) else {"items": parsed}
-    except HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")[:1000]
-        safe_body = body
-        try:
-            parsed = json.loads(body)
-            safe_body = {
-                key: parsed.get(key)
-                for key in ("detail", "error", "error_code", "code", "message", "retryable", "request_id")
-                if key in parsed
-            }
-        except json.JSONDecodeError:
-            pass
-        log_event("daxview_api_error", request_id=request_id, method=method.upper(), path=path, status=error.code, response=safe_body)
-        raise
-
-
-def first_nested_list(value) -> list:
-    if isinstance(value, list):
-        return value
-    if not isinstance(value, dict):
-        return []
-    direct = first_list(value, ("rows", "items", "results", "data", "devices", "meters", "parameters", "series", "points", "daily", "records"))
-    if direct:
-        return direct
-    for nested in value.values():
-        rows = first_nested_list(nested)
-        if rows:
-            return rows
-    return []
-
-
-def normalize_api_device(row: dict) -> dict:
-    device_id = first_value(row, ("device_id", "id", "deviceId", "meter_id", "meterId"))
-    return {
-        "device_id": device_id,
-        "device_name": first_value(row, ("device_name", "name", "label", "deviceName", "meter_name")) or f"Device {device_id or 'unknown'}",
-        "device_type": first_value(row, ("device_type", "type", "deviceType")),
-        "building_id": first_value(row, ("building_id", "buildingId")),
-        "building_name": first_value(row, ("building_name", "buildingName")),
-        "status": first_value(row, ("status", "connection_status", "data_status", "state")),
-        "last_seen": first_value(row, ("last_seen", "lastSeen", "last_reading_at", "updated_at")),
-        "manufacturer": row.get("manufacturer"),
-        "meter_model": first_value(row, ("meter_model", "model", "meterModel")),
-    }
-
-
-def normalize_api_devices(payload: dict, arguments: dict) -> dict:
-    rows = [row for row in first_nested_list(payload) if isinstance(row, dict)]
-    site_id = arguments.get("site_id")
-    if site_id:
-        site_text = str(site_id)
-        filtered = [row for row in rows if str(first_value(row, ("site_id", "site", "siteId")) or site_text) == site_text]
-        rows = filtered or rows
-    devices = [normalize_api_device(row) for row in rows]
-    limit = int(arguments.get("limit") or 100)
-    return {"site_id": site_id, "devices": devices[:limit], "device_count": len(devices), "truncated": len(devices) > limit}
-
-
-def normalize_api_energy_ranking(payload: dict, arguments: dict) -> dict:
-    rows = [row for row in first_nested_list(payload) if isinstance(row, dict)]
-    normalized = []
-    for row in rows:
-        device_id = first_value(row, ("device_id", "deviceId", "meter_id", "meterId", "id"))
-        value = first_value(row, (
-            "value", "kwh", "energy", "energy_kwh", "total_kwh", "total_energy_kwh",
-            "consumption", "consumption_kwh", "usage_kwh", "import_kwh", "daily_kwh",
-        ))
-        if value is None:
-            continue
-        try:
-            amount = float(value)
-        except (TypeError, ValueError):
-            continue
-        normalized.append({
-            **row,
-            "device_id": device_id,
-            "device_name": first_value(row, ("device_name", "deviceName", "meter_name", "name", "label")) or f"Device {device_id or 'unknown'}",
-            "value": amount,
-            "unit": first_value(row, ("unit", "reading_unit")) or "kWh",
-        })
-    normalized.sort(key=lambda row: float(row.get("value") or 0), reverse=True)
-    limit = int(arguments.get("limit") or 5)
-    return {
-        "site_id": arguments.get("site_id"),
-        "metric": "energy",
-        "unit": "kWh",
-        "rankings": normalized[:limit],
-        "device_count": len(normalized),
-        "calculation": "direct_daxview_api_rows",
-    }
-
-
-def run_daxview_api_operation(operation_id: str, arguments: dict, request_id: str) -> dict:
-    if operation_id == "site_device_list":
-        query = {
-            "site_id": arguments.get("site_id"),
-            "site": arguments.get("site_id"),
-            "building_id": arguments.get("building_id"),
-            "limit": arguments.get("limit"),
-        }
-        path = DAXVIEW_API_DEVICES_PATH if DAXVIEW_API_PROVIDER == "ai-direct" else "/core/devices/"
-        payload = call_daxview_api("GET", daxview_api_path(path), request_id, query=query)
-        data = normalize_api_devices(payload, arguments)
-        return {"structuredContent": {"status": "ok", "operation_id": operation_id, "data": data}}
-    if operation_id in {"device_energy_breakdown", "device_energy_ranking", "telemetry_top_consumers"}:
-        path = daxview_api_path(DAXVIEW_API_ENERGY_RANKING_PATH, site_id=arguments["site_id"])
-        query = {
-            "site_id": arguments.get("site_id"),
-            "building_id": arguments.get("building_id"),
-            "from": arguments.get("start_time") or arguments.get("start"),
-            "to": arguments.get("end_time") or arguments.get("end"),
-            "start": arguments.get("start_time") or arguments.get("start"),
-            "end": arguments.get("end_time") or arguments.get("end"),
-            "timeZone": arguments.get("timezone"),
-            "timezone": arguments.get("timezone"),
-            "limit": arguments.get("limit"),
-        }
-        payload = call_daxview_api("GET", path, request_id, query=query)
-        data = normalize_api_energy_ranking(payload, arguments)
-        return {"structuredContent": {"status": "ok", "operation_id": "device_energy_ranking", "data": data}}
-    if operation_id == "telemetry_timeseries":
-        query = {
-            "site_id": arguments.get("site_id"),
-            "building_id": arguments.get("building_id"),
-            "device_id": arguments.get("device_id"),
-            "metric": arguments.get("metric"),
-            "phase": arguments.get("phase"),
-            "from": arguments.get("start_time"),
-            "to": arguments.get("end_time"),
-            "start_time": arguments.get("start_time"),
-            "end_time": arguments.get("end_time"),
-            "timezone": arguments.get("timezone"),
-            "bucket": arguments.get("bucket"),
-            "aggregation": arguments.get("aggregation"),
-            "value_mode": arguments.get("value_mode"),
-            "limit": arguments.get("limit"),
-        }
-        payload = call_daxview_api("GET", daxview_api_path(DAXVIEW_API_TELEMETRY_PATH), request_id, query=query)
-        return {"structuredContent": {"status": "ok", "operation_id": operation_id, "data": payload.get("data") if isinstance(payload.get("data"), dict) else payload}}
-    raise ValueError(f"DaxView API provider does not support {operation_id} yet")
 
 
 def first_dict_with_list(value, list_keys: tuple[str, ...]) -> dict | None:
@@ -3749,6 +3639,14 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         try:
             step_context = {**context, "metric": metric} if metric else context
             arguments = build_historical_arguments(operation_id, step_context, message)
+            debug_trace_event(
+                "daxview_tool_arguments_debug",
+                request_id=request_id,
+                turn_id=turn_id,
+                operation_id=operation_id,
+                metric=metric,
+                arguments=redact_debug_value(arguments),
+            )
         except ValueError as error:
             return {
                 "provider": "daxview-question-filter",
@@ -3781,16 +3679,12 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
                     raise
             continue
         try:
-            if DAXVIEW_API_ENABLED:
-                result = run_daxview_api_operation(operation_id, arguments, request_id)
-                normalized_arguments = arguments
-            else:
-                plan = request_daxview_data_plan(turn_id, operation_id, arguments, request_id)
-                authorization_id = plan.get("authorization_id")
-                normalized_arguments = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else arguments
-                if not authorization_id:
-                    raise RuntimeError(f"Daxview did not return a data authorization for {operation_id}")
-                result = call_authorized_historical_tool(operation_id, str(authorization_id), normalized_arguments, request_id)
+            plan = request_daxview_data_plan(turn_id, operation_id, arguments, request_id)
+            authorization_id = plan.get("authorization_id")
+            normalized_arguments = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else arguments
+            if not authorization_id:
+                raise RuntimeError(f"Daxview did not return a data authorization for {operation_id}")
+            result = call_authorized_historical_tool(operation_id, str(authorization_id), normalized_arguments, request_id)
             if AI_MCP_FALLBACKS_ENABLED and operation_id == "demand_peak_summary" and demand_peak_needs_manual_fallback(result):
                 try:
                     results.append(try_manual_demand_peak_fallback(turn_id, normalized_arguments, request_id))
@@ -3828,9 +3722,9 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
             for item in errors
         )
         return {
-            "provider": "daxview-direct-api" if DAXVIEW_API_ENABLED else "daxview-historical-mcp",
+            "provider": "daxview-historical-mcp",
             "reply": readable_historical_errors(errors) or error_detail or (
-                "No DaxView API endpoint returned data." if DAXVIEW_API_ENABLED else "No DaxView MCP tool returned data."
+                "No DaxView MCP tool returned data."
             ),
             "charts": [],
             "debug_charts": [],
@@ -3853,7 +3747,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         charts=preview_charts,
     )
     return {
-        "provider": "daxview-direct-api" if DAXVIEW_API_ENABLED else "daxview-historical-mcp",
+        "provider": "daxview-historical-mcp",
         "reply": refined_reply,
         "charts": charts,
         "debug_charts": preview_charts,
@@ -4733,7 +4627,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
     <header>
       <div>
         <h1>AI Data Trace Dashboard</h1>
-        <div class="meta">DaxView -> AI Server -> API or MCP provider -> AI Server -> DaxView</div>
+        <div class="meta">DaxView -> AI Server -> Data Plan -> MCP -> AI Server -> DaxView</div>
       </div>
       <button id="refresh">Refresh</button>
     </header>
@@ -4770,8 +4664,8 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       }
       const flowStages = [
         {key: "incoming", label: "DaxView In", match: e => /daxview|api_to_ui/i.test(e.event || "") || e.job_id},
+        {key: "planner", label: "LLM Planner", match: e => /planner/i.test(e.event || "")},
         {key: "plan", label: "Data Plan", match: e => /data_plan/i.test(e.event || "")},
-        {key: "api", label: "API Call", match: e => /daxview_api/i.test(e.event || "")},
         {key: "mcp", label: "MCP Tool", match: e => /mcp_tool/i.test(e.event || "")},
         {key: "retrieval", label: "Knowledge", match: e => /retrieve|context|embedding/i.test(e.event || "")},
         {key: "model", label: "AI Model", match: e => /ollama|agent|synthesizer|mcp_answer_refine/i.test(e.event || "")},
@@ -4823,7 +4717,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       }
       function renderInspectors(events) {
         const answers = events.filter(e => e.event === "mcp_answer_refine_response_debug" && e.role !== "compare");
-        const payloads = events.filter(e => e.event === "mcp_tool_request_payload_debug" || e.event === "mcp_tool_response_payload_debug" || e.event === "daxview_api_response_debug");
+        const payloads = events.filter(e => e.event === "mcp_tool_request_payload_debug" || e.event === "mcp_tool_response_payload_debug");
         const answerHtml = answers.map((item, index) => `<div class="answer-block"><strong>${escapeHtml(item.role || "model")} - ${escapeHtml(item.model || "unknown model")}</strong><br>${escapeHtml(item.answer || "")}</div>`).join("");
         const payloadHtml = payloads.map(item => `<details><summary>${escapeHtml(item.event.replace("_debug", ""))} · ${escapeHtml(item.tool || "")}</summary><pre>${escapeHtml(JSON.stringify(item, null, 2))}</pre></details>`).join("");
         if (!answerHtml && !payloadHtml) return "";
@@ -5582,7 +5476,6 @@ class ChatHandler(BaseHTTPRequestHandler):
                     "conversation_store": bool(DATABASE_URL),
                     "job_queue": True,
                     "mcp_client": DAXVIEW_MCP_ENABLED,
-                    "api_client": DAXVIEW_API_ENABLED,
                     "supported_manifest_versions": ["2026-09-14"],
                 },
             )
