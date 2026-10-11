@@ -46,7 +46,7 @@ if not AI_COMPARE_MODELS and AI_COMPARE_MODEL:
 AI_COMPARE_MODEL_SHOW_TO_USER = os.getenv("AI_COMPARE_MODEL_SHOW_TO_USER", "false").lower() in {"1", "true", "yes", "on"}
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 OLLAMA_GENERATE_TIMEOUT = int(os.getenv("OLLAMA_GENERATE_TIMEOUT", "120"))
-AI_SANDBOX_MODEL_TIMEOUT = int(os.getenv("AI_SANDBOX_MODEL_TIMEOUT", "420"))
+AI_SANDBOX_MODEL_TIMEOUT = int(os.getenv("AI_SANDBOX_MODEL_TIMEOUT", "180"))
 AI_SANDBOX_PLANNER_TIMEOUT = int(os.getenv("AI_SANDBOX_PLANNER_TIMEOUT", "120"))
 OLLAMA_EMBEDDING_TIMEOUT = int(os.getenv("OLLAMA_EMBEDDING_TIMEOUT", "30"))
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -4057,6 +4057,64 @@ def decide_sandbox_data_access(message: str, history: list[dict], request_id: st
     return normalized
 
 
+def fast_sandbox_data_decision(message: str) -> dict | None:
+    """Skip an LLM routing round-trip for clear sample-data requests and conceptual questions."""
+    text = re.sub(r"[^a-z0-9%]+", " ", message.lower()).strip()
+    sample_reference = any(term in text for term in (
+        "sample", "synthetic", "demo", "this site", "this device", "today", "yesterday",
+        "last week", "this week", "last 7 days", "last 30 days", "for the week",
+    ))
+    has_carbon = any(term in text for term in ("carbon", "emission", "co2"))
+    if has_carbon and sample_reference:
+        return {"needs_sample_data": True, "categories": ["energy"],
+                "formula_topics": ["carbon"], "reason": "Sample emissions request; energy data and carbon factor are required.",
+                "routing": "fast_path"}
+
+    has_device = any(term in text for term in ("device", "devices", "consumer", "consumers"))
+    has_ranking = any(term in text for term in ("rank", "top", "highest", "lowest", "most energy"))
+    if has_device and has_ranking:
+        return {"needs_sample_data": True, "categories": ["devices"],
+                "formula_topics": [], "reason": "Sample device ranking request.", "routing": "fast_path"}
+
+    has_demand = any(term in text for term in ("peak demand", "maximum demand", "max demand"))
+    if sample_reference and has_demand:
+        return {"needs_sample_data": True, "categories": ["demand"],
+                "formula_topics": ["demand"], "reason": "Sample demand request.", "routing": "fast_path"}
+
+    conceptual = text.startswith(("what is ", "what are ", "what does ", "explain ", "define "))
+    if conceptual and not sample_reference:
+        return {"needs_sample_data": False, "categories": [], "formula_topics": [],
+                "reason": "General conceptual question; sample readings are not needed.", "routing": "fast_path"}
+    return None
+
+
+def sandbox_calculation_fallback(message: str, facts: dict) -> str | None:
+    """Provide an explicit deterministic answer when the answer model cannot finish."""
+    carbon = facts.get("carbon_estimate")
+    if carbon:
+        return (
+            "The LLM did not finish, so here is the calculation from the synthetic sample. "
+            f"Estimated emissions: {carbon['kg_co2e']:,.2f} kg CO2e = "
+            f"{facts['daily_energy_total_kwh']:,.2f} kWh x "
+            f"{carbon['factor_kg_co2e_per_kwh']} kg CO2e/kWh. "
+            f"Period: {carbon['period']}. Limitation: {carbon['status']}."
+        )
+    ranking = facts.get("device_energy_ranking")
+    if ranking and any(word in message.lower() for word in ("rank", "top", "highest", "lowest")):
+        rows = sorted(ranking, key=lambda row: float(row.get("energy_kwh") or 0), reverse=True)
+        lines = ["The LLM did not finish; these are the calculated synthetic sample device rankings:"]
+        lines.extend(f"{index}. {row['name']} (ID {row['device_id']}): {row['energy_kwh']:,.2f} kWh"
+                     for index, row in enumerate(rows[:5], 1))
+        return "\n".join(lines)
+    demand = facts.get("peak_demand_kw")
+    if demand:
+        return ("The LLM did not finish; calculated from the synthetic sample: "
+                f"peak demand {demand['value']} kW at {demand['timestamp']}; "
+                f"minimum demand {facts['minimum_demand_kw']['value']} kW. "
+                f"Readings use {facts['demand_interval_minutes']}-minute intervals.")
+    return None
+
+
 def run_sandbox_chat(message: str, history: list[dict], request_id: str, progress=None) -> dict:
     """Answer as a general chat model and load sample readings only when its planner requests them."""
     def set_progress(phase: str) -> None:
@@ -4065,7 +4123,12 @@ def run_sandbox_chat(message: str, history: list[dict], request_id: str, progres
 
     debug_trace_event("sandbox_input_debug", request_id=request_id, mode="normal_chat", message=message)
     set_progress("Asking the LLM whether sample readings are needed")
-    decision = decide_sandbox_data_access(message, history, request_id)
+    decision = fast_sandbox_data_decision(message)
+    if decision:
+        debug_trace_event("sandbox_decision_fast_path", request_id=request_id, **decision)
+    else:
+        set_progress("Asking the LLM whether sample readings are needed")
+        decision = decide_sandbox_data_access(message, history, request_id)
     categories = decision["categories"]
     dataset = sample_dataset() if decision["needs_sample_data"] else None
     if dataset:
@@ -4113,31 +4176,42 @@ def run_sandbox_chat(message: str, history: list[dict], request_id: str, progres
                       data_categories=categories, prompt_preview=preview(messages[-1]["content"], 500))
     set_progress("Waiting for Ollama to generate the answer")
     started = time.perf_counter()
+    answer_mode = "llm"
     try:
         data = ollama_json("/api/chat", {
             "model": CHAT_MODEL,
             "messages": messages,
             "stream": False,
             "think": False,
-            "options": {"temperature": 0.2, "num_predict": 512},
+            "options": {"temperature": 0.2, "num_predict": 192},
         }, timeout=AI_SANDBOX_MODEL_TIMEOUT)
     except (HTTPError, URLError, TimeoutError, ValueError) as error:
         debug_trace_event("sandbox_model_failed", request_id=request_id, model=CHAT_MODEL, error=str(error))
-        raise RuntimeError(f"Sandbox model request failed: {error}") from error
-    model_message = data.get("message") or {}
-    reply = str(model_message.get("content") or "").strip()
+        reply = sandbox_calculation_fallback(message, facts) or ""
+        if reply:
+            answer_mode = "deterministic_fallback"
+        else:
+            raise RuntimeError(f"Sandbox model request failed: {error}") from error
+    else:
+        model_message = data.get("message") or {}
+        reply = str(model_message.get("content") or "").strip()
     if not reply:
         debug_trace_event("sandbox_model_failed", request_id=request_id, model=CHAT_MODEL,
                           error="empty model answer", thinking_chars=len(str(model_message.get("thinking") or "")),
                           done_reason=data.get("done_reason"), eval_count=data.get("eval_count"))
-        raise RuntimeError("Ollama finished without a visible answer. Retry once; if it repeats, check the Ollama container logs and available memory.")
+        reply = sandbox_calculation_fallback(message, facts) or ""
+        if not reply:
+            raise RuntimeError("Ollama finished without a visible answer. Retry once; if it repeats, check the Ollama container logs and available memory.")
+        answer_mode = "deterministic_fallback"
     elapsed_ms = round((time.perf_counter() - started) * 1000)
-    debug_trace_event("sandbox_llm_response_debug", request_id=request_id, model=CHAT_MODEL,
-                      duration_ms=elapsed_ms, answer=reply)
+    debug_trace_event("sandbox_answer_fallback" if answer_mode != "llm" else "sandbox_llm_response_debug",
+                      request_id=request_id, model=CHAT_MODEL, duration_ms=elapsed_ms,
+                      answer_mode=answer_mode, answer=reply)
     result = {
         "request_id": request_id,
         "provider": "ollama-sandbox",
         "model": CHAT_MODEL,
+        "answer_mode": answer_mode,
         "answer": reply,
         "charts": charts,
         "report": report,
@@ -4890,7 +4964,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         {key: "mcp", label: "MCP Tool", match: e => /mcp_tool/i.test(e.event || "")},
         {key: "retrieval", label: "Knowledge", match: e => /retrieve|context|embedding/i.test(e.event || "")},
         {key: "model", label: "AI Model", match: e => /ollama|agent|synthesizer|mcp_answer_refine|sandbox_llm|sandbox_decision/i.test(e.event || "")},
-        {key: "response", label: "Response", match: e => e.event === "sandbox_outcome_debug" ||
+        {key: "response", label: "Response", match: e => e.event === "sandbox_outcome_debug" || e.event === "sandbox_answer_fallback" ||
           (/response|completed|api_to_ui/i.test(e.event || "") && !/sandbox_decision_response/i.test(e.event || ""))},
       ];
       function durationMs(events) {

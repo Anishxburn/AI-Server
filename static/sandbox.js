@@ -82,9 +82,12 @@
       history.push({role:'assistant', content:result.answer});
       pendingNode = null;
       renderOutput(result);
+      const completion = result.answer_mode === 'deterministic_fallback'
+        ? 'The LLM did not finish; a calculation-based fallback was returned.'
+        : `Completed with ${result.model}.`;
       setStatus(result.data_accessed
-        ? `Completed with ${result.model}. Sample data used: ${result.dataset.categories_loaded.join(', ')}. MCP called: no.`
-        : `Completed with ${result.model}. No sample readings were loaded. MCP called: no.`);
+        ? `${completion} Sample data used: ${result.dataset.categories_loaded.join(', ')}. MCP called: no.`
+        : `${completion} No sample readings were loaded. MCP called: no.`);
     } catch (error) {
       if (pendingNode) pendingNode.textContent = error.message;
       if (pendingNode) pendingNode.classList.add('error');
