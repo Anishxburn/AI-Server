@@ -2,10 +2,11 @@
   <div class="sandbox-head">
     <div>
       <h2>EMS Sandbox</h2>
-      <p>Local LLM chat grounded in synthetic EMS readings. No DaxView or MCP requests are made.</p>
+      <p>Normal local LLM chat. Synthetic EMS readings are added only when needed; no DaxView or MCP requests are made.</p>
     </div>
     <div class="sandbox-actions">
       <span class="sandbox-badge">SYNTHETIC DATA</span>
+      <span id="sandbox-runtime" class="sandbox-runtime" role="status">Checking Ollama...</span>
       <button id="sandbox-clear" class="secondary" type="button" title="Clear this sandbox conversation">Clear chat</button>
     </div>
   </div>
@@ -26,7 +27,7 @@
     </aside>
     <section class="sandbox-main" aria-label="Sandbox conversation and output">
       <div id="sandbox-chat" class="sandbox-chat" aria-live="polite">
-        <div class="sandbox-intro">Ask a question about the sample EMS data, or ask the model a general question. Follow-up questions use this chat's recent messages.</div>
+        <div class="sandbox-intro">Ask a general question or ask about the synthetic EMS sample. The model decides whether readings are needed; follow-up questions use this chat's recent messages.</div>
       </div>
       <form id="sandbox-form" class="sandbox-form">
         <textarea id="sandbox-input" rows="2" maxlength="4000" placeholder="Ask about demand, energy, devices, voltage, current, alarms, or EMS concepts..." required></textarea>

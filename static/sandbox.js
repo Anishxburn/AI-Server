@@ -26,13 +26,21 @@
       const state = await api(`/jobs/${encodeURIComponent(accepted.job_id)}`);
       if (state.status === 'completed') return state.result;
       if (state.status === 'failed') throw new Error(state.error || 'Sandbox model generation failed.');
-      setStatus(state.status === 'queued' ? 'Queued for the model...' : 'The model is generating an answer...');
+      setStatus(state.phase || (state.status === 'queued' ? 'Queued for the model...' : 'The model is working...'));
     }
     throw new Error('The model is still working. Check Traces for the sandbox job status.');
   }
   function setStatus(message, error = false) {
     byId('sandbox-status').textContent = message;
     byId('sandbox-status').dataset.error = String(error);
+  }
+  function setBusy(value) {
+    busy = value;
+    byId('sandbox-send').disabled = value;
+    byId('sandbox-input').disabled = value;
+    byId('sandbox-clear').disabled = value;
+    document.querySelectorAll('.sandbox-prompt').forEach(button => { button.disabled = value; });
+    byId('sandbox-status').setAttribute('aria-busy', String(value));
   }
   function appendMessage(role, content, model = '') {
     const intro = byId('sandbox-chat').querySelector('.sandbox-intro');
@@ -48,7 +56,7 @@
       <div class="sandbox-chart"><canvas id="sandbox-chart-${index}" aria-label="${esc(chart.title)}" role="img"></canvas></div>
       <details><summary>Chart specification</summary><pre>${esc(JSON.stringify(chart, null, 2))}</pre></details></section>`).join('');
     const report = result.report ? `<section><h3>Report preview</h3><pre>${esc(JSON.stringify(result.report, null, 2))}</pre></section>` : '';
-    const evidence = `<details><summary>Calculated evidence and provenance</summary><pre>${esc(JSON.stringify({dataset:result.dataset,evidence:result.evidence,formulas:result.formula_reference,mcp_called:result.mcp_called}, null, 2))}</pre></details>`;
+    const evidence = `<details><summary>Data decision and evidence</summary><pre>${esc(JSON.stringify({data_accessed:result.data_accessed,data_decision:result.data_decision,dataset:result.dataset,evidence:result.evidence,formulas:result.formula_reference,mcp_called:result.mcp_called}, null, 2))}</pre></details>`;
     const root = byId('sandbox-output');
     root.hidden = false;
     root.innerHTML = (charts || report ? `<h3>Generated output</h3>${charts}${report}` : '') + evidence;
@@ -59,27 +67,25 @@
   }
   async function send(message) {
     if (busy || !message.trim()) return;
-    busy = true;
-    byId('sandbox-send').disabled = true;
-    byId('sandbox-input').disabled = true;
+    setBusy(true);
     byId('sandbox-output').hidden = true;
     appendMessage('user', message);
     history.push({role:'user', content:message});
-    setStatus('Sending this question and recent chat context to the configured model...');
+    setStatus('Asking the LLM whether this question needs sample readings...');
     try {
       const result = await submitAndWait({message, history:history.slice(0, -1).slice(-12)});
       appendMessage('assistant', result.answer, result.model);
       history.push({role:'assistant', content:result.answer});
       renderOutput(result);
-      setStatus(`Completed with ${result.model}. Source: synthetic demo data. MCP called: no.`);
+      setStatus(result.data_accessed
+        ? `Completed with ${result.model}. Sample data used: ${result.dataset.categories_loaded.join(', ')}. MCP called: no.`
+        : `Completed with ${result.model}. No sample readings were loaded. MCP called: no.`);
     } catch (error) {
       appendMessage('assistant', error.message);
       history.push({role:'assistant', content:error.message});
       setStatus(error.message, true);
     } finally {
-      busy = false;
-      byId('sandbox-send').disabled = false;
-      byId('sandbox-input').disabled = false;
+      setBusy(false);
       byId('sandbox-input').focus();
     }
   }
@@ -106,15 +112,22 @@
     async refresh() {
       try {
         const data = await api('', undefined);
-        byId('sandbox-dataset').innerHTML = `<strong>${esc(data.dataset.dataset_name)}</strong><br>${esc(data.dataset.site.name)} · Site ${esc(data.dataset.site.site_id)}<br>${data.dataset.devices.length} sample devices · ${data.dataset.daily_energy.length} daily energy readings<br><em>Entire dataset is synthetic.</em>`;
-        const top = [...data.dataset.devices].sort((a,b) => b.energy_kwh - a.energy_kwh)[0];
-        const peak = data.dataset.demand_hourly.reduce((best,row) => row.value > best.value ? row : best);
-        byId('sandbox-facts').innerHTML = [
+        const runtime = data.ollama || {};
+        const runtimeLabel = runtime.status === 'online'
+          ? `Ollama online Â· ${runtime.model_installed ? 'chat model available' : 'configured model not installed'} (${runtime.model})`
+          : `Ollama offline Â· ${runtime.error || 'cannot connect'}`;
+        byId('sandbox-runtime').textContent = runtimeLabel;
+        byId('sandbox-runtime').dataset.error = String(runtime.status !== 'online' || !runtime.model_installed);
+        byId('sandbox-dataset').innerHTML = `<strong>${esc(data.dataset.dataset_name)}</strong><br>${esc(data.dataset.site.name)} / Site ${esc(data.dataset.site.site_id)}<br><em>Synthetic only. Readings enter a chat prompt only when relevant.</em>`;
+        /*
+        if (false) byId('sandbox-facts').innerHTML = [
           ['7-day energy', `${Number(data.dataset.daily_energy.reduce((sum,row) => sum + row.value, 0)).toLocaleString()} kWh`],
           ['Peak demand', `${peak.value} kW`],
           ['Highest consumer', `${esc(top.name)} · ${Number(top.energy_kwh).toLocaleString()} kWh`],
           ['Model', esc(data.model)],
         ].map(([label,value]) => `<div class="sandbox-fact"><span>${label}</span><strong>${value}</strong></div>`).join('');
+        */
+        byId('sandbox-facts').innerHTML = `<div class="sandbox-fact"><span>Available categories</span><strong>${data.dataset.available_categories.map(esc).join(', ')}</strong></div><div class="sandbox-fact"><span>Model</span><strong>${esc(data.model)}</strong></div>`;
         byId('sandbox-formulas').innerHTML = data.formulas.map(item => `<div class="sandbox-formula"><strong>${esc(item.name)}</strong><code>${esc(item.formula)}</code>${esc(item.needs)}</div>`).join('');
       } catch (error) { setStatus(error.message, true); }
     },

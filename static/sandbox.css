@@ -5,7 +5,10 @@
 #sandbox-status[data-error=true] { color:#b42318; }
 .sandbox-actions { display:flex; gap:8px; align-items:center; }
 .sandbox-badge { color:#8a4b08; background:#fff7ed; border:1px solid #fed7aa; padding:5px 8px; border-radius:4px; font-size:10px; font-weight:700; }
+.sandbox-runtime { color:#047857; font-size:11px; }
+.sandbox-runtime[data-error=true] { color:#b42318; }
 #sandbox-workspace button { font:inherit; cursor:pointer; }
+#sandbox-workspace button:disabled { opacity:.55; cursor:wait; }
 #sandbox-workspace button.secondary { border:1px solid #cbd5e1; color:#334155; background:#fff; border-radius:5px; padding:7px 10px; }
 .sandbox-layout { display:grid; grid-template-columns:270px minmax(0,1fr); min-height:calc(100vh - 190px); }
 .sandbox-data { padding:18px; background:#f8fafc; border-right:1px solid #e2e8f0; }

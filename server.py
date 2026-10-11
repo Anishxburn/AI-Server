@@ -47,6 +47,7 @@ AI_COMPARE_MODEL_SHOW_TO_USER = os.getenv("AI_COMPARE_MODEL_SHOW_TO_USER", "fals
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 OLLAMA_GENERATE_TIMEOUT = int(os.getenv("OLLAMA_GENERATE_TIMEOUT", "120"))
 AI_SANDBOX_MODEL_TIMEOUT = int(os.getenv("AI_SANDBOX_MODEL_TIMEOUT", "420"))
+AI_SANDBOX_PLANNER_TIMEOUT = int(os.getenv("AI_SANDBOX_PLANNER_TIMEOUT", "120"))
 OLLAMA_EMBEDDING_TIMEOUT = int(os.getenv("OLLAMA_EMBEDDING_TIMEOUT", "30"))
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 RAG_MATCH_LIMIT = int(os.getenv("RAG_MATCH_LIMIT", "5"))
@@ -3970,10 +3971,114 @@ def ollama_json(path: str, payload: dict, timeout: int = 300) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
-def run_sandbox_chat(message: str, history: list[dict], request_id: str) -> dict:
-    """Answer against local synthetic EMS readings without entering the MCP path."""
-    dataset = sample_dataset()
-    facts, charts, report = prepare_sandbox_context(message, dataset)
+def sandbox_ollama_status() -> dict:
+    """Report whether Ollama responds and the configured chat model is installed."""
+    try:
+        with urlopen(f"{OLLAMA_URL}/api/tags", timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        models = payload.get("models", []) if isinstance(payload, dict) else []
+        names = [str(item.get("name") or item.get("model") or "") for item in models if isinstance(item, dict)]
+        installed = any(name == CHAT_MODEL or name.startswith(f"{CHAT_MODEL}:") for name in names)
+        return {"status": "online", "model": CHAT_MODEL,
+                "model_installed": installed, "available_models": names}
+    except Exception as error:
+        return {"status": "offline", "model": CHAT_MODEL, "model_installed": False,
+                "error": str(error)[:180]}
+
+
+def decide_sandbox_data_access(message: str, history: list[dict], request_id: str) -> dict:
+    schema = {
+        "type": "object",
+        "properties": {
+            "needs_sample_data": {"type": "boolean"},
+            "categories": {"type": "array", "items": {"type": "string", "enum": ["energy", "devices", "demand", "telemetry", "alarms", "site"]}},
+            "formula_topics": {"type": "array", "items": {"type": "string", "enum": ["energy", "demand", "power_quality", "carbon", "comparison"]}},
+            "reason": {"type": "string"},
+        },
+        "required": ["needs_sample_data", "categories", "formula_topics", "reason"],
+        "additionalProperties": False,
+    }
+    system = (
+        "You are deciding whether a normal chat answer needs values from an optional local synthetic EMS sample. "
+        "Conceptual questions, general explanations, greetings, and calculations using numbers the user supplied "
+        "do not need sample data. Only choose sample data when the user asks about actual readings, the sample/site, "
+        "a device ranking, a time trend, alarms, or a report based on the sample. Choose the smallest category set "
+        "that can answer the current question, using conversation history for follow-ups. Never select every category "
+        "by default. If the question is ambiguous, do not load sample data. Category guidance: site energy, daily "
+        "energy, or sample carbon estimates use energy; top/highest/lowest consuming devices use devices; peak or "
+        "maximum demand uses demand; voltage, current, or power factor uses telemetry; alarm counts/types use alarms; "
+        "site identity or a site overview uses site. Carbon calculations may include energy plus the carbon formula. "
+        "User-provided readings must be calculated without reading the sample. Return only the requested JSON fields."
+    )
+    normalized_history = []
+    for turn in history[-10:]:
+        if not isinstance(turn, dict):
+            continue
+        role = turn.get("role")
+        content = str(turn.get("content") or "").strip()
+        if role in {"user", "assistant"} and content:
+            normalized_history.append({"role": role, "content": content[:2500]})
+    debug_trace_event("sandbox_decision_started", request_id=request_id, model=CHAT_MODEL)
+    started = time.perf_counter()
+    try:
+        response = ollama_json("/api/chat", {
+            "model": CHAT_MODEL,
+            "messages": [{"role": "system", "content": system}, *normalized_history,
+                         {"role": "user", "content": message[:4000]}],
+            "stream": False,
+            "format": schema,
+            "options": {"temperature": 0, "num_predict": 160},
+        }, timeout=AI_SANDBOX_PLANNER_TIMEOUT)
+        raw = str(((response.get("message") or {}).get("content") or "")).strip()
+        decision = json.loads(raw)
+        allowed_categories = {"energy", "devices", "demand", "telemetry", "alarms", "site"}
+        categories = list(dict.fromkeys(
+            item for item in decision.get("categories", []) if item in allowed_categories
+        ))
+        needs_data = bool(decision.get("needs_sample_data")) and bool(categories)
+        if not needs_data:
+            categories = []
+        allowed_formulas = {"energy", "demand", "power_quality", "carbon", "comparison"}
+        formula_topics = list(dict.fromkeys(
+            item for item in decision.get("formula_topics", []) if item in allowed_formulas
+        ))
+        normalized = {
+            "needs_sample_data": needs_data,
+            "categories": categories,
+            "formula_topics": formula_topics,
+            "reason": str(decision.get("reason") or "")[:300],
+        }
+    except Exception as error:
+        normalized = {"needs_sample_data": False, "categories": [], "formula_topics": [],
+                      "reason": f"Data decision unavailable: {error}"[:300]}
+    debug_trace_event("sandbox_decision_response_debug", request_id=request_id, model=CHAT_MODEL,
+                      duration_ms=round((time.perf_counter() - started) * 1000), **normalized)
+    return normalized
+
+
+def run_sandbox_chat(message: str, history: list[dict], request_id: str, progress=None) -> dict:
+    """Answer as a general chat model and load sample readings only when its planner requests them."""
+    def set_progress(phase: str) -> None:
+        if progress:
+            progress(phase)
+
+    debug_trace_event("sandbox_input_debug", request_id=request_id, mode="normal_chat", message=message)
+    set_progress("Asking the LLM whether sample readings are needed")
+    decision = decide_sandbox_data_access(message, history, request_id)
+    categories = decision["categories"]
+    dataset = sample_dataset() if decision["needs_sample_data"] else None
+    if dataset:
+        facts, charts, report = prepare_sandbox_context(message, dataset, categories)
+        dataset_info = {"name": dataset["dataset_name"], "source": dataset["source"],
+                        "is_live": False, "categories_loaded": categories}
+        debug_trace_event("sandbox_data_loaded_debug", request_id=request_id, source=dataset["source"],
+                          categories=categories, fields=list(facts.keys()))
+    else:
+        facts, charts, report = {}, [], None
+        dataset_info = {"name": None, "source": "not_used", "is_live": False, "categories_loaded": []}
+        debug_trace_event("sandbox_data_skipped_debug", request_id=request_id, reason=decision["reason"])
+    formulas = formula_reference(decision["formula_topics"])
+    set_progress("Preparing a normal chat answer" if not dataset else f"Sample data loaded: {', '.join(categories)}")
     normalized_history = []
     for turn in history[-10:]:
         if not isinstance(turn, dict):
@@ -3983,29 +4088,29 @@ def run_sandbox_chat(message: str, history: list[dict], request_id: str) -> dict
         if role in {"user", "assistant"} and content:
             normalized_history.append({"role": role, "content": content[:2500]})
     system = (
-        "You are an EMS-focused assistant in a local sandbox. Answer the user's full question in a natural, "
-        "practical way and use prior messages to understand follow-ups without requiring special keywords. "
-        "You may answer non-EMS questions too. Ground every numeric claim about the site in the supplied "
-        "synthetic dataset or calculated facts. State units, period, calculation, and assumptions when useful. "
-        "Never present synthetic data as live DaxView data. If the sample does not contain a requested value, "
-        "say so and explain what input would be needed. Use EMS terms accurately; peak demand is the maximum "
-        "interval-average kW in this sample, not an instantaneous reading. Keep standards or generic cautions "
-        "out unless they help answer the question."
+        "You are a helpful general chatbot with strong Energy Management System knowledge. Answer naturally, "
+        "understand follow-ups from the conversation, and answer non-EMS questions too. No sample readings were "
+        "loaded unless an optional data block is explicitly included below. If no sample data is included, answer "
+        "conceptual questions normally and calculate from values the user provided; do not invent site readings. "
+        "When synthetic sample facts are included, use only those facts, state that they are synthetic, retain units "
+        "and periods, and do not imply they are live DaxView data. Keep answers focused and avoid generic standards "
+        "or cautions unless they are relevant."
     )
-    user_context = {
-        "question": message[:4000],
-        "sample_dataset": dataset,
-        "deterministic_calculations": facts,
-        "formula_reference": formula_reference(),
-    }
+    data_context = {}
+    if dataset:
+        data_context["synthetic_sample_data"] = {"categories": categories, "calculated_facts": facts}
+    if formulas:
+        data_context["formula_reference"] = formulas
+    data_block = ""
+    if data_context:
+        data_block = "\n\nOptional context selected for this question (synthetic readings are not live):\n" + json.dumps(
+            data_context, ensure_ascii=True
+        )
     messages = [{"role": "system", "content": system}, *normalized_history,
-                {"role": "user", "content": json.dumps(user_context, ensure_ascii=True)}]
-    debug_trace_event("sandbox_input_debug", request_id=request_id, mode="synthetic", message=message)
-    debug_trace_event("sandbox_data_context_debug", request_id=request_id,
-                      dataset=dataset["dataset_name"], source=dataset["source"], facts=facts,
-                      formulas=formula_reference())
+                {"role": "user", "content": message[:4000] + data_block}]
     debug_trace_event("sandbox_llm_request", request_id=request_id, model=CHAT_MODEL,
-                      prompt_preview=preview(json.dumps(user_context), 500))
+                      data_categories=categories, prompt_preview=preview(messages[-1]["content"], 500))
+    set_progress("Waiting for Ollama to generate the answer")
     started = time.perf_counter()
     try:
         data = ollama_json("/api/chat", {
@@ -4032,8 +4137,10 @@ def run_sandbox_chat(message: str, history: list[dict], request_id: str) -> dict
         "charts": charts,
         "report": report,
         "evidence": facts,
-        "dataset": {"name": dataset["dataset_name"], "source": dataset["source"], "is_live": False},
-        "formula_reference": formula_reference(),
+        "dataset": dataset_info,
+        "formula_reference": formulas,
+        "data_decision": decision,
+        "data_accessed": bool(dataset),
         "mcp_called": False,
     }
     debug_trace_event("sandbox_outcome_debug", status="completed", **result)
@@ -4046,18 +4153,24 @@ def process_sandbox_job(job_id: str, request_id: str, message: str, history: lis
         if not job:
             return
         job["status"] = "running"
+        job["phase"] = "Starting the LLM data decision"
     try:
-        result = run_sandbox_chat(message, history, request_id)
+        def update_phase(phase: str) -> None:
+            with SANDBOX_JOBS_LOCK:
+                if job_id in SANDBOX_JOBS:
+                    SANDBOX_JOBS[job_id]["phase"] = phase
+
+        result = run_sandbox_chat(message, history, request_id, update_phase)
         with SANDBOX_JOBS_LOCK:
             job = SANDBOX_JOBS.get(job_id)
             if job:
-                job.update({"status": "completed", "result": result})
+                job.update({"status": "completed", "phase": "Answer ready", "result": result})
     except Exception as error:
         debug_trace_event("sandbox_job_failed", request_id=request_id, job_id=job_id, error=str(error))
         with SANDBOX_JOBS_LOCK:
             job = SANDBOX_JOBS.get(job_id)
             if job:
-                job.update({"status": "failed", "error": str(error)})
+                job.update({"status": "failed", "phase": "Generation failed", "error": str(error)})
 
 
 def parse_mcp_response(raw: str) -> dict:
@@ -4678,7 +4791,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       .chip.fail { background: #fee2e2; color: #991b1b; }
       .chip.ok { background: #dcfce7; color: #166534; }
       .timeline { padding: 12px 14px; max-height: calc(100vh - 150px); overflow: auto; }
-      .flow { display: grid; grid-template-columns: repeat(6, minmax(118px, 1fr)); gap: 8px; padding: 12px 14px; border-bottom: 1px solid #e5ebf3; background: #fbfdff; }
+      .flow { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 8px; padding: 12px 14px; border-bottom: 1px solid #e5ebf3; background: #fbfdff; }
       .stage { border: 1px solid #cbd5e1; border-radius: 8px; padding: 9px; min-height: 76px; background: white; }
       .stage.done { border-color: #22c55e; background: #f0fdf4; }
       .stage.fail { border-color: #ef4444; background: #fef2f2; }
@@ -4764,12 +4877,16 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       }
       const flowStages = [
         {key: "incoming", label: "DaxView In", match: e => /daxview|api_to_ui/i.test(e.event || "") || e.job_id},
+        {key: "sandbox_input", label: "Sandbox Input", match: e => e.event === "sandbox_input_debug"},
+        {key: "sandbox_decision", label: "LLM Data Decision", match: e => /sandbox_decision/i.test(e.event || "")},
+        {key: "sandbox_data", label: "Sample Data", match: e => /sandbox_data_(loaded|skipped)/i.test(e.event || "")},
         {key: "planner", label: "LLM Planner", match: e => /planner/i.test(e.event || "")},
         {key: "plan", label: "Data Plan", match: e => /data_plan/i.test(e.event || "")},
         {key: "mcp", label: "MCP Tool", match: e => /mcp_tool/i.test(e.event || "")},
         {key: "retrieval", label: "Knowledge", match: e => /retrieve|context|embedding/i.test(e.event || "")},
-        {key: "model", label: "AI Model", match: e => /ollama|agent|synthesizer|mcp_answer_refine/i.test(e.event || "")},
-        {key: "response", label: "Response", match: e => /response|completed|api_to_ui/i.test(e.event || "")},
+        {key: "model", label: "AI Model", match: e => /ollama|agent|synthesizer|mcp_answer_refine|sandbox_llm|sandbox_decision/i.test(e.event || "")},
+        {key: "response", label: "Response", match: e => e.event === "sandbox_outcome_debug" ||
+          (/response|completed|api_to_ui/i.test(e.event || "") && !/sandbox_decision_response/i.test(e.event || ""))},
       ];
       function durationMs(events) {
         const times = events.map(e => Date.parse(e.timestamp)).filter(Number.isFinite).sort((a, b) => a - b);
@@ -5990,7 +6107,12 @@ class ChatHandler(BaseHTTPRequestHandler):
             if not self._debug_allowed():
                 self._send_json(404, {"error": "Dashboard disabled"})
                 return
-            self._send_json(200, {"dataset": sample_dataset(), "formulas": formula_reference(), "model": CHAT_MODEL})
+            self._send_json(200, {"dataset": {"dataset_name": "Synthetic Office EMS Sample",
+                                                "site": {"name": "Sample Office Campus", "site_id": 17},
+                                                "available_categories": ["site", "energy", "devices", "demand", "telemetry", "alarms"],
+                                                "is_live": False},
+                                  "formulas": formula_reference(),
+                                  "model": CHAT_MODEL, "ollama": sandbox_ollama_status()})
             return
         sandbox_job_match = re.fullmatch(r"/debug/sandbox/jobs/([0-9a-fA-F-]{36})", path)
         if sandbox_job_match:

@@ -58,75 +58,100 @@ def _chart(chart_type: str, title: str, labels: list[str], values: list[float], 
             "series": [{"name": name, "unit": unit, "data": values}]}
 
 
-def prepare_sandbox_context(message: str, dataset: dict) -> tuple[dict, list[dict], dict | None]:
-    """Compute trusted facts and optional visualization/report from synthetic readings."""
+def prepare_sandbox_context(message: str, dataset: dict, categories: list[str]) -> tuple[dict, list[dict], dict | None]:
+    """Compute trusted facts only for sample data categories selected by the LLM."""
     lowered = message.lower()
+    selected = set(categories)
     devices = sorted(dataset["devices"], key=lambda row: row["energy_kwh"], reverse=True)
     demand = dataset["demand_hourly"]
     peak = max(demand, key=lambda row: row["value"])
     low = min(demand, key=lambda row: row["value"])
     daily = dataset["daily_energy"]
     telemetry = dataset["telemetry_hourly"]
-    facts = {
-        "site": dataset["site"],
-        "daily_energy_total_kwh": round(sum(row["value"] for row in daily), 2),
-        "daily_energy_high": max(daily, key=lambda row: row["value"]),
-        "daily_energy_low": min(daily, key=lambda row: row["value"]),
-        "device_energy_ranking": devices,
-        "device_energy_period": dataset["device_energy_period"],
-        "device_energy_total_kwh": round(sum(row["energy_kwh"] for row in devices), 2),
-        "peak_demand_kw": peak,
-        "minimum_demand_kw": low,
-        "average_demand_kw": round(sum(row["value"] for row in demand) / len(demand), 2),
-        "telemetry_hourly": telemetry,
-        "alarms": dataset["alarms"],
-        "carbon_estimate": {
-            "kg_co2e": round(sum(row["value"] for row in daily) * dataset["assumptions"]["carbon_factor_kg_per_kwh"], 2),
-            "factor_kg_co2e_per_kwh": dataset["assumptions"]["carbon_factor_kg_per_kwh"],
-            "period": "last 7 days",
-            "status": "illustrative only; replace the factor with the applicable reporting factor",
-        },
-    }
+    facts = {"site": dataset["site"]} if "site" in selected else {}
+    if "energy" in selected:
+        facts.update({
+            "daily_energy_total_kwh": round(sum(row["value"] for row in daily), 2),
+            "daily_energy_high": max(daily, key=lambda row: row["value"]),
+            "daily_energy_low": min(daily, key=lambda row: row["value"]),
+            "daily_energy_values": daily,
+        })
+        if any(word in lowered for word in ("carbon", "emission")):
+            facts["carbon_estimate"] = {
+                "kg_co2e": round(sum(row["value"] for row in daily) * dataset["assumptions"]["carbon_factor_kg_per_kwh"], 2),
+                "factor_kg_co2e_per_kwh": dataset["assumptions"]["carbon_factor_kg_per_kwh"],
+                "period": "last 7 days",
+                "status": "illustrative only; replace the factor with the applicable reporting factor",
+            }
+    if "devices" in selected:
+        facts.update({
+            "device_energy_ranking": devices,
+            "device_energy_period": dataset["device_energy_period"],
+            "device_energy_total_kwh": round(sum(row["energy_kwh"] for row in devices), 2),
+        })
+    if "demand" in selected:
+        facts.update({
+            "peak_demand_kw": peak,
+            "minimum_demand_kw": low,
+            "average_demand_kw": round(sum(row["value"] for row in demand) / len(demand), 2),
+            "demand_interval_minutes": dataset["demand_interval_minutes"],
+        })
+        if any(word in lowered for word in ("chart", "graph", "plot", "visual", "trend")):
+            facts["hourly_demand_values"] = demand
+    if "telemetry" in selected:
+        metric = "current_a" if "current" in lowered else "power_factor" if "power factor" in lowered else "voltage_v"
+        facts["telemetry_metric"] = metric
+        facts["telemetry_unit"] = {"current_a": "A", "power_factor": "ratio", "voltage_v": "V"}[metric]
+        facts["telemetry_hourly"] = [
+            {"timestamp": row["timestamp"], metric: row[metric]} for row in telemetry
+        ]
+    if "alarms" in selected:
+        facts["alarms"] = dataset["alarms"]
 
     charts: list[dict] = []
     wants_chart = any(word in lowered for word in ("chart", "graph", "plot", "visual", "trend"))
-    if wants_chart or any(word in lowered for word in ("top", "rank", "highest energy", "most energy")):
-        if any(word in lowered for word in ("device", "consumer", "rank", "top")):
-            rows = devices[:5]
-            charts.append(_chart("bar", "Top Device Energy Consumers",
-                                 [f"{row['name']} (ID {row['device_id']})" for row in rows],
-                                 [row["energy_kwh"] for row in rows], "kWh", "Energy"))
-        elif any(word in lowered for word in ("demand", "peak", "load")):
-            charts.append(_chart("line", "Hourly Sample Demand", [row["timestamp"][11:16] for row in demand],
-                                 [row["value"] for row in demand], "kW", "Demand"))
-        elif any(word in lowered for word in ("voltage", "current", "power factor")):
-            metric = "current_a" if "current" in lowered else "power_factor" if "power factor" in lowered else "voltage_v"
-            label, unit = {"current_a": ("Current", "A"), "power_factor": ("Power Factor", "ratio"),
-                           "voltage_v": ("Voltage", "V")}[metric]
-            charts.append(_chart("line", f"Hourly Sample {label}", [row["timestamp"][11:16] for row in telemetry],
-                                 [row[metric] for row in telemetry], unit, label))
-        else:
-            charts.append(_chart("bar", "Daily Site Energy", [row["date"] for row in daily],
-                                 [row["value"] for row in daily], "kWh", "Energy"))
+    wants_device_chart = any(word in lowered for word in ("top", "rank", "highest energy", "most energy"))
+    if "devices" in selected and (wants_chart or wants_device_chart):
+        rows = devices[:5]
+        charts.append(_chart("bar", "Top Device Energy Consumers",
+                             [f"{row['name']} (ID {row['device_id']})" for row in rows],
+                             [row["energy_kwh"] for row in rows], "kWh", "Energy"))
+    if "demand" in selected and wants_chart:
+        charts.append(_chart("line", "Hourly Sample Demand", [row["timestamp"][11:16] for row in demand],
+                             [row["value"] for row in demand], "kW", "Demand"))
+    if "telemetry" in selected and wants_chart:
+        metric = facts["telemetry_metric"]
+        label = {"current_a": "Current", "power_factor": "Power Factor", "voltage_v": "Voltage"}[metric]
+        charts.append(_chart("line", f"Hourly Sample {label}", [row["timestamp"][11:16] for row in telemetry],
+                             [row[metric] for row in telemetry], facts["telemetry_unit"], label))
+    if "energy" in selected and wants_chart:
+        charts.append(_chart("bar", "Daily Site Energy", [row["date"] for row in daily],
+                             [row["value"] for row in daily], "kWh", "Energy"))
 
     report = None
-    if any(word in lowered for word in ("report", "summary", "overview")):
+    if selected and any(word in lowered for word in ("report", "summary", "overview")):
+        sections = []
+        if "energy" in selected:
+            sections.append({"heading": "Energy", "total_kwh": facts["daily_energy_total_kwh"], "daily_values": daily})
+        if "devices" in selected:
+            sections.append({"heading": "Leading consumers", "devices": devices[:5]})
+        if "demand" in selected:
+            sections.append({"heading": "Demand", "peak": peak, "average_kw": facts["average_demand_kw"]})
+        if "telemetry" in selected:
+            sections.append({"heading": "Telemetry", "metric": facts["telemetry_metric"],
+                             "unit": facts["telemetry_unit"], "readings": facts["telemetry_hourly"]})
+        if "alarms" in selected:
+            sections.append({"heading": "Alarms", "items": dataset["alarms"]})
         report = {
             "title": f"EMS Summary - {dataset['site']['name']}",
-            "period": {"start": daily[0]["date"], "end": daily[-1]["date"]},
-            "sections": [
-                {"heading": "Energy", "total_kwh": facts["daily_energy_total_kwh"], "daily_values": daily},
-                {"heading": "Leading consumers", "devices": devices[:5]},
-                {"heading": "Demand", "peak": peak, "average_kw": facts["average_demand_kw"]},
-                {"heading": "Alarms", "items": dataset["alarms"]},
-            ],
+            "sections": sections,
             "data_source": "synthetic_demo_data",
         }
     return facts, charts, report
 
 
-def formula_reference() -> list[dict]:
-    return [
+def formula_reference(topics: list[str] | None = None) -> list[dict]:
+    formulas = [
         {"name": "Interval energy", "formula": "E = sum(interval energy)", "unit": "kWh",
          "needs": "Non-overlapping interval consumption values; cumulative registers must be differenced first."},
         {"name": "Maximum demand", "formula": "max(interval-average active power)", "unit": "kW",
@@ -140,3 +165,13 @@ def formula_reference() -> list[dict]:
         {"name": "Percentage difference", "formula": "(A - B) / B x 100%", "unit": "%",
          "needs": "A non-zero baseline B; state the comparison direction."},
     ]
+    if not topics:
+        return formulas
+    requested = set(topics)
+    topic_keys = {
+        "energy": {"Interval energy"}, "demand": {"Maximum demand", "Load factor"},
+        "power_quality": {"Power factor"}, "carbon": {"Estimated emissions"},
+        "comparison": {"Percentage difference"},
+    }
+    allowed = set().union(*(topic_keys.get(topic, set()) for topic in requested))
+    return [formula for formula in formulas if formula["name"] in allowed]
