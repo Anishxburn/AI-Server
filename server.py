@@ -24,6 +24,7 @@ from langchain_core.runnables import RunnableLambda
 import psycopg
 from psycopg.rows import dict_row
 from prediction_lab import PredictionService, daily_dataset
+from ems_sandbox import formula_reference, prepare_sandbox_context, sample_dataset
 from ems_contracts import measurement_context, metric_clarification, percentage_difference, question_metrics, result_problem
 from contracts.tool_schemas import TOOL_ARGUMENT_KEYS, TOOL_SCHEMAS, validate_tool_arguments
 from memory.conversation import load_conversation_history as load_conversation_history_from_db
@@ -3964,6 +3965,76 @@ def ollama_json(path: str, payload: dict, timeout: int = 300) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def run_sandbox_chat(message: str, history: list[dict], request_id: str) -> dict:
+    """Answer against local synthetic EMS readings without entering the MCP path."""
+    dataset = sample_dataset()
+    facts, charts, report = prepare_sandbox_context(message, dataset)
+    normalized_history = []
+    for turn in history[-10:]:
+        if not isinstance(turn, dict):
+            continue
+        role = turn.get("role")
+        content = str(turn.get("content") or "").strip()
+        if role in {"user", "assistant"} and content:
+            normalized_history.append({"role": role, "content": content[:2500]})
+    system = (
+        "You are an EMS-focused assistant in a local sandbox. Answer the user's full question in a natural, "
+        "practical way and use prior messages to understand follow-ups without requiring special keywords. "
+        "You may answer non-EMS questions too. Ground every numeric claim about the site in the supplied "
+        "synthetic dataset or calculated facts. State units, period, calculation, and assumptions when useful. "
+        "Never present synthetic data as live DaxView data. If the sample does not contain a requested value, "
+        "say so and explain what input would be needed. Use EMS terms accurately; peak demand is the maximum "
+        "interval-average kW in this sample, not an instantaneous reading. Keep standards or generic cautions "
+        "out unless they help answer the question."
+    )
+    user_context = {
+        "question": message[:4000],
+        "sample_dataset": dataset,
+        "deterministic_calculations": facts,
+        "formula_reference": formula_reference(),
+    }
+    messages = [{"role": "system", "content": system}, *normalized_history,
+                {"role": "user", "content": json.dumps(user_context, ensure_ascii=True)}]
+    debug_trace_event("sandbox_input_debug", request_id=request_id, mode="synthetic", message=message)
+    debug_trace_event("sandbox_data_context_debug", request_id=request_id,
+                      dataset=dataset["dataset_name"], source=dataset["source"], facts=facts,
+                      formulas=formula_reference())
+    debug_trace_event("sandbox_llm_request", request_id=request_id, model=CHAT_MODEL,
+                      prompt_preview=preview(json.dumps(user_context), 500))
+    started = time.perf_counter()
+    try:
+        data = ollama_json("/api/chat", {
+            "model": CHAT_MODEL,
+            "messages": messages,
+            "stream": False,
+            "options": {"temperature": 0.2},
+        }, timeout=OLLAMA_GENERATE_TIMEOUT)
+    except (HTTPError, URLError, TimeoutError, ValueError) as error:
+        debug_trace_event("sandbox_model_failed", request_id=request_id, model=CHAT_MODEL, error=str(error))
+        raise RuntimeError(f"Sandbox model request failed: {error}") from error
+    reply = str(((data.get("message") or {}).get("content") or "")).strip()
+    if not reply:
+        debug_trace_event("sandbox_model_failed", request_id=request_id, model=CHAT_MODEL, error="empty model answer")
+        raise RuntimeError("The sandbox model returned an empty answer.")
+    elapsed_ms = round((time.perf_counter() - started) * 1000)
+    debug_trace_event("sandbox_llm_response_debug", request_id=request_id, model=CHAT_MODEL,
+                      duration_ms=elapsed_ms, answer=reply)
+    result = {
+        "request_id": request_id,
+        "provider": "ollama-sandbox",
+        "model": CHAT_MODEL,
+        "answer": reply,
+        "charts": charts,
+        "report": report,
+        "evidence": facts,
+        "dataset": {"name": dataset["dataset_name"], "source": dataset["source"], "is_live": False},
+        "formula_reference": formula_reference(),
+        "mcp_called": False,
+    }
+    debug_trace_event("sandbox_outcome_debug", status="completed", **result)
+    return result
+
+
 def parse_mcp_response(raw: str) -> dict:
     """Accept normal JSON or simple SSE-style MCP responses."""
     raw = raw.strip()
@@ -4553,6 +4624,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>AI Data Trace Dashboard</title>
     <link rel="stylesheet" href="/debug/assets/prediction_lab.css" />
+    <link rel="stylesheet" href="/debug/assets/sandbox.css" />
     <script src="/debug/assets/chart.umd.js"></script>
     <script src="/debug/assets/lucide.min.js"></script>
     <style>
@@ -4635,6 +4707,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
     <nav class="tabs" aria-label="Dashboard views">
       <button type="button" data-view="traces" class="active">Traces</button>
       <button type="button" data-view="predictions">Predictions</button>
+      <button type="button" data-view="sandbox">Sandbox</button>
     </nav>
     <main id="trace-workspace">
       <section class="panel">
@@ -4648,6 +4721,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       </section>
     </main>
     __PREDICTION_WORKSPACE__
+    __SANDBOX_WORKSPACE__
     <script>
       let grouped = [];
       let selected = null;
@@ -4728,16 +4802,17 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         </section>`;
       }
       function renderOutcome(events) {
-        const outcome = events.find(event => event.event === "ai_outcome_debug");
+        const outcome = events.find(event => event.event === "ai_outcome_debug" || event.event === "sandbox_outcome_debug");
         const final = events.find(event => event.event === "ai_final_response_debug");
         const failed = events.find(event => event.event === "daxview_job_failed");
         const unavailable = events.find(event => event.event === "energy_prediction_unavailable");
         const fallback = events.find(event => event.event === "mcp_answer_refine_fallback");
         const answer = outcome?.answer || final?.answer || "";
         const charts = outcome?.charts || final?.charts || [];
+        const report = outcome?.report || null;
         const error = outcome?.error || failed?.error || "";
         const unavailableCode = unavailable?.error_code || (/DAXVIEW_UNAVAILABLE/.test(error) ? "DAXVIEW_UNAVAILABLE" : "");
-        const chartExpected = events.some(event =>
+        const chartExpected = events.some(event => event.event === "sandbox_outcome_debug" ||
           (event.operation_ids || []).some(id => ["energy_forecast", "site_energy_summary", "telemetry_timeseries", "alarm_frequency_summary", "demand_peak_summary"].includes(id))
         );
         const chartItems = charts.map(chart => {
@@ -4760,6 +4835,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
           ${fallback ? `<div class="outcome-state">Model refinement unavailable; showing the calculated fallback.</div>` : ""}
           ${answer ? `<div class="outcome-answer">${escapeHtml(answer)}</div>` : ""}
           ${chartItems ? `<div class="chart-grid">${chartItems}</div>` : ""}
+          ${report ? `<details><summary>Report structure</summary><pre>${escapeHtml(JSON.stringify(report, null, 2))}</pre></details>` : ""}
           ${state ? `<div class="outcome-state ${unavailableCode || error ? "fail" : ""}">${escapeHtml(state)}</div>` : ""}
         </section>`;
       }
@@ -4855,21 +4931,27 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       function escapeHtml(value) {
         return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
       }
-      document.querySelector("#refresh").addEventListener("click", () => activeView === "predictions" ? window.PredictionLab.show() : load());
+      document.querySelector("#refresh").addEventListener("click", () => {
+        if (activeView === "predictions") window.PredictionLab.show();
+        else if (activeView === "sandbox") window.SandboxChat.refresh();
+        else load();
+      });
       document.querySelector("#filter").addEventListener("input", renderRequests);
       document.querySelectorAll(".tabs button").forEach(button => button.addEventListener("click", () => {
         activeView = button.dataset.view;
         document.querySelectorAll(".tabs button").forEach(tab => tab.classList.toggle("active", tab === button));
-        document.querySelector("#trace-workspace").hidden = activeView === "predictions";
+        document.querySelector("#trace-workspace").hidden = activeView !== "traces";
         document.querySelector("#prediction-workspace").hidden = activeView !== "predictions";
+        document.querySelector("#sandbox-workspace").hidden = activeView !== "sandbox";
         if (activeView === "predictions") {
           window.PredictionLab.show();
           return;
         }
-        selected = activeView === "predictions"
-          ? grouped.find(group => group.events.some(event =>
-              event.event === "energy_prediction_debug" || (event.operation_ids || []).includes("energy_forecast")))?.id || null
-          : null;
+        if (activeView === "sandbox") {
+          window.SandboxChat.refresh();
+          return;
+        }
+        selected = null;
         renderRequests();
         if (selected) renderTimeline(selected);
         else document.querySelector("#timeline").innerHTML = '<div class="empty">Select a request.</div>';
@@ -5852,12 +5934,18 @@ class ChatHandler(BaseHTTPRequestHandler):
             if not AI_DEBUG_DASHBOARD_ENABLED:
                 self._send_html(404, "<h1>Debug dashboard disabled</h1>")
                 return
-            self._send_html(200, DEBUG_DASHBOARD_HTML.replace("__PREDICTION_WORKSPACE__", (STATIC_DIRECTORY / "prediction_lab.html").read_text(encoding="utf-8")))
+            html = DEBUG_DASHBOARD_HTML.replace("__PREDICTION_WORKSPACE__", (STATIC_DIRECTORY / "prediction_lab.html").read_text(encoding="utf-8"))
+            html = html.replace("__SANDBOX_WORKSPACE__", (STATIC_DIRECTORY / "sandbox_workspace.html").read_text(encoding="utf-8"))
+            html = html.replace("<script src=\"/debug/assets/prediction_lab.js\"></script>",
+                                "<script src=\"/debug/assets/prediction_lab.js\"></script><script src=\"/debug/assets/sandbox.js\"></script>")
+            self._send_html(200, html)
             return
         if path.startswith("/debug/assets/"):
             files = {
                 "prediction_lab.js": ("prediction_lab.js", "text/javascript"),
                 "prediction_lab.css": ("prediction_lab.css", "text/css"),
+                "sandbox.js": ("sandbox.js", "text/javascript"),
+                "sandbox.css": ("sandbox.css", "text/css"),
                 "chart.umd.js": ("vendor/chart.umd.js", "text/javascript"),
                 "lucide.min.js": ("vendor/lucide.min.js", "text/javascript"),
             }
@@ -5871,6 +5959,12 @@ class ChatHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if path == "/debug/sandbox":
+            if not self._debug_allowed():
+                self._send_json(404, {"error": "Dashboard disabled"})
+                return
+            self._send_json(200, {"dataset": sample_dataset(), "formulas": formula_reference(), "model": CHAT_MODEL})
             return
         if path == "/debug/predictions" or path.startswith("/debug/predictions/"):
             if not self._debug_allowed():
@@ -5910,6 +6004,22 @@ class ChatHandler(BaseHTTPRequestHandler):
             return
 
         if self.handle_daxview_post(path, request):
+            return
+        if path == "/debug/sandbox":
+            message = str(request.get("message") or "").strip()
+            if not message:
+                self._send_json(400, {"error": "message is required"})
+                return
+            if len(message) > 4000:
+                self._send_json(413, {"error": "Question must be 4,000 characters or fewer."})
+                return
+            history = request.get("history") if isinstance(request.get("history"), list) else []
+            try:
+                result = run_sandbox_chat(message, history, str(uuid.uuid4()))
+            except RuntimeError as error:
+                self._send_json(503, {"error": str(error), "provider": "ollama-sandbox"})
+                return
+            self._send_json(200, result)
             return
         if path.startswith("/debug/predictions/"):
             try:

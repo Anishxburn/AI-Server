@@ -1,0 +1,39 @@
+<section id="sandbox-workspace" hidden>
+  <div class="sandbox-head">
+    <div>
+      <h2>EMS Sandbox</h2>
+      <p>Local LLM chat grounded in synthetic EMS readings. No DaxView or MCP requests are made.</p>
+    </div>
+    <div class="sandbox-actions">
+      <span class="sandbox-badge">SYNTHETIC DATA</span>
+      <button id="sandbox-clear" class="secondary" type="button" title="Clear this sandbox conversation">Clear chat</button>
+    </div>
+  </div>
+  <div class="sandbox-layout">
+    <aside class="sandbox-data">
+      <h3>Sample data</h3>
+      <div id="sandbox-dataset" class="sandbox-muted">Loading sample dataset...</div>
+      <div id="sandbox-facts" class="sandbox-facts"></div>
+      <details>
+        <summary>EMS formulas</summary>
+        <div id="sandbox-formulas"></div>
+      </details>
+      <h3 class="sandbox-try-title">Try a question</h3>
+      <button class="sandbox-prompt" data-prompt="What was the peak demand today? Explain the difference between demand and energy.">Peak demand vs energy</button>
+      <button class="sandbox-prompt" data-prompt="Rank the top 5 energy-consuming devices and explain which one is the best opportunity to investigate.">Rank device energy</button>
+      <button class="sandbox-prompt" data-prompt="Estimate this week's emissions and explain the assumption used.">Estimate carbon</button>
+      <button class="sandbox-prompt" data-prompt="Create an EMS report for this sample site, including energy, demand, device ranking, alarms, and a chart.">Create report</button>
+    </aside>
+    <section class="sandbox-main" aria-label="Sandbox conversation and output">
+      <div id="sandbox-chat" class="sandbox-chat" aria-live="polite">
+        <div class="sandbox-intro">Ask a question about the sample EMS data, or ask the model a general question. Follow-up questions use this chat's recent messages.</div>
+      </div>
+      <form id="sandbox-form" class="sandbox-form">
+        <textarea id="sandbox-input" rows="2" maxlength="4000" placeholder="Ask about demand, energy, devices, voltage, current, alarms, or EMS concepts..." required></textarea>
+        <button id="sandbox-send" type="submit" aria-label="Send question" title="Send question">Send</button>
+      </form>
+      <div id="sandbox-status" class="sandbox-muted" role="status"></div>
+      <div id="sandbox-output" class="sandbox-output" hidden></div>
+    </section>
+  </div>
+</section>

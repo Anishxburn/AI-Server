@@ -4,7 +4,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py .
-COPY prediction_lab.py ems_contracts.py ./
+COPY prediction_lab.py ems_contracts.py ems_sandbox.py ./
 COPY contracts ./contracts
 COPY routing ./routing
 COPY memory ./memory
