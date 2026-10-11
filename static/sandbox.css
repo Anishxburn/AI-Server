@@ -30,6 +30,7 @@
 .sandbox-message { max-width:min(78ch,85%); white-space:pre-wrap; overflow-wrap:anywhere; font-size:13px; line-height:1.55; padding:10px 12px; }
 .sandbox-message.user { justify-self:end; background:#e0f2fe; border-radius:8px 8px 2px 8px; }
 .sandbox-message.assistant { justify-self:start; border-left:2px solid #0ea5e9; padding-left:12px; }
+.sandbox-message.error { border-left-color:#dc2626; color:#b42318; }
 .sandbox-message small { display:block; color:#64748b; font-size:10px; margin-bottom:4px; }
 .sandbox-form { display:flex; gap:8px; align-items:end; padding:12px 0 4px; }
 #sandbox-input { flex:1; min-width:0; resize:vertical; font:inherit; font-size:13px; line-height:1.45; border:1px solid #cbd5e1; border-radius:6px; padding:10px; }

@@ -3,6 +3,7 @@
   const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
   const history = [];
   let busy = false;
+  let pendingNode = null;
 
   async function api(path, payload) {
     const response = await fetch('/debug/sandbox' + path, payload === undefined ? {} : {
@@ -33,6 +34,7 @@
   function setStatus(message, error = false) {
     byId('sandbox-status').textContent = message;
     byId('sandbox-status').dataset.error = String(error);
+    if (busy && pendingNode) pendingNode.textContent = message;
   }
   function setBusy(value) {
     busy = value;
@@ -50,6 +52,7 @@
     node.innerHTML = `<small>${role === 'user' ? 'You' : `AI sandbox${model ? ` · ${esc(model)}` : ''}`}</small>${esc(content)}`;
     byId('sandbox-chat').appendChild(node);
     byId('sandbox-chat').scrollTop = byId('sandbox-chat').scrollHeight;
+    return node;
   }
   function renderOutput(result) {
     const charts = (result.charts || []).map((chart, index) => `<section><h3>${esc(chart.title)}</h3>
@@ -70,21 +73,24 @@
     setBusy(true);
     byId('sandbox-output').hidden = true;
     appendMessage('user', message);
+    pendingNode = appendMessage('assistant', 'Starting the request...');
     history.push({role:'user', content:message});
     setStatus('Asking the LLM whether this question needs sample readings...');
     try {
       const result = await submitAndWait({message, history:history.slice(0, -1).slice(-12)});
-      appendMessage('assistant', result.answer, result.model);
+      pendingNode.textContent = result.answer;
       history.push({role:'assistant', content:result.answer});
+      pendingNode = null;
       renderOutput(result);
       setStatus(result.data_accessed
         ? `Completed with ${result.model}. Sample data used: ${result.dataset.categories_loaded.join(', ')}. MCP called: no.`
         : `Completed with ${result.model}. No sample readings were loaded. MCP called: no.`);
     } catch (error) {
-      appendMessage('assistant', error.message);
-      history.push({role:'assistant', content:error.message});
+      if (pendingNode) pendingNode.textContent = error.message;
+      if (pendingNode) pendingNode.classList.add('error');
       setStatus(error.message, true);
     } finally {
+      pendingNode = null;
       setBusy(false);
       byId('sandbox-input').focus();
     }

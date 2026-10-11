@@ -4118,15 +4118,19 @@ def run_sandbox_chat(message: str, history: list[dict], request_id: str, progres
             "model": CHAT_MODEL,
             "messages": messages,
             "stream": False,
+            "think": False,
             "options": {"temperature": 0.2, "num_predict": 512},
         }, timeout=AI_SANDBOX_MODEL_TIMEOUT)
     except (HTTPError, URLError, TimeoutError, ValueError) as error:
         debug_trace_event("sandbox_model_failed", request_id=request_id, model=CHAT_MODEL, error=str(error))
         raise RuntimeError(f"Sandbox model request failed: {error}") from error
-    reply = str(((data.get("message") or {}).get("content") or "")).strip()
+    model_message = data.get("message") or {}
+    reply = str(model_message.get("content") or "").strip()
     if not reply:
-        debug_trace_event("sandbox_model_failed", request_id=request_id, model=CHAT_MODEL, error="empty model answer")
-        raise RuntimeError("The sandbox model returned an empty answer.")
+        debug_trace_event("sandbox_model_failed", request_id=request_id, model=CHAT_MODEL,
+                          error="empty model answer", thinking_chars=len(str(model_message.get("thinking") or "")),
+                          done_reason=data.get("done_reason"), eval_count=data.get("eval_count"))
+        raise RuntimeError("Ollama finished without a visible answer. Retry once; if it repeats, check the Ollama container logs and available memory.")
     elapsed_ms = round((time.perf_counter() - started) * 1000)
     debug_trace_event("sandbox_llm_response_debug", request_id=request_id, model=CHAT_MODEL,
                       duration_ms=elapsed_ms, answer=reply)
@@ -5647,6 +5651,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         body = html.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -6100,6 +6105,7 @@ class ChatHandler(BaseHTTPRequestHandler):
             body = (STATIC_DIRECTORY / item[0]).read_bytes()
             self.send_response(200)
             self.send_header("Content-Type", item[1])
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
