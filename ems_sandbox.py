@@ -165,8 +165,10 @@ def formula_reference(topics: list[str] | None = None) -> list[dict]:
         {"name": "Percentage difference", "formula": "(A - B) / B x 100%", "unit": "%",
          "needs": "A non-zero baseline B; state the comparison direction."},
     ]
-    if not topics:
+    if topics is None:
         return formulas
+    if not topics:
+        return []
     requested = set(topics)
     topic_keys = {
         "energy": {"Interval energy"}, "demand": {"Maximum demand", "Load factor"},

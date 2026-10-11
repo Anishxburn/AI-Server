@@ -4026,6 +4026,7 @@ def decide_sandbox_data_access(message: str, history: list[dict], request_id: st
             "messages": [{"role": "system", "content": system}, *normalized_history,
                          {"role": "user", "content": message[:4000]}],
             "stream": False,
+            "think": False,
             "format": schema,
             "options": {"temperature": 0, "num_predict": 160},
         }, timeout=AI_SANDBOX_PLANNER_TIMEOUT)
