@@ -18,7 +18,7 @@ The sample dataset is generated locally by `ems_sandbox.py` and includes seven d
 }
 ```
 
-It returns an `answer`, `model`, `dataset` provenance, deterministic `evidence`, optional `charts`, optional `report`, `formula_reference`, and `mcp_called: false`. Chart specs use `type`, `title`, `labels`, and `series[]` with `name`, `unit`, and numeric `data`. The V2 frontend can render these chart specs with Chart.js and render report `sections` as cards, tables, or exportable reports. The response object is model-independent: a hosted provider can replace Ollama later without changing the front-end contract.
+It immediately returns HTTP `202` with a `job_id`. Poll `GET /debug/sandbox/jobs/{job_id}` for `queued` or `running`; when complete, the result contains `answer`, `model`, `dataset` provenance, deterministic `evidence`, optional `charts`, optional `report`, `formula_reference`, and `mcp_called: false`. This avoids holding the browser request open while Ollama generates. Chart specs use `type`, `title`, `labels`, and `series[]` with `name`, `unit`, and numeric `data`. The V2 frontend can render these chart specs with Chart.js and render report `sections` as cards, tables, or exportable reports. The response object is model-independent: a hosted provider can replace Ollama later without changing the front-end contract.
 
 Ranking, sums, extrema, and the demo carbon estimate are calculated in Python before answer generation. The LLM explains the facts and handles general questions and follow-ups; it does not define chart values. The formula reference documents required inputs and limitations for energy, maximum demand, load factor, power factor, emissions estimates, and percentage difference.
 

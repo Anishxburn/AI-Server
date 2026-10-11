@@ -8,9 +8,27 @@
     const response = await fetch('/debug/sandbox' + path, payload === undefined ? {} : {
       method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload),
     });
-    const data = await response.json();
+    const raw = await response.text();
+    let data;
+    try { data = JSON.parse(raw); }
+    catch {
+      const detail = raw.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 180);
+      throw new Error(`Sandbox API returned HTTP ${response.status} with a non-JSON response${detail ? `: ${detail}` : '.'}`);
+    }
     if (!response.ok) throw new Error(data.error || 'Sandbox request failed.');
     return data;
+  }
+  async function submitAndWait(payload) {
+    const accepted = await api('', payload);
+    if (!accepted.job_id) return accepted;
+    for (let attempt = 0; attempt < 600; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      const state = await api(`/jobs/${encodeURIComponent(accepted.job_id)}`);
+      if (state.status === 'completed') return state.result;
+      if (state.status === 'failed') throw new Error(state.error || 'Sandbox model generation failed.');
+      setStatus(state.status === 'queued' ? 'Queued for the model...' : 'The model is generating an answer...');
+    }
+    throw new Error('The model is still working. Check Traces for the sandbox job status.');
   }
   function setStatus(message, error = false) {
     byId('sandbox-status').textContent = message;
@@ -49,7 +67,7 @@
     history.push({role:'user', content:message});
     setStatus('Sending this question and recent chat context to the configured model...');
     try {
-      const result = await api('', {message, history:history.slice(0, -1).slice(-12)});
+      const result = await submitAndWait({message, history:history.slice(0, -1).slice(-12)});
       appendMessage('assistant', result.answer, result.model);
       history.push({role:'assistant', content:result.answer});
       renderOutput(result);

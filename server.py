@@ -16,6 +16,7 @@ import uuid
 from pathlib import Path
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
+from threading import Lock
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
@@ -45,6 +46,7 @@ if not AI_COMPARE_MODELS and AI_COMPARE_MODEL:
 AI_COMPARE_MODEL_SHOW_TO_USER = os.getenv("AI_COMPARE_MODEL_SHOW_TO_USER", "false").lower() in {"1", "true", "yes", "on"}
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
 OLLAMA_GENERATE_TIMEOUT = int(os.getenv("OLLAMA_GENERATE_TIMEOUT", "120"))
+AI_SANDBOX_MODEL_TIMEOUT = int(os.getenv("AI_SANDBOX_MODEL_TIMEOUT", "420"))
 OLLAMA_EMBEDDING_TIMEOUT = int(os.getenv("OLLAMA_EMBEDDING_TIMEOUT", "30"))
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 RAG_MATCH_LIMIT = int(os.getenv("RAG_MATCH_LIMIT", "5"))
@@ -108,6 +110,9 @@ DAXVIEW_ALLOWED_HISTORICAL_TOOLS = {
     "report_summary",
 }
 DAXVIEW_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=AI_JOB_WORKERS)
+SANDBOX_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ems-sandbox")
+SANDBOX_JOBS: dict[str, dict] = {}
+SANDBOX_JOBS_LOCK = Lock()
 TRACES = deque(maxlen=TRACE_LIMIT)
 ALLOWED_ORIGINS = {
     origin.strip()
@@ -4007,8 +4012,8 @@ def run_sandbox_chat(message: str, history: list[dict], request_id: str) -> dict
             "model": CHAT_MODEL,
             "messages": messages,
             "stream": False,
-            "options": {"temperature": 0.2},
-        }, timeout=OLLAMA_GENERATE_TIMEOUT)
+            "options": {"temperature": 0.2, "num_predict": 512},
+        }, timeout=AI_SANDBOX_MODEL_TIMEOUT)
     except (HTTPError, URLError, TimeoutError, ValueError) as error:
         debug_trace_event("sandbox_model_failed", request_id=request_id, model=CHAT_MODEL, error=str(error))
         raise RuntimeError(f"Sandbox model request failed: {error}") from error
@@ -4033,6 +4038,26 @@ def run_sandbox_chat(message: str, history: list[dict], request_id: str) -> dict
     }
     debug_trace_event("sandbox_outcome_debug", status="completed", **result)
     return result
+
+
+def process_sandbox_job(job_id: str, request_id: str, message: str, history: list[dict]) -> None:
+    with SANDBOX_JOBS_LOCK:
+        job = SANDBOX_JOBS.get(job_id)
+        if not job:
+            return
+        job["status"] = "running"
+    try:
+        result = run_sandbox_chat(message, history, request_id)
+        with SANDBOX_JOBS_LOCK:
+            job = SANDBOX_JOBS.get(job_id)
+            if job:
+                job.update({"status": "completed", "result": result})
+    except Exception as error:
+        debug_trace_event("sandbox_job_failed", request_id=request_id, job_id=job_id, error=str(error))
+        with SANDBOX_JOBS_LOCK:
+            job = SANDBOX_JOBS.get(job_id)
+            if job:
+                job.update({"status": "failed", "error": str(error)})
 
 
 def parse_mcp_response(raw: str) -> dict:
@@ -5512,6 +5537,7 @@ class ChatHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         origin = self.headers.get("Origin")
         if origin in ALLOWED_ORIGINS:
@@ -5966,6 +5992,19 @@ class ChatHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(200, {"dataset": sample_dataset(), "formulas": formula_reference(), "model": CHAT_MODEL})
             return
+        sandbox_job_match = re.fullmatch(r"/debug/sandbox/jobs/([0-9a-fA-F-]{36})", path)
+        if sandbox_job_match:
+            if not self._debug_allowed():
+                self._send_json(404, {"error": "Dashboard disabled"})
+                return
+            with SANDBOX_JOBS_LOCK:
+                job = SANDBOX_JOBS.get(sandbox_job_match.group(1))
+                payload = dict(job) if job else None
+            if not payload:
+                self._send_json(404, {"error": "Sandbox job not found. It may have expired after a server restart."})
+                return
+            self._send_json(200, payload)
+            return
         if path == "/debug/predictions" or path.startswith("/debug/predictions/"):
             if not self._debug_allowed():
                 self._send_json(404, {"error": "Dashboard disabled"})
@@ -6014,12 +6053,21 @@ class ChatHandler(BaseHTTPRequestHandler):
                 self._send_json(413, {"error": "Question must be 4,000 characters or fewer."})
                 return
             history = request.get("history") if isinstance(request.get("history"), list) else []
-            try:
-                result = run_sandbox_chat(message, history, str(uuid.uuid4()))
-            except RuntimeError as error:
-                self._send_json(503, {"error": str(error), "provider": "ollama-sandbox"})
-                return
-            self._send_json(200, result)
+            job_id = str(uuid.uuid4())
+            request_id = str(uuid.uuid4())
+            with SANDBOX_JOBS_LOCK:
+                if len(SANDBOX_JOBS) >= 100:
+                    for old_id, old_job in list(SANDBOX_JOBS.items()):
+                        if old_job.get("status") in {"completed", "failed"}:
+                            SANDBOX_JOBS.pop(old_id, None)
+                            if len(SANDBOX_JOBS) < 80:
+                                break
+                if len(SANDBOX_JOBS) >= 100:
+                    self._send_json(429, {"error": "Sandbox is busy. Wait for a running answer to finish, then retry."})
+                    return
+                SANDBOX_JOBS[job_id] = {"job_id": job_id, "request_id": request_id, "status": "queued"}
+            SANDBOX_EXECUTOR.submit(process_sandbox_job, job_id, request_id, message, history)
+            self._send_json(202, {"job_id": job_id, "request_id": request_id, "status": "queued"})
             return
         if path.startswith("/debug/predictions/"):
             try:
