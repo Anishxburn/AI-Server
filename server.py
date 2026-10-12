@@ -4850,8 +4850,8 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 22px; background: #111827; color: white; }
       header h1 { font-size: 18px; margin: 0; }
       header .meta { color: #cbd5e1; font-size: 12px; }
-      main { display: grid; grid-template-columns: 380px 1fr; gap: 14px; padding: 14px; }
-      .panel { background: white; border: 1px solid #dbe3ef; border-radius: 8px; overflow: hidden; }
+      main { display: grid; grid-template-columns: minmax(270px, 22vw) minmax(0, 1fr); gap: 14px; padding: 14px; align-items: start; }
+      .panel { min-width: 0; background: white; border: 1px solid #dbe3ef; border-radius: 8px; overflow: hidden; }
       .panel h2 { margin: 0; padding: 12px 14px; font-size: 13px; border-bottom: 1px solid #e5ebf3; background: #f8fafc; }
       .toolbar { display: flex; gap: 8px; align-items: center; padding: 10px 14px; border-bottom: 1px solid #e5ebf3; }
       .tabs { display: flex; gap: 4px; padding: 0 14px; border-bottom: 1px solid #e5ebf3; }
@@ -4869,7 +4869,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       .chip { font-size: 11px; border-radius: 999px; padding: 2px 7px; background: #e2e8f0; color: #334155; }
       .chip.fail { background: #fee2e2; color: #991b1b; }
       .chip.ok { background: #dcfce7; color: #166534; }
-      .timeline { padding: 12px 14px; max-height: calc(100vh - 150px); overflow: auto; }
+      .timeline { min-width: 0; padding: 12px 14px; overflow: visible; }
       .flow { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 8px; padding: 12px 14px; border-bottom: 1px solid #e5ebf3; background: #fbfdff; }
       .stage { border: 1px solid #cbd5e1; border-radius: 8px; padding: 9px; min-height: 76px; background: white; }
       .stage.done { border-color: #22c55e; background: #f0fdf4; }
