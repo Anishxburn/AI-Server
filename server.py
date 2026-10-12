@@ -64,7 +64,7 @@ AI_PLANNER_ENABLED = os.getenv("AI_PLANNER_ENABLED", "false").lower() in {"1", "
 AI_PLANNER_SHADOW_MODE = os.getenv("AI_PLANNER_SHADOW_MODE", "false").lower() in {"1", "true", "yes", "on"}
 PLANNER_MODEL = os.getenv("PLANNER_MODEL", OLLAMA_MODEL)
 PLANNER_TIMEOUT = int(os.getenv("PLANNER_TIMEOUT", "15"))
-DEMAND_RANKING_MAX_DEVICES = int(os.getenv("DEMAND_RANKING_MAX_DEVICES", "20"))
+DEMAND_RANKING_MAX_DEVICES = int(os.getenv("DEMAND_RANKING_MAX_DEVICES", "50"))
 STATIC_DIRECTORY = Path(__file__).resolve().parent / "static"
 PREDICTION_SERVICE = PredictionService(
     os.getenv("AI_PREDICTION_DATA_DIR", str(Path(__file__).resolve().parent / "data")),
@@ -2802,9 +2802,11 @@ def summarize_generic_tool(operation_id: str, data: dict) -> str:
 
 def summarize_demand_peak(data: dict, message: str, arguments: dict | None = None) -> str:
     ranked_devices = data.get("ranked_devices") if isinstance(data.get("ranked_devices"), list) else []
-    if ranked_devices:
+    if ranked_devices or "device_count" in data:
         lines = [f"Highest demand devices ({format_time_window(data, arguments)}):"]
         top_peak = ranked_devices[0].get("peak_kw") if ranked_devices else None
+        if not ranked_devices:
+            lines.append("No devices returned a comparable, unit-qualified demand or active-power reading for this period.")
         for index, row in enumerate(ranked_devices[:requested_top_limit(message) or 5], 1):
             diff = ""
             if index > 1 and top_peak not in (None, 0):
@@ -2815,9 +2817,23 @@ def summarize_demand_peak(data: dict, message: str, arguments: dict | None = Non
             lines.append(
                 f"{index}. {row.get('device_name') or 'Device'} (ID {row.get('device_id')}): "
                 f"{format_number(row.get('peak_kw'), 2)} kW{diff}{status}"
+                + (f", peak at {row['peak_time']}" if row.get("peak_time") else "")
+                + (f", metric {row['metric']}" if row.get("metric") else "")
             )
-        if data.get("device_count"):
-            lines.append(f"Compared {data.get('device_count')} device(s) with returned demand data.")
+        if data.get("device_count") is not None:
+            lines.append(
+                f"Scanned {data.get('device_count')} device(s); compared {data.get('eligible_device_count', len(ranked_devices))} with usable demand/power readings."
+            )
+        excluded = data.get("excluded_devices") if isinstance(data.get("excluded_devices"), list) else []
+        if excluded:
+            lines.append(f"Excluded {len(excluded)} device(s) with unsupported metrics, missing readings, or unusable units.")
+            for row in excluded[:5]:
+                name = row.get("device_name") or f"Device {row.get('device_id')}"
+                lines.append(f"- {name}: {row.get('reason') or 'not eligible'}.")
+        if data.get("truncated_device_scan"):
+            lines.append("The device inventory was truncated; this is not a complete site-wide ranking.")
+        if data.get("truncated_readings"):
+            lines.append("At least one device's returned readings were truncated; its peak may be understated.")
         return "\n".join(lines)
     summary = data.get("summary") if isinstance(data.get("summary"), dict) else data
     rows = first_list(data, ("rows", "items", "results", "devices"))
@@ -3997,39 +4013,117 @@ def run_highest_demand_device_ranking(turn_id: str, message: str, context: dict,
             "choices": choices,
         }]
     ranked = []
+    excluded = []
     for device in selectable:
         device_id = device.get("device_id") or device.get("id") or device.get("meter_id")
+        device_name = device.get("device_name") or device.get("name") or f"Device {device_id}"
         try:
-            demand_args = build_historical_arguments("demand_peak_summary", {**context, "device_id": int(device_id)}, message)
-            per_result = call_authorized_internal_operation(turn_id, "demand_peak_summary", demand_args, request_id, message)
-            per_args = build_public_calls("demand_peak_summary", demand_args, message)[0][1]
+            device_context = {**context, "device_id": int(device_id)}
+            metric_args = build_historical_arguments("telemetry_metric_catalog", device_context, message)
+            metric_result = call_authorized_internal_operation(turn_id, "telemetry_metric_catalog", metric_args, request_id, message)
+            metric_data = historical_result_data(metric_result)
+            metric_rows = first_list(metric_data, ("metrics", "rows", "items", "series"))
+            eligible = []
+            for metric_row in metric_rows:
+                if not isinstance(metric_row, dict):
+                    continue
+                canonical = str(metric_row.get("metric") or "").strip().lower().replace(" ", "_")
+                source_name = str(metric_row.get("source_metric") or metric_row.get("name") or "").strip().lower()
+                unit = str(metric_row.get("unit") or "").strip().lower()
+                status = str(metric_row.get("status") or "ok").strip().lower()
+                if status not in {"ok", "available", "supported"} or metric_row.get("enabled") is False:
+                    continue
+                if canonical in {"demand", "maximum_demand", "max_demand"} or "maximum demand" in source_name:
+                    eligible.append(("demand", metric_row))
+                elif (canonical in {"active_power", "power", "active_power_total"} or "active power" in source_name) and unit in {"w", "kw", "mw"}:
+                    eligible.append(("active_power", metric_row))
+            if not eligible:
+                excluded.append({"device_id": int(device_id), "device_name": device_name, "reason": "No configured demand or unit-qualified active-power metric"})
+                continue
+
+            # Prefer the meter's explicit demand series. Otherwise use measured
+            # active power in a compatible unit; never infer kW from current.
+            metric_kind, metric_row = next((item for item in eligible if item[0] == "demand"), eligible[0])
+            source_metric = metric_row.get("metric") or metric_row.get("source_metric") or "demand"
+            if metric_kind == "demand":
+                peak_args = build_historical_arguments("demand_peak_summary", device_context, message)
+                per_result = call_authorized_internal_operation(turn_id, "demand_peak_summary", peak_args, request_id, message)
+                per_args = build_public_calls("demand_peak_summary", peak_args, message)[0][1]
+            else:
+                peak_args = build_historical_arguments("telemetry_timeseries", {
+                    **device_context,
+                    "metric": str(source_metric),
+                    "bucket": "15m",
+                    "aggregation": "mean",
+                    "value_mode": "measured",
+                    "limit": 2000,
+                }, message)
+                per_result = call_authorized_internal_operation(turn_id, "telemetry_timeseries", peak_args, request_id, message)
+                per_args = build_public_calls("telemetry_timeseries", peak_args, message)[0][1]
+
             per_data = historical_result_data(per_result)
+            if metric_kind == "active_power":
+                series_rows = first_list(per_data, ("series", "rows", "items"))
+                has_power_unit = any(
+                    isinstance(row, dict) and str(row.get("unit") or "").strip().lower() in {"w", "kw", "mw"}
+                    for row in series_rows
+                )
+                if not has_power_unit:
+                    excluded.append({"device_id": int(device_id), "device_name": device_name, "reason": "Active-power values did not include a recognized W/kW/MW unit"})
+                    continue
             summary = per_data.get("summary") if isinstance(per_data.get("summary"), dict) else per_data
             peak = first_value(summary, ("peak_kw", "max_demand_kw", "maximum_demand_kw", "peak_demand_kw", "max_kw"))
+            peak_time = first_value(summary, ("peak_time", "peak_at", "timestamp", "max_time", "max_at"))
+            calculated = None
             if peak is None:
-                rows = first_list(per_data, ("rows", "items", "results", "devices"))
-                for row in rows:
-                    if isinstance(row, dict):
-                        peak = first_value(row, ("peak_kw", "max_demand_kw", "maximum_demand_kw", "peak_demand_kw", "max_kw"))
-                        if peak is not None:
-                            break
+                calculated = calculate_demand_peak_from_telemetry(per_result, per_args)
+                if calculated:
+                    peak_data = calculated["data"]
+                    peak = peak_data["peak_kw"]
+                    peak_time = peak_data.get("peak_time")
             if peak is None:
+                excluded.append({"device_id": int(device_id), "device_name": device_name, "reason": "No numeric demand/power readings in the requested period"})
                 continue
             ranked.append({
                 "device_id": int(device_id),
-                "device_name": device.get("device_name") or device.get("name") or f"Device {device_id}",
+                "device_name": device_name,
                 "status": device.get("status") or device.get("connection_status"),
                 "peak_kw": float(peak),
+                "peak_time": format_display_timestamp(peak_time) if peak_time else None,
+                "metric": source_metric,
+                "sample_count": (calculated or {}).get("data", {}).get("sample_count") or first_value(summary, ("sample_count", "returned_count")),
+                "coverage_percent": first_value(summary, ("coverage_percent",)),
+                "truncated": bool(per_data.get("truncated")) or any(
+                    isinstance(series, dict) and bool(series.get("truncated"))
+                    for series in first_list(per_data, ("series",))
+                ),
                 "result": per_result,
                 "arguments": per_args,
             })
         except Exception as error:
             log_event("demand_device_rank_step_failed", request_id=request_id, device_id=device_id, error=str(error))
+            excluded.append({"device_id": int(device_id), "device_name": device_name, "reason": "Metric discovery or readings unavailable"})
     ranked.sort(key=lambda row: row["peak_kw"], reverse=True)
+    debug_trace_event(
+        "demand_site_scan_debug",
+        request_id=request_id,
+        device_count=len(selectable),
+        eligible_count=len(ranked),
+        excluded_count=len(excluded),
+        excluded_devices=excluded[:50],
+        range=context.get("_time_window"),
+    )
     return [{
         "operation_id": "demand_peak_summary",
         "arguments": {key: context[key] for key in ("site_id", "building_id", "_time_window") if key in context},
-        "result": {"structuredContent": {"data": {"ranked_devices": ranked, "device_count": len(selectable)}}},
+        "result": {"structuredContent": {"data": {
+            "ranked_devices": ranked,
+            "device_count": len(selectable),
+            "eligible_device_count": len(ranked),
+            "excluded_devices": excluded,
+            "truncated_device_scan": bool(device_data.get("truncated")) or len(selectable) > DEMAND_RANKING_MAX_DEVICES,
+            "truncated_readings": any(row.get("truncated") for row in ranked),
+        }}},
     }]
 
 
@@ -4525,6 +4619,8 @@ def wants_highest_demand_device(message: str) -> bool:
     return bool(
         re.search(r"\b(?:highest|max(?:imum)?|peak|top)\s+demand\s+device\b", lowered)
         or re.search(r"\bdevice\s+(?:with|has|having)\s+(?:the\s+)?(?:highest|max(?:imum)?|peak)\s+demand\b", lowered)
+        or re.search(r"\b(?:highest|max(?:imum)?|peak)\s+(?:maximum\s+)?demand\b", lowered)
+        and requested_device_id(message) is None
     )
 
 

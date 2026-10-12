@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import Mock
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from ems_contracts import question_metrics, metric_clarification, percentage_difference, result_problem
-from contracts.mcp_manifest import public_tool_for_internal
+from contracts.mcp_manifest import build_public_calls, public_tool_for_internal
 from contracts.tool_schemas import validate_tool_arguments
 
 
@@ -20,7 +20,7 @@ FUNCTIONS = {
     node.name: node for node in TREE.body if isinstance(node, ast.FunctionDef)
 }
 NAMES = (
-    "requested_top_limit", "connected_load_calculation_answer", "requested_forecast_days", "requested_energy_extrema", "format_number", "format_time_window",
+    "requested_top_limit", "connected_load_calculation_answer", "requested_forecast_days", "requested_energy_extrema", "format_number", "format_time_window", "format_display_timestamp",
     "reading_detail",
     "requested_question_parts", "completed_daily_range", "wants_device_usage_ranking", "wants_all_devices",
     "supplied_demand_readings_answer", "requested_historical_range", "default_historical_range",
@@ -38,7 +38,7 @@ NAMES = (
     "summarize_generic_tool", "summarize_historical_answer", "summarize_historical_answers", "summarize_demand_peak", "summarize_site_devices", "device_selection_prompt_from_result",
     "build_device_choice_response",
     "daxview_history_event",
-    "wants_highest_demand_device", "choose_historical_operations",
+    "wants_highest_demand_device", "run_highest_demand_device_ranking", "choose_historical_operations",
     "resolved_plan_for_result", "readable_historical_errors", "refine_historical_answer_with_model",
     "chart_number", "chart_value", "mcp_structured_result", "historical_result_data",
     "demand_peak_needs_manual_fallback", "calculate_demand_peak_from_telemetry",
@@ -60,6 +60,8 @@ def load_functions():
         "result_problem": result_problem,
         "validate_tool_arguments": validate_tool_arguments,
         "public_tool_for_internal": public_tool_for_internal,
+        "build_public_calls": build_public_calls,
+        "DEMAND_RANKING_MAX_DEVICES": 20,
         "AI_CHAT_MEMORY_ENABLED": False,
         "MONTH_NAMES": next(
             ast.literal_eval(node.value)
@@ -842,6 +844,53 @@ class EmsPredictionTests(unittest.TestCase):
         question = "What is the highest demand device today?"
         self.assertEqual(self.env["select_historical_operations"](question), ["demand_peak_summary"])
         self.assertFalse(self.env["needs_device_choice"](question))
+
+    def test_site_wide_demand_scan_uses_configured_power_and_excludes_current_only_devices(self):
+        question = "Find the highest maximum demand across all devices at site 17 for the last 7 days"
+        self.assertEqual(self.env["select_historical_operations"](question), ["demand_peak_summary"])
+        self.env["build_historical_arguments"] = lambda operation, context, message="": {
+            "site_id": context["site_id"],
+            **({"device_id": context["device_id"]} if context.get("device_id") else {}),
+            "start_time": "2026-10-05T00:00:00+08:00",
+            "end_time": "2026-10-12T00:00:00+08:00",
+            "timezone": "Asia/Kuala_Lumpur",
+            "limit": 100,
+        }
+
+        def call(turn_id, operation, arguments, request_id, message=""):
+            if operation == "site_device_list":
+                return {"data": {"devices": [
+                    {"device_id": 519, "device_name": "Main Meter", "status": "online"},
+                    {"device_id": 520, "device_name": "Current-only Meter", "status": "online"},
+                ], "row_count": 2, "truncated": False}}
+            if operation == "telemetry_metric_catalog" and arguments["device_id"] == 519:
+                return {"data": {"metrics": [{"metric": "active_power", "source_metric": "Active Power Total", "unit": "kW", "status": "OK", "enabled": True}]}}
+            if operation == "telemetry_metric_catalog":
+                return {"data": {"metrics": [{"metric": "current", "source_metric": "Current L1", "unit": "A", "status": "OK", "enabled": True}]}}
+            if operation == "telemetry_timeseries":
+                return {"structuredContent": {"data": {"series": [{
+                    "metric": "active_power", "unit": "kW", "points": [
+                        {"timestamp": "2026-10-11T09:00:00+08:00", "value": 42.5},
+                        {"timestamp": "2026-10-11T10:00:00+08:00", "value": 48.2},
+                    ],
+                }]}}}
+            raise AssertionError(f"Unexpected operation: {operation}")
+
+        self.env["call_authorized_internal_operation"] = call
+        self.env["debug_trace_event"] = Mock()
+        results = self.env["run_highest_demand_device_ranking"](
+            "turn", question, {"site_id": 17, "_time_window": {
+                "start": "2026-10-05T00:00:00+08:00",
+                "end": "2026-10-12T00:00:00+08:00",
+                "timezone": "Asia/Kuala_Lumpur",
+            }}, "request"
+        )
+        data = results[0]["result"]["structuredContent"]["data"]
+        self.assertEqual(data["ranked_devices"][0]["device_id"], 519)
+        self.assertEqual(data["ranked_devices"][0]["peak_kw"], 48.2)
+        self.assertEqual(data["ranked_devices"][0]["peak_time"], "11 Oct 2026, 10:00 AM MYT")
+        self.assertEqual(data["excluded_devices"][0]["device_id"], 520)
+        self.assertIn("No configured demand", data["excluded_devices"][0]["reason"])
 
     def test_selected_device_context_does_not_trigger_choice_again(self):
         self.env["resolve_follow_up_message"] = Mock(side_effect=lambda turn, message, context, conversation, request: (message, context))
