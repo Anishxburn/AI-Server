@@ -756,6 +756,86 @@ def select_historical_operation(message: str) -> str | None:
     return operations[0] if operations else None
 
 
+def connected_load_calculation_answer(message: str) -> dict | None:
+    """Calculate explicit connected loads without routing them as historical telemetry."""
+    lowered = message.lower()
+    if not re.search(r"\b(?:maximum demand|max demand|peak demand|connected load|connected loads)\b", lowered):
+        return None
+    if not re.search(r"\b(?:load|loads|lighting|socket|cooker|heater|air conditioner)\b", lowered):
+        return None
+
+    voltage_match = re.search(r"\b(?:at\s*)?(\d+(?:\.\d+)?)\s*v\b", lowered)
+    voltage = float(voltage_match.group(1)) if voltage_match else None
+    segments = [segment.strip(" \t-*•") for segment in re.split(r"[\r\n;]+|\s*[•]\s*", message) if segment.strip()]
+    loads = []
+    socket_points = None
+    socket_current = None
+
+    for segment in segments:
+        text = segment.strip()
+        lower_segment = text.lower()
+        if "socket" in lower_segment and "point" in lower_segment:
+            count_match = re.search(r"\b(\d+)\s+(?:(?:single|double)(?:\s*/\s*(?:single|double))?\s+)?(?:socket\s+)?(?:outlet\s+)?points?\b", lower_segment)
+            current_match = re.search(r"\b(\d+(?:\.\d+)?)\s*a\b", lower_segment)
+            if count_match and current_match:
+                socket_points = int(count_match.group(1))
+                socket_current = float(current_match.group(1))
+                continue
+
+        if "lighting" in lower_segment:
+            count_match = re.search(r"\b(\d+)\s+(?:lighting\s+)?points?\b", lower_segment)
+            watts_match = re.search(r"\b(\d+(?:\.\d+)?)\s*w\s*(?:each|per\s+point)\b", lower_segment)
+            if count_match and watts_match:
+                count, watts = int(count_match.group(1)), float(watts_match.group(1))
+                loads.append({"name": "Lighting", "calculation": f"{count} x {watts:g} W", "kw": count * watts / 1000})
+                continue
+
+        kw_match = re.search(r"\b(\d+(?:\.\d+)?)\s*kw\b", lower_segment)
+        w_match = re.search(r"\b(\d+(?:\.\d+)?)\s*w\b", lower_segment)
+        if kw_match:
+            label = re.split(r"[:(]", text, maxsplit=1)[0].strip(" -*•") or "Load"
+            loads.append({"name": label, "calculation": f"{float(kw_match.group(1)):g} kW", "kw": float(kw_match.group(1))})
+        elif w_match and not "each" in lower_segment:
+            label = re.split(r"[:(]", text, maxsplit=1)[0].strip(" -*•") or "Load"
+            loads.append({"name": label, "calculation": f"{float(w_match.group(1)):g} W", "kw": float(w_match.group(1)) / 1000})
+
+    if socket_points and socket_current and voltage:
+        socket_kw = socket_points * socket_current * voltage / 1000
+        loads.append({
+            "name": "Socket outlets",
+            "calculation": f"{socket_points} points x {socket_current:g} A x {voltage:g} V",
+            "kw": socket_kw,
+        })
+    if not loads:
+        return None
+
+    total_kw = sum(item["kw"] for item in loads)
+    lines = ["Calculated from the loads you supplied (no DaxView/MCP data used):"]
+    lines.extend(
+        f"- {item['name']}: {item['calculation']} = {item['kw']:.2f} kW"
+        for item in loads
+    )
+    lines.append(f"Total connected load: {total_kw:.2f} kW")
+    if voltage:
+        lines.append(f"At {voltage:g} V single-phase, the equivalent full-load current is {total_kw * 1000 / voltage:.2f} A (assuming power factor 1.0).")
+    if socket_points and socket_current:
+        lines.append(
+            f"Socket assumption: each of the {socket_points} stated points is treated as one {socket_current:g} A outlet, "
+            "all drawing full current simultaneously; single/double-point wiring details may change this."
+        )
+    lines.append(
+        "This is the undiversified connected-load total, not a code-diversified maximum-demand estimate. "
+        "A defensible diversified estimate needs the applicable local wiring standard and its diversity rules; "
+        "socket-point count alone also does not establish actual simultaneous loading."
+    )
+    return {
+        "reply": "\n".join(lines),
+        "loads": loads,
+        "total_kw": total_kw,
+        "voltage_v": voltage,
+    }
+
+
 def requested_top_limit(message: str) -> int | None:
     match = re.search(
         r"\btop\s+(\d{1,2}|five|ten)\b"
@@ -3300,24 +3380,28 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
                 )
             table_limit = min(max(int(arguments.get("limit") or 10), 1), 100)
             for rank, row in enumerate(source_rows[:table_limit], 1):
+                device_name = first_value(row, ("device_name", "meter_name", "device"))
+                device_id = first_value(row, ("device_id", "deviceId"))
                 rows.append({
                     "rank": rank,
                     "alarm": first_value(row, ("alarm_name", "alarm_type", "alarm", "name", "type")) or "Alarm",
-                    "device": first_value(row, ("device_name", "meter_name", "device")) or "",
-                    "device_id": first_value(row, ("device_id", "deviceId")),
+                    "device": f"{device_name} (ID {device_id})" if device_name and device_id is not None else device_name or (f"ID {device_id}" if device_id is not None else ""),
                     "severity": first_value(row, ("severity", "priority")) or "",
                     "occurrences": first_value(row, ("event_count", "occurrence_count", "alarm_count", "count", "frequency")),
+                    "first_seen": first_value(row, ("first_seen", "first_occurrence", "started_at")),
                     "latest": first_value(row, ("latest_occurrence", "last_occurrence", "last_seen", "last_seen_at", "latest_at")),
                     "active": first_value(row, ("active_count", "active")),
                     "acknowledged": first_value(row, ("acknowledged_count", "acknowledged")),
                     "resolved": first_value(row, ("resolved_count", "resolved")),
                     "closed": first_value(row, ("closed_count", "closed")),
+                    "alarm_id": first_value(row, ("alarm_event_id", "alarm_id", "event_id")),
                 })
             title = "Latest Alarm Occurrences" if latest_requested else "Alarm Frequency"
             columns = [
-                ("rank", "#"), ("alarm", "Alarm"), ("device", "Device"), ("device_id", "Device ID"),
-                ("severity", "Severity"), ("occurrences", "Occurrences"), ("latest", "Latest occurrence"),
-                ("active", "Active"), ("acknowledged", "Acknowledged"), ("resolved", "Resolved"), ("closed", "Closed"),
+                ("rank", "#"), ("alarm", "Alarm"), ("device", "Device"), ("severity", "Severity"),
+                ("first_seen", "First occurrence"), ("latest", "Latest occurrence"),
+                ("occurrences", "Occurrences"), ("active", "Active"), ("acknowledged", "Acknowledged"),
+                ("resolved", "Resolved"), ("closed", "Closed"), ("alarm_id", "Alarm ID"),
             ]
         elif operation_id in {"device_energy_breakdown", "device_energy_ranking", "telemetry_top_consumers"}:
             measured, _ = ranked_consumer_rows(data)
@@ -3382,7 +3466,7 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
         if rows:
             display_timezone = arguments.get("timezone") or AI_DISPLAY_TIMEZONE
             for row in rows:
-                for key in ("latest", "started_at", "last_seen", "period"):
+                for key in ("first_seen", "latest", "started_at", "last_seen", "period"):
                     if row.get(key):
                         row[key] = format_display_timestamp(row[key], display_timezone)
             tables.append({
@@ -3938,6 +4022,25 @@ def try_top_consumers_breakdown_fallback(turn_id: str, arguments: dict, request_
 
 def run_daxview_integration_turn(turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> dict:
     message, context = resolve_follow_up_message(turn_id, message, context, session_id, request_id)
+    local_calculation = connected_load_calculation_answer(message)
+    if local_calculation:
+        debug_trace_event(
+            "local_ems_calculation_debug",
+            request_id=request_id,
+            calculation="connected_load_total",
+            source="user_supplied_values",
+            total_kw=local_calculation["total_kw"],
+            load_count=len(local_calculation["loads"]),
+            mcp_used=False,
+        )
+        return {
+            "provider": "local-ems-calculation",
+            "reply": local_calculation["reply"],
+            "charts": [],
+            "debug_charts": [],
+            "debug_tables": [],
+            "resolved_plan": resolved_plan_for_result("ok", [], context),
+        }
     clarification = metric_clarification(message)
     if clarification:
         return {"provider": "daxview-question-filter", "reply": clarification, "resolved_plan": resolved_plan_for_result("clarification", [], context)}
@@ -5416,11 +5519,21 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
           const heading = `<tr>${columns.map(column => `<th scope="col">${escapeHtml(column.label || column.key || "")}</th>`).join("")}</tr>`;
           const body = rows.map(row => `<tr>${columns.map((column, index) => {
             const wanted = String(column.key || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-            const actualKey = row && !Array.isArray(row)
-              ? Object.keys(row).find(key => key.toLowerCase().replace(/[^a-z0-9]/g, "") === wanted)
+            const sourceRow = row && !Array.isArray(row) ? (row.data || row.values || row) : row;
+            const aliases = {
+              rank: ["index", "number"], alarm: ["alarm_name", "alarm_type", "type", "name"],
+              device: ["device_name", "meter_name"], severity: ["priority"],
+              first_seen: ["first_occurrence", "started_at"], latest: ["latest_occurrence", "last_seen", "last_occurrence", "latest_at"],
+              occurrences: ["event_count", "occurrence_count", "frequency", "count"],
+              active: ["active_count"], acknowledged: ["acknowledged_count"],
+              resolved: ["resolved_count"], closed: ["closed_count"], alarm_id: ["alarm_event_id", "event_id"],
+            };
+            const candidateKeys = [column.key, ...(aliases[column.key] || [])].map(key => String(key).toLowerCase().replace(/[^a-z0-9]/g, ""));
+            const actualKey = sourceRow && !Array.isArray(sourceRow)
+              ? Object.keys(sourceRow).find(key => candidateKeys.includes(key.toLowerCase().replace(/[^a-z0-9]/g, "")))
               : null;
-            const value = row?.[column.key] ?? (actualKey ? row[actualKey] : Array.isArray(row) ? row[index] : null);
-            const display = value == null || value === "" ? "Not reported" : typeof value === "object" ? JSON.stringify(value) : value;
+            const value = sourceRow?.[column.key] ?? (actualKey ? sourceRow[actualKey] : Array.isArray(sourceRow) ? sourceRow[index] : null);
+            const display = value == null || value === "" ? "" : typeof value === "object" ? JSON.stringify(value) : value;
             return `<td>${escapeHtml(display)}</td>`;
           }).join("")}</tr>`).join("");
           const range = table.time_range || {};

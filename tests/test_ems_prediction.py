@@ -20,7 +20,7 @@ FUNCTIONS = {
     node.name: node for node in TREE.body if isinstance(node, ast.FunctionDef)
 }
 NAMES = (
-    "requested_top_limit", "requested_forecast_days", "requested_energy_extrema", "format_number", "format_time_window",
+    "requested_top_limit", "connected_load_calculation_answer", "requested_forecast_days", "requested_energy_extrema", "format_number", "format_time_window",
     "reading_detail",
     "requested_question_parts", "completed_daily_range", "wants_device_usage_ranking", "wants_all_devices",
     "wants_lowest_consumer", "wants_top_lowest_sum", "wants_device_inventory", "wants_device_capability_discovery",
@@ -117,6 +117,39 @@ class EmsPredictionTests(unittest.TestCase):
         question = "What alarm types occurred most often at this site in the last 7 days? Rank the top five."
         self.assertEqual(self.env["select_historical_operations"](question), ["alarm_frequency_summary"])
         self.assertEqual(self.env["requested_top_limit"](question), 5)
+
+    def test_connected_load_question_calculates_locally_without_historical_data(self):
+        question = (
+            "Calculate the estimated maximum demand for a standard domestic single-phase installation with the following connected loads:\n"
+            "Lighting: 12 lighting points (60W each)\n"
+            "Socket outlets (10A): 15 single/double points\n"
+            "Electric cooker: 6.9 kW (at 230V)\n"
+            "Instantaneous water heater: 4.0 kW (at 230V)\n"
+            "Air conditioner: 2.5 kW (at 230V)"
+        )
+        result = self.env["connected_load_calculation_answer"](question)
+        self.assertEqual([row["name"] for row in result["loads"]], [
+            "Lighting", "Electric cooker", "Instantaneous water heater", "Air conditioner", "Socket outlets",
+        ])
+        self.assertAlmostEqual(result["total_kw"], 48.62)
+        self.assertIn("211.39 A", result["reply"])
+        self.assertIn("not a code-diversified maximum-demand estimate", result["reply"])
+        self.assertIn("no DaxView/MCP data used", result["reply"])
+
+    def test_demand_questions_without_explicit_connected_loads_are_not_calculated(self):
+        self.assertIsNone(self.env["connected_load_calculation_answer"]("What was the site's maximum demand last week?"))
+
+    def test_original_turn_short_circuits_planner_and_mcp_for_supplied_load_math(self):
+        question = (
+            "Estimate maximum demand for connected loads: Lighting 10 points (50W each); "
+            "Water heater 3 kW at 230V"
+        )
+        self.env["resolve_follow_up_message"] = lambda turn_id, message, context, session_id, request_id: (message, context)
+        self.env["choose_historical_operations"] = Mock(side_effect=AssertionError("planner should not run"))
+        result = self.env["run_daxview_integration_turn"]("turn", question, {}, "request", "session")
+        self.assertEqual(result["provider"], "local-ems-calculation")
+        self.assertIn("3.50 kW", result["reply"])
+        self.assertFalse(any("mcp" in call.args[0] for call in self.env["debug_trace_event"].call_args_list))
 
     def test_planner_public_tool_intents_resolve_to_correct_internal_operation(self):
         intents = self.env["planner_default_intents"]
@@ -360,7 +393,7 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertEqual(tables[0]["title"], "Latest Alarm Occurrences")
         self.assertEqual(tables[0]["source_tool"], "alarm_data.frequency")
         self.assertEqual(tables[0]["rows"][0]["alarm"], "Newer")
-        self.assertEqual(tables[0]["rows"][0]["device_id"], 11)
+        self.assertEqual(tables[0]["rows"][0]["device"], "Meter B (ID 11)")
         self.assertEqual(tables[0]["time_range"]["timezone"], "UTC")
 
     def test_debug_alarm_table_falls_back_to_populated_aliases(self):
@@ -382,11 +415,43 @@ class EmsPredictionTests(unittest.TestCase):
         }], "Show latest alarm")
         row = tables[0]["rows"][0]
         self.assertEqual(row["alarm"], "High Voltage")
-        self.assertEqual(row["device"], "Main Meter")
-        self.assertEqual(row["device_id"], 519)
+        self.assertEqual(row["device"], "Main Meter (ID 519)")
         self.assertEqual(row["occurrences"], 2)
         self.assertEqual(row["resolved"], 2)
         self.assertIn("11 Oct 2026", row["latest"])
+
+    def test_alarm_table_matches_alarm_frequency_response_fields_and_leaves_missing_blank(self):
+        tables = self.env["build_tables_from_historical_results"]([{
+            "operation_id": "alarm_frequency_summary",
+            "arguments": {"timezone": "Asia/Kuala_Lumpur", "limit": 1},
+            "result": {"structuredContent": {"data": {"rows": [{
+                "alarm_id": 2026093000140,
+                "alarm_name": "Device Offline",
+                "alarm_type": "Device Offline",
+                "device_id": 492,
+                "device_name": "MhsOffice_DB_LP_2",
+                "event_count": 1,
+                "first_seen": "2026-10-06T04:03:00+00:00",
+                "last_seen": "2026-10-06T04:03:00+00:00",
+                "active_count": 0,
+                "acknowledged_count": 0,
+                "resolved_count": 1,
+                "closed_count": 0,
+            }], "row_count": 1, "truncated": False}}},
+        }], "List latest alarm")
+        table = tables[0]
+        row = table["rows"][0]
+        self.assertEqual([column["key"] for column in table["columns"]], [
+            "rank", "alarm", "device", "severity", "first_seen", "latest", "occurrences",
+            "active", "acknowledged", "resolved", "closed", "alarm_id",
+        ])
+        self.assertEqual(row["rank"], 1)
+        self.assertEqual(row["alarm"], "Device Offline")
+        self.assertEqual(row["device"], "MhsOffice_DB_LP_2 (ID 492)")
+        self.assertEqual(row["severity"], "")
+        self.assertEqual(row["active"], 0)
+        self.assertEqual(row["resolved"], 1)
+        self.assertEqual(row["alarm_id"], 2026093000140)
 
     def test_ranking_sorts_numeric_usage_and_joins_current_status(self):
         self.env["historical_result_data"] = lambda result: result["data"]
