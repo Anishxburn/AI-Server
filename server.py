@@ -28,6 +28,7 @@ from prediction_lab import PredictionService, daily_dataset
 from ems_sandbox import formula_reference, prepare_sandbox_context, sample_dataset
 from ems_contracts import measurement_context, metric_clarification, percentage_difference, question_metrics, result_problem
 from contracts.tool_schemas import TOOL_ARGUMENT_KEYS, TOOL_SCHEMAS, validate_tool_arguments
+from contracts.mcp_manifest import PUBLIC_MCP_TOOLS, build_public_calls, normalize_mcp_arguments, public_tool_for_internal
 from memory.conversation import load_conversation_history as load_conversation_history_from_db
 from planner.hybrid_planner import parse_planner_response, planner_json_schema, planner_system_prompt
 
@@ -88,28 +89,7 @@ DAXVIEW_ALLOW_MISSING_COMPANY = os.getenv("DAXVIEW_ALLOW_MISSING_COMPANY", "fals
 DAXVIEW_CALLBACK_BASE_URL = os.getenv("DAXVIEW_CALLBACK_BASE_URL", "").strip().rstrip("/")
 DAXVIEW_CALLBACK_KEY = os.getenv("DAXVIEW_CALLBACK_KEY", "").strip()
 DAXVIEW_CALLBACK_KEY_PREVIOUS = os.getenv("DAXVIEW_CALLBACK_KEY_PREVIOUS", "").strip()
-DAXVIEW_ALLOWED_HISTORICAL_TOOLS = {
-    "device_energy_ranking",
-    "site_energy_summary",
-    "alarm_frequency_summary",
-    "site_metadata_summary",
-    "site_device_list",
-    "telemetry_timeseries",
-    "telemetry_metric_catalog",
-    "latest_telemetry_snapshot",
-    "active_alarm_summary",
-    "meter_status_summary",
-    "energy_comparison_summary",
-    "data_availability_summary",
-    "alarm_detail_lookup",
-    "power_quality_summary",
-    "demand_peak_summary",
-    "tariff_cost_summary",
-    "device_energy_breakdown",
-    "energy_forecast",
-    "anomaly_detection_summary",
-    "report_summary",
-}
+DAXVIEW_ALLOWED_HISTORICAL_TOOLS = {"device_data", "alarm_data", "site_summary"}
 DAXVIEW_JOB_EXECUTOR = ThreadPoolExecutor(max_workers=AI_JOB_WORKERS)
 SANDBOX_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ems-sandbox")
 SANDBOX_JOBS: dict[str, dict] = {}
@@ -238,26 +218,9 @@ DAXVIEW_TOOL_KEYWORDS = {
 }
 
 DAXVIEW_TOOL_DESCRIPTIONS = {
-    "device_energy_ranking": "Rank devices by energy consumption for a site/window.",
-    "site_energy_summary": "Summarize site energy values over a time window.",
-    "alarm_frequency_summary": "Rank historical alarm types by count/severity.",
-    "site_metadata_summary": "Return site/building/device/meter metadata counts.",
-    "site_device_list": "List devices/meters in the scoped site/building.",
-    "telemetry_timeseries": "Return a device metric trend such as voltage/current/energy.",
-    "telemetry_metric_catalog": "Discover available telemetry metrics and coverage by device.",
-    "latest_telemetry_snapshot": "Return latest persisted telemetry readings by device/metric.",
-    "active_alarm_summary": "Return currently active/open alarms.",
-    "meter_status_summary": "Return device/meter online/offline/stale state.",
-    "energy_comparison_summary": "Compare two energy periods.",
-    "data_availability_summary": "Check data coverage/missing readings.",
-    "alarm_detail_lookup": "Look up one alarm by alarm ID.",
-    "power_quality_summary": "Summarize voltage sag/swell/THD/power-quality events.",
-    "demand_peak_summary": "Return max/peak demand for site/building/device.",
-    "tariff_cost_summary": "Estimate tariff or cost for energy use.",
-    "device_energy_breakdown": "Break down site energy by device/building.",
-    "energy_forecast": "Forecast future energy from historical data.",
-    "anomaly_detection_summary": "Find abnormal readings or usage patterns.",
-    "report_summary": "Generate a compact EMS management report.",
+    "device_data": "Device inventory, configured metric discovery, historical metric values, and per-device energy rows. Select the operation field: list, metrics, values, or energy_rows.",
+    "alarm_data": "Active alarms, historical alarm frequency, or one alarm's detail. Select the operation field: active, frequency, or detail.",
+    "site_summary": "Site/building overview or site energy buckets. Select the operation field: overview or energy.",
 }
 
 DAXVIEW_SCOPE_REQUIRED_TOOLS = {
@@ -886,12 +849,59 @@ def select_historical_operations_without_device_timeseries(message: str) -> list
 def explicit_mcp_tool_request(message: str) -> str | None:
     lowered = message.lower()
     match = re.search(r"\b(?:test|call|run|use)\s+(?:the\s+)?(?:mcp\s+)?tool\s+([a-z_][a-z0-9_]*)\b", lowered)
-    if match and match.group(1) in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
-        return match.group(1)
-    for tool_name in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
-        if re.search(rf"\b(?:test|call|run|use)\s+{re.escape(tool_name)}\b", lowered):
-            return tool_name
+    tool_name = match.group(1) if match and match.group(1) in DAXVIEW_ALLOWED_HISTORICAL_TOOLS else next(
+        (name for name in DAXVIEW_ALLOWED_HISTORICAL_TOOLS if re.search(rf"\b(?:test|call|run|use)\s+{re.escape(name)}\b", lowered)),
+        None,
+    )
+    if tool_name:
+        operations = [op for op in re.split(r"\W+", lowered) if op in {"list", "metrics", "values", "energy_rows", "active", "frequency", "detail", "overview", "energy"}]
+        operation = operations[0] if operations else None
+        return internal_for_public_operation(tool_name, operation)
     return None
+
+
+def internal_for_public_operation(tool_name: str, operation: str | None = None) -> str:
+    reverse = {
+        ("device_data", "list"): "site_device_list",
+        ("device_data", "metrics"): "telemetry_metric_catalog",
+        ("device_data", "values"): "telemetry_timeseries",
+        ("device_data", "energy_rows"): "device_energy_breakdown",
+        ("alarm_data", "active"): "active_alarm_summary",
+        ("alarm_data", "frequency"): "alarm_frequency_summary",
+        ("alarm_data", "detail"): "alarm_detail_lookup",
+        ("site_summary", "overview"): "site_metadata_summary",
+        ("site_summary", "energy"): "site_energy_summary",
+    }
+    defaults = {"device_data": "site_device_list", "alarm_data": "active_alarm_summary", "site_summary": "site_metadata_summary"}
+    return reverse.get((tool_name, operation), defaults.get(tool_name, ""))
+
+
+def select_public_tools(internal_operations: list[str]) -> list[str]:
+    tools = []
+    for intent in internal_operations:
+        tool, _ = public_tool_for_internal(intent)
+        if tool not in tools:
+            tools.append(tool)
+    return tools
+
+
+def planner_default_intents(message: str, tools: list[str]) -> list[str]:
+    lowered = message.lower()
+    defaults = []
+    if "device_data" in tools:
+        if wants_device_usage_ranking(message):
+            defaults.append("device_energy_breakdown")
+        elif question_metrics(message) or any(term in lowered for term in ("trend", "reading", "maximum demand", "max demand", "peak demand")):
+            defaults.append("telemetry_timeseries")
+        elif any(term in lowered for term in ("available metric", "what metrics", "supports voltage", "supports current")):
+            defaults.append("telemetry_metric_catalog")
+        else:
+            defaults.append("site_device_list")
+    if "alarm_data" in tools:
+        defaults.append("alarm_frequency_summary" if any(term in lowered for term in ("frequency", "most common", "most often", "history")) else "active_alarm_summary")
+    if "site_summary" in tools:
+        defaults.append("site_metadata_summary" if any(term in lowered for term in ("overview", "site detail", "site information")) else "site_energy_summary")
+    return defaults
 
 
 def select_historical_operations(message: str) -> list[str]:
@@ -1073,20 +1083,23 @@ def choose_historical_operations(message: str, context: dict, turn_id: str, sess
     try:
         plan, latency_ms = plan_turn_with_llm(message, history, context, request_id)
         planned_context = planner_slot_context(message, context, plan)
-        planned_tools = [tool for tool in plan.tools if tool in DAXVIEW_ALLOWED_HISTORICAL_TOOLS]
+        planned_public_tools = [tool for tool in plan.tools if tool in DAXVIEW_ALLOWED_HISTORICAL_TOOLS]
+        planned_tools = [intent for intent in regex_operations if public_tool_for_internal(intent)[0] in planned_public_tools]
+        if not planned_tools:
+            planned_tools = planner_default_intents(message, planned_public_tools)
         if AI_PLANNER_SHADOW_MODE or not AI_PLANNER_ENABLED:
             log_event(
                 "planner_shadow_compare",
                 request_id=request_id,
                 regex_tools=regex_operations,
-                planner_tools=planned_tools,
-                agreement=regex_operations == planned_tools,
+                planner_tools=planned_public_tools,
+                agreement=select_public_tools(regex_operations) == planned_public_tools,
                 latency_ms=latency_ms,
                 confidence=plan.confidence,
             )
             return regex_operations, context, {
                 "status": "shadow",
-                "tools": [{"tool": tool, "arguments": {}} for tool in planned_tools],
+                "tools": [{"tool": tool, "arguments": {}} for tool in planned_public_tools],
                 "slots": planned_context,
             }
         if plan.clarification and plan.clarification.question:
@@ -1095,7 +1108,7 @@ def choose_historical_operations(message: str, context: dict, turn_id: str, sess
                 request_id=request_id,
                 status="clarification",
                 regex_tools=regex_operations,
-                planner_tools=planned_tools,
+                planner_tools=planned_public_tools,
                 selected_tools=[],
                 context=planned_context,
                 clarification=plan.clarification.question,
@@ -1118,7 +1131,7 @@ def choose_historical_operations(message: str, context: dict, turn_id: str, sess
         )
         return selected_tools, planned_context, {
             "status": "ok",
-            "tools": [{"tool": tool, "arguments": {}} for tool in planned_tools],
+            "tools": [{"tool": tool, "arguments": {}} for tool in planned_public_tools],
             "slots": planned_context,
         }
     except Exception as error:
@@ -1432,7 +1445,7 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
 def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, request_id: str) -> dict:
     if not DAXVIEW_CALLBACK_BASE_URL or not DAXVIEW_CALLBACK_KEY:
         raise RuntimeError("DAXVIEW_CALLBACK_BASE_URL and DAXVIEW_CALLBACK_KEY are required for historical data")
-    arguments = validate_tool_arguments(operation_id, arguments)
+    arguments = normalize_mcp_arguments(operation_id, arguments)
     payload = {
         "turn_id": turn_id,
         "continuation_id": str(uuid.uuid4()),
@@ -1459,6 +1472,7 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
             "building_id",
             "device_id",
             "alarm_id",
+            "alarm_event_id",
             "start",
             "end",
             "start_time",
@@ -1477,6 +1491,16 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
             "forecast_start",
             "forecast_end",
             "training_days",
+            "operation",
+            "metric",
+            "metrics",
+            "device_type",
+            "meter_model",
+            "manufacturer",
+            "status",
+            "has_data",
+            "search",
+            "severity",
         }
     }
     log_event(
@@ -1484,6 +1508,7 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
         request_id=request_id,
         turn_id=turn_id,
         operation_id=operation_id,
+        operation=arguments.get("operation"),
         arguments=safe_arguments,
     )
     debug_trace_event(
@@ -1503,6 +1528,7 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
                 request_id=request_id,
                 turn_id=turn_id,
                 operation_id=operation_id,
+                operation=arguments.get("operation"),
                 has_authorization=bool(plan.get("authorization_id")),
                 arguments=redact_debug_value(normalized_arguments),
             )
@@ -1511,6 +1537,7 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
                 request_id=request_id,
                 turn_id=turn_id,
                 operation_id=operation_id,
+                operation=arguments.get("operation"),
                 has_authorization=bool(plan.get("authorization_id")),
                 arguments=redact_debug_value(normalized_arguments),
                 changed_arguments={
@@ -1525,6 +1552,7 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
                 request_id=request_id,
                 turn_id=turn_id,
                 operation_id=operation_id,
+                operation=arguments.get("operation"),
                 stage="data_plan_authorized" if plan.get("authorization_id") else "data_plan_missing_authorization",
                 has_authorization=bool(plan.get("authorization_id")),
                 arguments=redact_debug_value(normalized_arguments),
@@ -1565,11 +1593,12 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
 def call_authorized_historical_tool(operation_id: str, authorization_id: str, arguments: dict, request_id: str) -> dict:
     if operation_id not in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
         raise ValueError("historical operation is not allowlisted")
-    arguments = validate_tool_arguments(operation_id, arguments)
+    arguments = normalize_mcp_arguments(operation_id, arguments)
     debug_trace_event(
         "daxview_fetch_stage_debug",
         request_id=request_id,
         operation_id=operation_id,
+        operation=arguments.get("operation"),
         stage="mcp_tool_call_start",
         arguments=redact_debug_value(arguments),
     )
@@ -1580,6 +1609,7 @@ def call_authorized_historical_tool(operation_id: str, authorization_id: str, ar
         "daxview_mcp_structured_result_debug",
         request_id=request_id,
         operation_id=operation_id,
+        operation=arguments.get("operation"),
         status=structured.get("status"),
         error_code=structured.get("error_code") or structured.get("code"),
         message=structured.get("message") or structured.get("detail") or structured.get("error"),
@@ -1600,9 +1630,10 @@ def call_authorized_historical_tool(operation_id: str, authorization_id: str, ar
         "daxview_fetch_stage_debug",
         request_id=request_id,
         operation_id=operation_id,
+        operation=arguments.get("operation"),
         stage="mcp_tool_valid_data",
     )
-    if AI_DEBUG_DASHBOARD_ENABLED and operation_id == "site_energy_summary" and arguments.get("bucket") == "day":
+    if AI_DEBUG_DASHBOARD_ENABLED and operation_id == "site_summary" and arguments.get("operation") == "energy" and arguments.get("bucket") == "day":
         try:
             data = historical_result_data(result)
             rows = first_list(data, ("buckets", "rows", "series", "data"))
@@ -1614,6 +1645,48 @@ def call_authorized_historical_tool(operation_id: str, authorization_id: str, ar
         except Exception as error:
             log_event("prediction_snapshot_skipped", request_id=request_id, reason=str(error))
     return result
+
+
+def execute_authorized_internal_operation(
+    turn_id: str, internal_operation: str, arguments: dict, request_id: str, message: str = "",
+) -> list[dict]:
+    """Run an internal EMS intent only through a plan-authorized public MCP tool."""
+    records = []
+    for index, (tool_name, requested_arguments) in enumerate(build_public_calls(internal_operation, arguments, message)):
+        plan = request_daxview_data_plan(turn_id, tool_name, requested_arguments, request_id)
+        authorization_id = plan.get("authorization_id")
+        planned = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else requested_arguments
+        normalized = normalize_mcp_arguments(tool_name, planned)
+        if normalized.get("operation") != requested_arguments.get("operation"):
+            raise RuntimeError("DaxView changed the authorized MCP operation")
+        if not authorization_id:
+            raise RuntimeError(f"DaxView did not return a data authorization for {tool_name}.{normalized['operation']}")
+        result = call_authorized_historical_tool(tool_name, str(authorization_id), normalized, request_id)
+        record_operation = internal_operation
+        if internal_operation in {"energy_comparison_summary", "report_summary"}:
+            record_operation = {
+                ("site_summary", "energy"): "site_energy_summary",
+                ("device_data", "energy_rows"): "device_energy_breakdown",
+                ("alarm_data", "frequency"): "alarm_frequency_summary",
+                ("site_summary", "overview"): "site_metadata_summary",
+            }.get((tool_name, normalized["operation"]), internal_operation)
+        records.append({
+            "operation_id": record_operation,
+            "intent_id": internal_operation,
+            "public_tool": tool_name,
+            "operation": normalized["operation"],
+            "arguments": normalized,
+            "result": result,
+            **({"period_label": "A" if index == 0 else "B"} if internal_operation == "energy_comparison_summary" else {}),
+        })
+    return records
+
+
+def call_authorized_internal_operation(turn_id: str, internal_operation: str, arguments: dict, request_id: str, message: str = "") -> dict:
+    records = execute_authorized_internal_operation(turn_id, internal_operation, arguments, request_id, message)
+    if not records:
+        raise RuntimeError(f"No public MCP operation was produced for {internal_operation}")
+    return records[0]["result"]
 
 
 def first_dict_with_list(value, list_keys: tuple[str, ...]) -> dict | None:
@@ -2036,6 +2109,8 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
             lines.append(f"Showing 31 of {len(daily_values)} daily row(s).")
     elif total_value is None:
         lines.append("No energy values were returned for this site and time range.")
+    if data.get("complete") is False:
+        lines.append("Completeness: the MCP marked this requested energy range incomplete; treat totals as partial evidence.")
     wants_highest, wants_lowest = requested_energy_extrema(message)
     if wants_highest or wants_lowest:
         complete_values = dict(daily_values)
@@ -2141,7 +2216,7 @@ def summarize_alarm_frequency(data: dict, arguments: dict | None = None) -> str:
         if not isinstance(row, dict):
             continue
         name = row.get("alarm_name") or row.get("name") or row.get("type") or row.get("severity") or "Alarm"
-        count = next((row[key] for key in ("count", "frequency", "total", "value") if row.get(key) is not None), None)
+        count = next((row[key] for key in ("event_count", "count", "frequency", "total", "value") if row.get(key) is not None), None)
         detail = f"{index}. {name} - {format_number(count, 0)} occurrence(s)"
         if row.get("severity"):
             detail += f", severity {row['severity']}"
@@ -2185,8 +2260,9 @@ def summarize_site_metadata(data: dict) -> str:
     site = data.get("site") if isinstance(data.get("site"), dict) else data
     buildings = data.get("buildings") if isinstance(data.get("buildings"), list) else []
     lines = []
-    if site.get("name"):
-        lines.append(f"Site: {site.get('name')} (ID {site.get('id', site.get('site_id', 'unknown'))})")
+    site_name = site.get("name") or site.get("site_name")
+    if site_name:
+        lines.append(f"Site: {site_name} (ID {site.get('id', site.get('site_id', 'unknown'))})")
     details = []
     detail_labels = {
         "timezone": "Timezone",
@@ -2530,6 +2606,12 @@ def summarize_historical_answer(
             return f"DaxView historical data is currently unavailable for this {scope}."
         return f"DaxView could not return {operation_id}: {issue}."
     data = historical_result_data(mcp_result)
+    if operation_id == "demand_peak_summary" and not any(
+        data.get(key) is not None for key in ("peak_kw", "max_demand_kw", "maximum_demand_kw", "peak_demand_kw", "max_kw")
+    ):
+        calculated = calculate_demand_peak_from_telemetry(mcp_result, arguments or {})
+        if calculated and isinstance(calculated.get("data"), dict):
+            data = {**data, **calculated["data"]}
     if operation_id in {"device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers"} and wants_device_usage_ranking(message):
         return summarize_top_consumers(data, arguments, message)
     if operation_id == "site_energy_summary":
@@ -2575,6 +2657,27 @@ def summarize_historical_answers(
             request_id,
             item.get("arguments"),
         )
+
+    comparison_results = [item for item in results if item.get("intent_id") == "energy_comparison_summary"]
+    if len(comparison_results) == 2:
+        totals = []
+        for item in comparison_results:
+            data = historical_result_data(item.get("result", {}))
+            total = first_value(data, ("total_kwh", "total", "total_value", "value"))
+            if total is None:
+                buckets = first_list(data, ("buckets", "rows", "series"))
+                numeric = [chart_value(row, ("value", "kwh", "energy")) for row in buckets if isinstance(row, dict)]
+                numeric = [value for value in numeric if value is not None]
+                total = sum(numeric) if numeric else None
+            totals.append((item.get("period_label", "period"), total))
+        if all(isinstance(value, (int, float)) and not isinstance(value, bool) for _, value in totals):
+            (label_a, value_a), (label_b, value_b) = totals
+            delta = value_b - value_a
+            percent = (delta / value_a * 100) if value_a else None
+            direction = "higher" if delta > 0 else "lower" if delta < 0 else "unchanged"
+            lines = [f"Energy comparison: period {label_a} = {format_number(value_a, 2)} kWh; period {label_b} = {format_number(value_b, 2)} kWh."]
+            lines.append(f"Period {label_b} was {format_number(abs(delta), 2)} kWh {direction} than period {label_a}" + (f" ({format_number(abs(percent), 2)}%)." if percent is not None else ". Percentage change is unavailable because the reference period is zero."))
+            return "\n".join(lines)
 
     top_result = next((item for item in results if item["operation_id"] in {"device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers"}), None)
     device_result = next((item for item in results if item["operation_id"] == "site_device_list"), None)
@@ -2991,6 +3094,19 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
                 labels.append(chart_label(row, "peak"))
                 values.append(value)
         if not values:
+            for series in first_list(data, ("series",)):
+                if not isinstance(series, dict):
+                    continue
+                factor = {"w": 0.001, "kw": 1.0, "mw": 1000.0}.get(str(series.get("unit") or "kw").lower(), 1.0)
+                for point in (series.get("points") if isinstance(series.get("points"), list) else []):
+                    if not isinstance(point, dict):
+                        continue
+                    value = chart_value(point, ("value", "demand_kw", "kw", "reading"))
+                    label = point.get("timestamp") or point.get("time") or point.get("bucket")
+                    if value is not None and label:
+                        labels.append(str(label))
+                        values.append(value * factor)
+        if not values:
             value = chart_value(data, ("peak_kw", "max_kw", "demand_kw", "value", "peak", "maximum"))
             if value is not None:
                 labels = [str(data.get("peak_time") or data.get("timestamp") or "Peak demand")]
@@ -2998,9 +3114,22 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
         return build_chart_spec("bar", "Peak Demand", labels, values, data.get("unit") or "kW", "Demand")
     if operation_id == "telemetry_timeseries":
         rows = first_list(data, ("rows", "series", "buckets", "data", "points"))
-        pairs = [(str(row.get("timestamp") or row.get("date") or row.get("bucket") or ""),
-                  chart_value(row, ("value", "average", "avg", "reading")))
-                 for row in rows[:1000] if isinstance(row, dict)]
+        pairs = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            points = row.get("points") if isinstance(row.get("points"), list) else [row]
+            for point in points:
+                if not isinstance(point, dict):
+                    continue
+                label = point.get("timestamp") or point.get("date") or point.get("bucket") or ""
+                value = chart_value(point, ("value", "average", "avg", "reading"))
+                if label and value is not None:
+                    pairs.append((str(label), value))
+                if len(pairs) >= 1000:
+                    break
+            if len(pairs) >= 1000:
+                break
         pairs = sorted((label, value) for label, value in pairs if label and value is not None)
         metric = (arguments or {}).get("metric", "Telemetry")
         return build_chart_spec("line", f"{str(metric).title()} History", [p[0] for p in pairs],
@@ -3335,12 +3464,7 @@ def device_selection_prompt_from_result(mcp_result: dict) -> tuple[str, list[dic
 def build_device_choice_response(turn_id: str, message: str, context: dict, request_id: str) -> dict:
     try:
         arguments = build_historical_arguments("site_device_list", context, message)
-        plan = request_daxview_data_plan(turn_id, "site_device_list", arguments, request_id)
-        authorization_id = plan.get("authorization_id")
-        normalized_arguments = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else arguments
-        if not authorization_id:
-            raise RuntimeError("Daxview did not return a data authorization for site_device_list")
-        result = call_authorized_historical_tool("site_device_list", str(authorization_id), normalized_arguments, request_id)
+        result = call_authorized_internal_operation(turn_id, "site_device_list", arguments, request_id, message)
         prompt, choices = device_selection_prompt_from_result(result)
     except Exception as error:
         log_event("daxview_device_choice_failed", request_id=request_id, turn_id=turn_id, error=str(error))
@@ -3370,12 +3494,8 @@ def run_highest_demand_device_ranking(turn_id: str, message: str, context: dict,
         **({"building_id": int(context["building_id"])} if context.get("building_id") else {}),
         "limit": DEMAND_RANKING_MAX_DEVICES + 1,
     })
-    plan = request_daxview_data_plan(turn_id, "site_device_list", device_args, request_id)
-    authorization_id = plan.get("authorization_id")
-    normalized_args = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else device_args
-    if not authorization_id:
-        raise RuntimeError("DaxView did not authorize site_device_list for demand ranking")
-    device_result = call_authorized_historical_tool("site_device_list", str(authorization_id), normalized_args, request_id)
+    device_result = call_authorized_internal_operation(turn_id, "site_device_list", device_args, request_id, message)
+    normalized_args = build_public_calls("site_device_list", device_args, message)[0][1]
     device_data = historical_result_data(device_result)
     devices = first_list(device_data, ("devices", "rows", "items", "meters"))
     selectable = [device for device in devices if isinstance(device, dict) and (device.get("device_id") or device.get("id") or device.get("meter_id"))]
@@ -3397,12 +3517,8 @@ def run_highest_demand_device_ranking(turn_id: str, message: str, context: dict,
         device_id = device.get("device_id") or device.get("id") or device.get("meter_id")
         try:
             demand_args = build_historical_arguments("demand_peak_summary", {**context, "device_id": int(device_id)}, message)
-            per_plan = request_daxview_data_plan(turn_id, "demand_peak_summary", demand_args, request_id)
-            per_auth = per_plan.get("authorization_id")
-            per_args = per_plan.get("arguments") if isinstance(per_plan.get("arguments"), dict) else demand_args
-            if not per_auth:
-                continue
-            per_result = call_authorized_historical_tool("demand_peak_summary", str(per_auth), per_args, request_id)
+            per_result = call_authorized_internal_operation(turn_id, "demand_peak_summary", demand_args, request_id, message)
+            per_args = build_public_calls("demand_peak_summary", demand_args, message)[0][1]
             per_data = historical_result_data(per_result)
             summary = per_data.get("summary") if isinstance(per_data.get("summary"), dict) else per_data
             peak = first_value(summary, ("peak_kw", "max_demand_kw", "maximum_demand_kw", "peak_demand_kw", "max_kw"))
@@ -3452,13 +3568,8 @@ def run_authorized_energy_prediction(turn_id: str, arguments: dict, request_id: 
     source_args["start"] = (forecast_start - timedelta(days=training_days)).isoformat()
     source_args["end"] = forecast_start.isoformat()
     source_args["bucket"] = "day"
-    plan = request_daxview_data_plan(turn_id, "site_energy_summary", source_args, request_id)
-    authorization_id = plan.get("authorization_id")
-    normalized = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else source_args
-    if not authorization_id:
-        raise RuntimeError("DaxView did not authorize site_energy_summary for prediction")
     try:
-        source = call_authorized_historical_tool("site_energy_summary", str(authorization_id), normalized, request_id)
+        source = call_authorized_internal_operation(turn_id, "site_energy_summary", source_args, request_id)
     except RuntimeError as error:
         raise PredictionSourceError(str(error)) from error
     structured = mcp_structured_result(source)
@@ -3486,6 +3597,8 @@ def demand_peak_needs_manual_fallback(mcp_result: dict) -> bool:
     peak_keys = ("peak_kw", "max_demand_kw", "maximum_demand_kw", "peak_demand_kw", "max_kw")
     if first_value(data, peak_keys) is not None:
         return False
+    if calculate_demand_peak_from_telemetry(mcp_result, {}):
+        return False
     rows = first_list(data, ("rows", "items", "results", "data", "series", "buckets"))
     return not any(isinstance(row, dict) and first_value(row, peak_keys) is not None for row in rows)
 
@@ -3501,9 +3614,18 @@ def calculate_demand_peak_from_telemetry(mcp_result: dict, arguments: dict) -> d
     for row in rows:
         if not isinstance(row, dict):
             continue
-        value = chart_value(row, value_keys)
-        if value is not None:
-            candidates.append((value, row))
+        points = row.get("points") if isinstance(row.get("points"), list) else [row]
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            value = chart_value(point, value_keys)
+            if value is None:
+                continue
+            unit = str(point.get("unit") or row.get("unit") or data.get("unit") or "kw").strip().lower()
+            factor = {"w": 0.001, "kw": 1.0, "mw": 1000.0}.get(unit)
+            if factor is not None:
+                value *= factor
+            candidates.append((value, {**row, **point, "unit": "kW"}))
     if not candidates:
         return None
     peak, row = max(candidates, key=lambda item: item[0])
@@ -3512,7 +3634,8 @@ def calculate_demand_peak_from_telemetry(mcp_result: dict, arguments: dict) -> d
         "data": {
             "peak_kw": round(float(peak), 4),
             "peak_time": first_value(row, ("timestamp", "time", "bucket", "date", "start_time", "started_at")),
-            "source": "manual calculation from telemetry_timeseries",
+            "unit": "kW",
+            "source": "deterministic maximum of device_data.values demand points",
             "sample_count": len(candidates),
             "calculation": "max(demand telemetry values)",
             "start_time": arguments.get("start_time"),
@@ -3531,12 +3654,8 @@ def try_manual_demand_peak_fallback(turn_id: str, arguments: dict, request_id: s
     telemetry_args["bucket"] = telemetry_args.get("bucket") or "1h"
     telemetry_args["aggregation"] = telemetry_args.get("aggregation") or "auto"
     telemetry_args["limit"] = int(telemetry_args.get("limit") or 1000)
-    plan = request_daxview_data_plan(turn_id, "telemetry_timeseries", telemetry_args, request_id)
-    authorization_id = plan.get("authorization_id")
-    normalized = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else telemetry_args
-    if not authorization_id:
-        raise RuntimeError("Daxview did not return a data authorization for telemetry_timeseries")
-    telemetry_result = call_authorized_historical_tool("telemetry_timeseries", str(authorization_id), normalized, request_id)
+    telemetry_result = call_authorized_internal_operation(turn_id, "telemetry_timeseries", telemetry_args, request_id)
+    normalized = build_public_calls("telemetry_timeseries", telemetry_args)[0][1]
     calculated = calculate_demand_peak_from_telemetry(telemetry_result, normalized)
     if not calculated:
         raise RuntimeError("telemetry_timeseries returned no demand values that can be used for manual max-demand calculation")
@@ -3562,17 +3681,8 @@ def try_top_consumers_breakdown_fallback(turn_id: str, arguments: dict, request_
     if "end" in breakdown_args:
         breakdown_args["end_time"] = breakdown_args.pop("end")
     breakdown_args["limit"] = int(breakdown_args.get("limit") or 20)
-    plan = request_daxview_data_plan(turn_id, "device_energy_breakdown", breakdown_args, request_id)
-    authorization_id = plan.get("authorization_id")
-    normalized = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else breakdown_args
-    normalized = dict(normalized)
-    if "start" in normalized:
-        normalized["start_time"] = normalized.pop("start")
-    if "end" in normalized:
-        normalized["end_time"] = normalized.pop("end")
-    if not authorization_id:
-        raise RuntimeError("Daxview did not return a data authorization for device_energy_breakdown")
-    result = call_authorized_historical_tool("device_energy_breakdown", str(authorization_id), normalized, request_id)
+    result = call_authorized_internal_operation(turn_id, "device_energy_breakdown", breakdown_args, request_id)
+    normalized = build_public_calls("device_energy_breakdown", breakdown_args)[0][1]
     return {
         "operation_id": "device_energy_ranking",
         "arguments": {**normalized, "limit": int(normalized.get("limit") or breakdown_args["limit"])},
@@ -3607,7 +3717,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         result = langchain_chat_response(message, request_id, session_id)
         result["resolved_plan"] = resolved_plan_for_result("ok", [], context)
         return result
-    if "demand_peak_summary" in operation_ids and needs_device_choice(message) and not context.get("device_id"):
+    if "demand_peak_summary" in operation_ids and not context.get("device_id") and not wants_highest_demand_device(message):
         result = build_device_choice_response(turn_id, message, context, request_id)
         result["resolved_plan"] = resolved_plan_for_result("clarification", operation_ids, context)
         return result
@@ -3687,25 +3797,15 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
                     raise
             continue
         try:
-            plan = request_daxview_data_plan(turn_id, operation_id, arguments, request_id)
-            authorization_id = plan.get("authorization_id")
-            normalized_arguments = plan.get("arguments") if isinstance(plan.get("arguments"), dict) else arguments
-            if not authorization_id:
-                raise RuntimeError(f"Daxview did not return a data authorization for {operation_id}")
-            result = call_authorized_historical_tool(operation_id, str(authorization_id), normalized_arguments, request_id)
+            operation_results = execute_authorized_internal_operation(turn_id, operation_id, arguments, request_id, message)
+            result = operation_results[0]["result"] if operation_results else {}
             if AI_MCP_FALLBACKS_ENABLED and operation_id == "demand_peak_summary" and demand_peak_needs_manual_fallback(result):
                 try:
-                    results.append(try_manual_demand_peak_fallback(turn_id, normalized_arguments, request_id))
+                    results.append(try_manual_demand_peak_fallback(turn_id, arguments, request_id))
                     continue
                 except Exception as fallback_error:
                     errors.append({"operation_id": "telemetry_timeseries", "metric": "demand", "error": str(fallback_error)})
-            results.append(
-                {
-                    "operation_id": operation_id,
-                    "arguments": normalized_arguments,
-                    "result": result,
-                }
-            )
+            results.extend(operation_results)
         except Exception as error:
             if AI_MCP_FALLBACKS_ENABLED and operation_id in {"device_energy_ranking", "telemetry_top_consumers"}:
                 try:
@@ -4389,7 +4489,12 @@ def call_daxview_mcp_tool(tool_name: str, arguments: dict | None, request_id: st
 
 
 def select_daxview_tools(message: str) -> list[str]:
-    return select_historical_operations(message)[:5]
+    tools = []
+    for intent in select_historical_operations(message):
+        tool, _ = public_tool_for_internal(intent)
+        if tool not in tools:
+            tools.append(tool)
+    return tools
 
 
 def retrieve_daxview_context(message: str, request_id: str) -> dict:

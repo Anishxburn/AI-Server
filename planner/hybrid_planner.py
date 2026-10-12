@@ -65,20 +65,21 @@ Rules:
 - Never output site_id, company_id, deployment_id, authorization_id, start/end timestamps, or tenant identifiers.
 - Use natural references from the user in slots, such as device_refs or building_ref.
 - Use tools only from the allowlist.
-- For max demand use demand_peak_summary. For energy totals/trends use site_energy_summary or telemetry_timeseries.
-- For "highest demand device" choose demand_peak_summary and mark device as missing if no device is named.
-- For multi-intent questions include multiple tools, for example demand_peak_summary and active_alarm_summary.
+- Public tools are categories; the server resolves the operation and exact arguments. device_data covers inventory, metric discovery, telemetry values, and device energy rows; alarm_data covers active/frequency/detail; site_summary covers overview and site energy.
+- For max demand, voltage/current, readings, or trends choose device_data. The server will request configured metric values; if the device is ambiguous, ask which one.
+- For device energy ranking choose device_data. For energy totals/trends choose site_summary. For alarms choose alarm_data.
+- For multi-intent questions include every relevant public tool, for example device_data and alarm_data.
 - If the question is vague, return a clarification field.
 
 Examples:
 User: max demand yesterday for device 12
-JSON: {{"intent":"data_query","is_follow_up":false,"tools":["demand_peak_summary"],"slots":{{"device_refs":["12"],"time_phrase":"yesterday","metric":"demand"}},"inherit_from_previous":[],"clarification":null,"confidence":0.93}}
+JSON: {{"intent":"data_query","is_follow_up":false,"tools":["device_data"],"slots":{{"device_refs":["12"],"time_phrase":"yesterday","metric":"demand"}},"inherit_from_previous":[],"clarification":null,"confidence":0.93}}
 User: what about today?
 JSON: {{"intent":"follow_up","is_follow_up":true,"tools":[],"slots":{{"time_phrase":"today"}},"inherit_from_previous":["device","tools","metric"],"clarification":null,"confidence":0.84}}
 User: top consumers last week and active alarms
-JSON: {{"intent":"data_query","is_follow_up":false,"tools":["device_energy_breakdown","active_alarm_summary"],"slots":{{"time_phrase":"last week","metric":"energy","limit":5}},"inherit_from_previous":[],"clarification":null,"confidence":0.9}}
+JSON: {{"intent":"data_query","is_follow_up":false,"tools":["device_data","alarm_data"],"slots":{{"time_phrase":"last week","metric":"energy","limit":5}},"inherit_from_previous":[],"clarification":null,"confidence":0.9}}
 User: berapa max demand hari ini
-JSON: {{"intent":"data_query","is_follow_up":false,"tools":["demand_peak_summary"],"slots":{{"time_phrase":"today","metric":"demand"}},"inherit_from_previous":[],"clarification":null,"confidence":0.82}}
+JSON: {{"intent":"data_query","is_follow_up":false,"tools":["device_data"],"slots":{{"time_phrase":"today","metric":"demand"}},"inherit_from_previous":[],"clarification":null,"confidence":0.82}}
 User: show building 3
 JSON: {{"intent":"follow_up","is_follow_up":true,"tools":[],"slots":{{"building_ref":"3"}},"inherit_from_previous":["tools","time","metric"],"clarification":null,"confidence":0.76}}
 User: tell me a joke

@@ -24,7 +24,7 @@ NAMES = (
     "wants_lowest_consumer", "wants_top_lowest_sum", "wants_device_inventory", "wants_device_capability_discovery",
     "wants_available_parameters_follow_up", "select_historical_operations_without_device_timeseries",
     "wants_device_metric_timeseries", "explicit_mcp_tool_request", "first_device_id_from_text", "follow_up_metric_from_message",
-    "select_historical_operations", "build_historical_arguments", "requested_device_id", "requested_metric",
+    "select_historical_operations", "internal_for_public_operation", "build_historical_arguments", "requested_device_id", "requested_metric",
     "parse_datetime", "local_bucket_date", "first_dict_with_list", "first_list", "first_value", "predict_daily_energy",
     "format_coverage_note", "is_follow_up_message", "resolve_follow_up_message", "needs_ems_library",
     "build_compliance_context", "has_time_scope", "first_regex_int", "needs_device_choice",
@@ -86,6 +86,21 @@ def load_functions():
         ),
     }
     exec(compile(module, str(SOURCE), "exec"), env)
+    env.setdefault("log_event", Mock())
+    env.setdefault("debug_trace_event", Mock())
+
+    def authorized_call(turn_id, operation, arguments, request_id, message=""):
+        plan = env["request_daxview_data_plan"](turn_id, operation, arguments, request_id)
+        return env["call_authorized_historical_tool"](
+            operation, plan.get("authorization_id", "authorized"), arguments, request_id
+        )
+
+    def authorized_execute(turn_id, operation, arguments, request_id, message=""):
+        return [{"operation_id": operation, "arguments": arguments,
+                 "result": authorized_call(turn_id, operation, arguments, request_id, message)}]
+
+    env["call_authorized_internal_operation"] = authorized_call
+    env["execute_authorized_internal_operation"] = authorized_execute
     return env
 
 
@@ -520,7 +535,7 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertEqual(context["site_id"], 17)
 
     def test_explicit_mcp_tool_request_uses_only_named_tool(self):
-        question = "Test MCP tool telemetry_metric_catalog for this site and show devices and metrics"
+        question = "Test MCP tool device_data metrics for this site and show devices and metrics"
         self.assertEqual(self.env["explicit_mcp_tool_request"](question), "telemetry_metric_catalog")
         self.assertEqual(self.env["select_historical_operations"](question), ["telemetry_metric_catalog"])
 
@@ -632,7 +647,22 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertEqual(result["data"]["peak_kw"], 44.25)
         self.assertEqual(result["data"]["peak_time"], "2026-10-01T09:00:00+08:00")
         self.assertEqual(result["data"]["sample_count"], 3)
-        self.assertEqual(result["data"]["source"], "manual calculation from telemetry_timeseries")
+        self.assertEqual(result["data"]["source"], "deterministic maximum of device_data.values demand points")
+
+    def test_demand_peak_reads_series_points_and_converts_watts_to_kw(self):
+        result = self.env["calculate_demand_peak_from_telemetry"](
+            {"structuredContent": {"data": {"series": [{
+                "metric": "demand", "unit": "W", "points": [
+                    {"timestamp": "2026-10-11T08:00:00Z", "value": 240800},
+                    {"timestamp": "2026-10-11T09:00:00Z", "value": 428600},
+                    {"timestamp": "2026-10-11T10:00:00Z", "value": 390000},
+                ],
+            }]}}},
+            {"device_id": 519, "site_id": 17},
+        )
+        self.assertEqual(result["data"]["peak_kw"], 428.6)
+        self.assertEqual(result["data"]["peak_time"], "2026-10-11T09:00:00Z")
+        self.assertEqual(result["data"]["unit"], "kW")
 
     def test_standards_are_not_added_to_routine_site_answer(self):
         self.assertEqual(self.env["build_compliance_context"]("Show site energy for the last 7 days", ["site_energy_summary"]), [])
