@@ -62,7 +62,6 @@ AI_CHARTS_ENABLED = os.getenv("AI_CHARTS_ENABLED", "true").lower() in {"1", "tru
 AI_DISPLAY_TIMEZONE = os.getenv("AI_DISPLAY_TIMEZONE", "Asia/Kuala_Lumpur")
 AI_PLANNER_ENABLED = os.getenv("AI_PLANNER_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 AI_PLANNER_SHADOW_MODE = os.getenv("AI_PLANNER_SHADOW_MODE", "false").lower() in {"1", "true", "yes", "on"}
-AI_CHAT_MEMORY_ENABLED = os.getenv("AI_CHAT_MEMORY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 PLANNER_MODEL = os.getenv("PLANNER_MODEL", OLLAMA_MODEL)
 PLANNER_TIMEOUT = int(os.getenv("PLANNER_TIMEOUT", "15"))
 DEMAND_RANKING_MAX_DEVICES = int(os.getenv("DEMAND_RANKING_MAX_DEVICES", "20"))
@@ -836,11 +835,53 @@ def connected_load_calculation_answer(message: str) -> dict | None:
     }
 
 
+def supplied_demand_readings_answer(message: str) -> dict | None:
+    """Compute a peak from explicitly supplied interval-average kW readings."""
+    if not re.search(r"\b(?:demand|peak|maximum)\b", message, re.IGNORECASE):
+        return None
+    match = re.search(
+        r"\breadings?\b[^:]{0,60}:\s*(.+?)(?=\.\s+[A-Z]|\n|$)",
+        message,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None
+    values = [
+        float(value.replace(",", ""))
+        for value in re.findall(r"(?<![\w.])(\d[\d,]*(?:\.\d+)?)\s*kW\b", match.group(1), re.IGNORECASE)
+    ]
+    if not values:
+        return None
+    peak = max(values)
+    peak_index = values.index(peak) + 1
+    target_match = re.search(
+        r"\b(\d+(?:\.\d+)?)\s*kW\s+(?:cap|limit|target)\b|"
+        r"\b(?:cap|limit|target)(?:\s+of|\s+at)?\s+(\d+(?:\.\d+)?)\s*kW\b",
+        message,
+        re.IGNORECASE,
+    )
+    lines = [
+        f"Maximum demand from the supplied interval-average readings: {peak:.2f} kW.",
+        f"It occurred at reading {peak_index} of {len(values)} in the order provided.",
+        f"Calculation: max({', '.join(f'{value:g}' for value in values)}) = {peak:g} kW.",
+    ]
+    if target_match:
+        target = float(next(group for group in target_match.groups() if group is not None))
+        reduction = max(peak - target, 0.0)
+        percentage = reduction / peak * 100 if peak > 0 else 0.0
+        if reduction:
+            lines.append(f"To meet a {target:g} kW cap, reduce demand by {reduction:.2f} kW ({percentage:.2f}% of the peak).")
+        else:
+            lines.append(f"The peak is already at or below the {target:g} kW cap; no reduction is required.")
+    lines.append("This uses the readings as supplied; the interval length and meter configuration determine whether it matches the utility's billing-demand method.")
+    return {"reply": "\n".join(lines), "peak_kw": peak, "peak_reading_index": peak_index, "readings_kw": values}
+
+
 def requested_top_limit(message: str) -> int | None:
     match = re.search(
         r"\btop\s+(\d{1,2}|five|ten)\b"
         r"|\b(\d{1,2}|five|ten)\s+(?:latest|most recent)\s+alarms?\b"
-        r"|\b(?:latest|most recent|last)\s+(\d{1,2}|five|ten)\s+alarms?\b",
+        r"|\b(?:latest|most recent|last|up to)\s+(\d{1,2}|five|ten)\s+(?:(?:active|acknowledged|open)\s+)?alarms?\b",
         message,
         re.IGNORECASE,
     )
@@ -900,7 +941,13 @@ def wants_all_devices(message: str) -> bool:
 
 def wants_device_inventory(message: str) -> bool:
     lowered = message.lower()
+    if re.search(r"\b(?:alarm|alarms|alert|alerts)\b", lowered) and not any(
+        term in lowered for term in ("energy", "kwh", "consumption", "usage", "demand")
+    ):
+        return False
     if wants_device_usage_ranking(message) or wants_highest_demand_device(message):
+        return False
+    if re.search(r"\b(?:top|highest|maximum|peak|rank|ranking)\b", lowered) and question_metrics(message):
         return False
     return bool(
         re.search(r"\b(?:list|show|get|give)\b.*\b(?:devices?|meters?|device\s*ids?)\b", lowered)
@@ -1011,6 +1058,27 @@ def select_historical_operations(message: str) -> list[str]:
     if explicit_tool:
         return [explicit_tool]
     lowered = message.lower()
+    # The word "list" is common in alarm requests; resolve alarm intent before
+    # the generic device-inventory heuristic can claim the request.
+    asks_for_other_data = any(
+        term in lowered
+        for term in ("energy", "kwh", "consumption", "usage", "demand", "voltage", "current", "power")
+    )
+    if re.search(r"\b(?:alarm|alarms|alert|alerts)\b", lowered) and not asks_for_other_data:
+        if re.search(r"\b(?:detail|details|explain|cause)\b", lowered) or re.search(r"\b(?:alarm|event)\s*(?:id|#|:)\s*\d+", lowered):
+            return ["alarm_detail_lookup"]
+        if re.search(r"\b(?:frequency|occurred|occurrence|how many|count|most common|most frequent|rank|latest|most recent|history)\b", lowered):
+            return ["alarm_frequency_summary"]
+        return ["active_alarm_summary"]
+
+    ranked_metrics = set(question_metrics(message)) - {"energy"}
+    if re.search(r"\b(?:top|highest|maximum|peak|rank|ranking)\b", lowered) and ranked_metrics:
+        if "demand" in ranked_metrics and wants_highest_demand_device(message):
+            return ["demand_peak_summary"]
+        if requested_device_id(message) is None:
+            return ["telemetry_metric_catalog"]
+        return ["demand_peak_summary" if "demand" in ranked_metrics else "telemetry_timeseries"]
+
     operations = select_historical_operations_without_device_timeseries(message)
     if wants_device_metric_timeseries(message):
         operations = [name for name in operations if name != "site_energy_summary"]
@@ -1181,7 +1249,7 @@ def choose_historical_operations(message: str, context: dict, turn_id: str, sess
             context=context,
         )
         return regex_operations, context, None
-    history = load_conversation_history(session_id, turn_id) if AI_CHAT_MEMORY_ENABLED else []
+    history = load_conversation_history(session_id, turn_id)
     try:
         plan, latency_ms = plan_turn_with_llm(message, history, context, request_id)
         planned_context = planner_slot_context(message, context, plan)
@@ -1331,22 +1399,27 @@ def requested_month_ranges(message: str, fallback_year: int) -> list[tuple[date,
 def requested_historical_range(message: str) -> dict:
     lowered = message.lower()
     end = datetime.now(timezone.utc)
+    explicit_range = requested_explicit_date_range(message, end.year)
     requested_dates = requested_comparison_dates(message, end.year)
     requested_months = [] if requested_dates else requested_month_ranges(message, end.year)
     relative_range = relative_historical_range(message)
     local_now = end.astimezone(timezone(timedelta(hours=8)))
-    if requested_dates and relative_range:
+    if explicit_range:
+        first_day, last_day = explicit_range
+        start = datetime(first_day.year, first_day.month, first_day.day, tzinfo=timezone.utc) - timedelta(hours=8)
+        end = datetime(last_day.year, last_day.month, last_day.day, tzinfo=timezone.utc) + timedelta(hours=16)
+    elif requested_dates and relative_range:
         start, end = relative_range
     elif requested_dates:
         parsed_dates = [datetime.fromisoformat(date).date() for date in requested_dates]
         start_date = min(parsed_dates)
         end_date = max(parsed_dates)
-        start = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc) - timedelta(days=1, hours=8)
-        end = datetime(end_date.year, end_date.month, end_date.day, tzinfo=timezone.utc) - timedelta(hours=8)
+        start = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc) - timedelta(hours=8)
+        end = datetime(end_date.year, end_date.month, end_date.day, tzinfo=timezone.utc) + timedelta(hours=16)
     elif requested_months:
         start_date = min(month_start for month_start, _ in requested_months)
-        end_date = max(month_end for _, month_end in requested_months) - timedelta(days=1)
-        start = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc) - timedelta(days=1, hours=8)
+        end_date = max(month_end for _, month_end in requested_months)
+        start = datetime(start_date.year, start_date.month, start_date.day, tzinfo=timezone.utc) - timedelta(hours=8)
         end = datetime(end_date.year, end_date.month, end_date.day, tzinfo=timezone.utc) - timedelta(hours=8)
     elif "last month" in lowered:
         current_month = local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -1473,7 +1546,7 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
             args["value_mode"] = str(context["value_mode"])
         args["limit"] = int(context.get("limit") or 500)
     elif operation_id == "active_alarm_summary":
-        args["limit"] = int(context.get("limit") or 50)
+        args["limit"] = requested_top_limit(message) or int(context.get("limit") or 50)
     elif operation_id == "meter_status_summary":
         args["limit"] = int(context.get("limit") or 100)
     elif operation_id == "energy_comparison_summary":
@@ -2179,6 +2252,43 @@ def requested_comparison_dates(message: str, fallback_year: int) -> list[str]:
     return dates
 
 
+def requested_explicit_date_range(message: str, fallback_year: int) -> tuple[date, date] | None:
+    text = message.lower().replace("\u2011", "-")
+    month_pattern = r"january|february|march|april|may|june|july|august|september|october|november|december"
+    day_range = re.search(
+        rf"\b(?:from\s+)?(\d{{1,2}})(?:st|nd|rd|th)?\s*(?:-|\u2013|\u2014|to|through|until)\s*"
+        rf"(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_pattern})(?:\s+(\d{{4}}))?\b",
+        text,
+    )
+    if day_range:
+        first_day, last_day = int(day_range.group(1)), int(day_range.group(2))
+        month = MONTH_NAMES[day_range.group(3)]
+        year = int(day_range.group(4) or fallback_year)
+        try:
+            first = date(year, month, first_day)
+            last = date(year, month, last_day)
+            return (first, last) if first <= last else None
+        except ValueError:
+            return None
+
+    full_range = re.search(
+        rf"\b(?:from\s+)?(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_pattern})(?:\s+(\d{{4}}))?\s+"
+        rf"(?:-|\u2013|\u2014|to|through|until)\s*"
+        rf"(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_pattern})(?:\s+(\d{{4}}))?\b",
+        text,
+    )
+    if not full_range:
+        return None
+    first_day, first_month, first_year = int(full_range.group(1)), MONTH_NAMES[full_range.group(2)], int(full_range.group(3) or fallback_year)
+    last_day, last_month = int(full_range.group(4)), MONTH_NAMES[full_range.group(5)]
+    last_year = int(full_range.group(6) or first_year)
+    try:
+        first, last = date(first_year, first_month, first_day), date(last_year, last_month, last_day)
+        return (first, last) if first <= last else None
+    except ValueError:
+        return None
+
+
 def month_label(value: date) -> str:
     return value.strftime("%B %Y")
 
@@ -2196,7 +2306,14 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
     range_info = data.get("range") if isinstance(data.get("range"), dict) else {}
     timezone_name = range_info.get("timezone") or (arguments or {}).get("timezone") or "Asia/Kuala_Lumpur"
     fallback_year = datetime.now(timezone.utc).year
+    explicit_range = requested_explicit_date_range(message, fallback_year)
     requested_dates = requested_comparison_dates(message, fallback_year)
+    if explicit_range:
+        first_day, last_day = explicit_range
+        requested_dates = [
+            (first_day + timedelta(days=offset)).isoformat()
+            for offset in range((last_day - first_day).days + 1)
+        ]
     requested_months = [] if requested_dates else requested_comparison_months(message, fallback_year)
     requested_date_set = set(requested_dates)
     has_specific_dates = bool(requested_date_set)
@@ -2961,6 +3078,9 @@ def ensure_historical_answer_coverage(
     generic_failure_patterns = (
         r"\bempty input\b",
         r"\btesting the system\b",
+        r"\bseems like you might have intended to ask\b",
+        r"\bsent a message with just\b",
+        r"\bhello!?\s+how can i assist you today\b",
         r"\bhow can i assist you today\b",
         r"\bplease let me know if you have any questions\b",
         r"\bneed help with something specific\b",
@@ -2973,6 +3093,32 @@ def ensure_historical_answer_coverage(
     if results and any(re.search(pattern, model_answer, flags=re.IGNORECASE) for pattern in generic_failure_patterns):
         log_event("historical_answer_coverage_fallback", request_id=request_id, missing_items="generic_model_reply")
         return deterministic_answer
+
+    # Successful tool data is the factual source of truth. If the model's rewrite
+    # omits the returned entities entirely, show the deterministic summary.
+    for item in results:
+        operation_id = item.get("operation_id")
+        data = historical_result_data(item.get("result") or {})
+        if operation_id == "site_device_list":
+            rows = first_list(data, ("devices", "rows", "items", "meters"))
+            expected = [
+                str(row.get("device_name") or row.get("name") or row.get("meter_name") or "").strip()
+                for row in rows[:3] if isinstance(row, dict)
+            ]
+            expected = [name for name in expected if name]
+            if expected and not any(name.casefold() in model_answer.casefold() for name in expected):
+                log_event("historical_answer_coverage_fallback", request_id=request_id, missing_items="device_inventory")
+                return deterministic_answer
+        elif operation_id in {"alarm_frequency_summary", "active_alarm_summary"}:
+            rows = first_list(data, ("rows", "alarms", "items"))
+            expected = [
+                str(row.get("alarm_name") or row.get("name") or row.get("alarm_type") or "").strip()
+                for row in rows[:3] if isinstance(row, dict)
+            ]
+            expected = [name for name in expected if name]
+            if expected and not any(name.casefold() in model_answer.casefold() for name in expected):
+                log_event("historical_answer_coverage_fallback", request_id=request_id, missing_items="alarm_rows")
+                return deterministic_answer
     top_result = next((item for item in results if item.get("operation_id") in {"device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers"}), None)
     if top_result and wants_device_usage_ranking(message):
         top_data = historical_result_data(top_result["result"])
@@ -3542,6 +3688,10 @@ def is_follow_up_message(message: str) -> bool:
         return True
     if re.match(r"^(?:and\s+)?(?:what about|how about|for the same|on the same|can you also|show me more about|which day|which one|which was)\b", lowered):
         return True
+    if re.match(r"^(?:and\s+)?(?:it|that|this|those|them|they|its|their|there)\b", lowered):
+        return True
+    if len(lowered.split()) <= 8 and re.match(r"^(?:and\s+)?(?:what|how|when|where|why|show|calculate|compare|rank)\b", lowered):
+        return True
     return any(phrase in lowered for phrase in FOLLOW_UP_PHRASES if phrase != "why")
 
 
@@ -3652,7 +3802,7 @@ def resolve_follow_up_message(turn_id: str, message: str, context: dict, convers
     merged_context = {**previous_context, **context} if not site_changed else dict(context)
     if site_changed:
         merged_context = dict(context)
-    elif reusable and AI_CHAT_MEMORY_ENABLED:
+    elif reusable:
         slots = previous_plan.get("slots") if isinstance(previous_plan.get("slots"), dict) else {}
         for key in ("device_id", "building_id", "metric", "_time_window"):
             if key not in merged_context and slots.get(key) is not None:
@@ -3685,7 +3835,7 @@ def resolve_follow_up_message(turn_id: str, message: str, context: dict, convers
             inferred_device_id=merged_context.get("device_id"),
         )
         return resolved, merged_context
-    if not is_follow_up_message(message) and (select_historical_operations(message) or not AI_CHAT_MEMORY_ENABLED):
+    if not is_follow_up_message(message) and select_historical_operations(message):
         return message, merged_context
     if select_historical_operations(message):
         resolved = message
@@ -3741,6 +3891,14 @@ def readable_historical_errors(errors: list[dict]) -> str:
         label = f"{operation} for {metric}" if metric else operation
         if "INVALID_METRIC" in error:
             parts.append(f"{label} was rejected by DaxView because that metric name is not supported by the telemetry tool.")
+        elif "UNSUPPORTED_METRIC" in error and operation == "demand_peak_summary":
+            parts.append(
+                "DaxView has no configured demand series for the selected device and period. "
+                "Maximum demand must be calculated from measured active-power or demand readings in kW; "
+                "current in amperes alone is not enough to determine kW without the required voltage, phase, and power-factor data."
+            )
+        elif "UNSUPPORTED_METRIC" in error:
+            parts.append(f"{label} is not configured for this device or site in DaxView.")
         elif "NO_DATA" in error:
             parts.append(f"{label} returned no data for the requested scope and time range.")
         elif "UNAVAILABLE" in error:
@@ -4022,6 +4180,25 @@ def try_top_consumers_breakdown_fallback(turn_id: str, arguments: dict, request_
 
 def run_daxview_integration_turn(turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> dict:
     message, context = resolve_follow_up_message(turn_id, message, context, session_id, request_id)
+    supplied_demand = supplied_demand_readings_answer(message)
+    if supplied_demand:
+        debug_trace_event(
+            "local_ems_calculation_debug",
+            request_id=request_id,
+            calculation="maximum_demand_from_supplied_readings",
+            source="user_supplied_interval_average_kw",
+            peak_kw=supplied_demand["peak_kw"],
+            sample_count=len(supplied_demand["readings_kw"]),
+            mcp_used=False,
+        )
+        return {
+            "provider": "local-ems-calculation",
+            "reply": supplied_demand["reply"],
+            "charts": [],
+            "debug_charts": [],
+            "debug_tables": [],
+            "resolved_plan": resolved_plan_for_result("ok", [], context),
+        }
     local_calculation = connected_load_calculation_answer(message)
     if local_calculation:
         debug_trace_event(
@@ -4379,7 +4556,10 @@ def has_time_scope(message: str) -> bool:
         )
     ):
         return True
-    return bool(re.search(r"\b\d{1,2}\s+\w+\s+\d{4}\b|\b\d{4}-\d{2}-\d{2}\b", lowered))
+    return bool(
+        re.search(r"\b\d{1,2}\s+\w+\s+\d{4}\b|\b\d{4}-\d{2}-\d{2}\b", lowered)
+        or relative_historical_range(message)
+    )
 
 
 def daxview_clarification_needed(message: str, tools: list[str]) -> bool:

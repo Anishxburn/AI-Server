@@ -23,6 +23,8 @@ NAMES = (
     "requested_top_limit", "connected_load_calculation_answer", "requested_forecast_days", "requested_energy_extrema", "format_number", "format_time_window",
     "reading_detail",
     "requested_question_parts", "completed_daily_range", "wants_device_usage_ranking", "wants_all_devices",
+    "supplied_demand_readings_answer", "requested_historical_range", "default_historical_range",
+    "relative_historical_range", "requested_explicit_date_range", "requested_comparison_dates", "requested_month_ranges",
     "wants_lowest_consumer", "wants_top_lowest_sum", "wants_device_inventory", "wants_device_capability_discovery",
     "wants_available_parameters_follow_up", "select_historical_operations_without_device_timeseries",
     "wants_device_metric_timeseries", "explicit_mcp_tool_request", "planner_default_intents", "select_public_tools", "planner_slot_context", "choose_historical_operations", "first_device_id_from_text", "follow_up_metric_from_message",
@@ -59,6 +61,12 @@ def load_functions():
         "validate_tool_arguments": validate_tool_arguments,
         "public_tool_for_internal": public_tool_for_internal,
         "AI_CHAT_MEMORY_ENABLED": False,
+        "MONTH_NAMES": next(
+            ast.literal_eval(node.value)
+            for node in TREE.body
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "MONTH_NAMES" for target in node.targets)
+        ),
+        "load_conversation_history": lambda conversation_id, turn_id: [],
         "AI_PLANNER_ENABLED": False,
         "AI_PLANNER_SHADOW_MODE": False,
         "AI_REFINE_MCP_WITH_MODEL": True,
@@ -91,6 +99,8 @@ def load_functions():
         ),
     }
     exec(compile(module, str(SOURCE), "exec"), env)
+    env["requested_historical_range_impl"] = env["requested_historical_range"]
+    env["requested_historical_range"] = Mock(return_value={"start": "start", "end": "end", "timezone": "Asia/Kuala_Lumpur"})
     env.setdefault("log_event", Mock())
     env.setdefault("debug_trace_event", Mock())
 
@@ -135,6 +145,64 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertIn("211.39 A", result["reply"])
         self.assertIn("not a code-diversified maximum-demand estimate", result["reply"])
         self.assertIn("no DaxView/MCP data used", result["reply"])
+
+    def test_supplied_interval_demand_readings_and_cap_are_calculated_locally(self):
+        question = (
+            "A device recorded these 15-minute average power readings today: "
+            "312 kW, 348 kW, 421 kW, 389 kW, and 405 kW. What was the maximum demand, "
+            "when did it occur if these readings are chronological, and how much must demand "
+            "be reduced to meet a 400 kW cap?"
+        )
+        result = self.env["supplied_demand_readings_answer"](question)
+        self.assertEqual(result["peak_kw"], 421)
+        self.assertEqual(result["peak_reading_index"], 3)
+        self.assertIn("21.00 kW (4.99% of the peak)", result["reply"])
+
+    def test_explicit_inclusive_date_range_maps_to_local_midnight_bounds(self):
+        window = self.env["requested_historical_range_impl"](
+            "Show site energy from 1–8 October 2026 in Asia/Kuala_Lumpur"
+        )
+        self.assertEqual(window["start"], "2026-09-30T16:00:00+00:00")
+        self.assertEqual(window["end"], "2026-10-08T16:00:00+00:00")
+        self.assertEqual(
+            self.env["requested_explicit_date_range"]("from 1 to 8 October 2026", 2026),
+            (date(2026, 10, 1), date(2026, 10, 8)),
+        )
+
+    def test_alarm_lists_never_route_to_device_inventory(self):
+        self.assertEqual(
+            self.env["select_historical_operations"](
+                "List up to 10 active or acknowledged alarms at site 33, showing severity and device"
+            ),
+            ["active_alarm_summary"],
+        )
+        self.assertEqual(
+            self.env["select_historical_operations"](
+                "List the latest alarm occurrences at site 33"
+            ),
+            ["alarm_frequency_summary"],
+        )
+
+    def test_top_voltage_without_device_requests_metric_discovery_not_inventory(self):
+        self.assertEqual(
+            self.env["select_historical_operations"]("List the top 5 devices by highest voltage for 7 days"),
+            ["telemetry_metric_catalog"],
+        )
+
+    def test_follow_up_reuses_previous_device_even_when_memory_flag_is_false(self):
+        self.env["previous_daxview_turn"] = Mock(return_value={
+            "id": "previous",
+            "user_message": "Show demand for device ID 614 for the last 7 days",
+            "assistant_reply": "Peak demand was 42 kW",
+            "context": {"site_id": 33, "device_id": 614},
+            "resolved_plan": {"status": "ok", "slots": {"site_id": 33, "device_id": 614}},
+        })
+        self.env["log_event"] = Mock()
+        resolved, context = self.env["resolve_follow_up_message"](
+            "turn", "What was its max demand for 3 days?", {"site_id": 33}, "same-conversation", "request"
+        )
+        self.assertEqual(resolved, "What was its max demand for 3 days?")
+        self.assertEqual(context["device_id"], 614)
 
     def test_demand_questions_without_explicit_connected_loads_are_not_calculated(self):
         self.assertIsNone(self.env["connected_load_calculation_answer"]("What was the site's maximum demand last week?"))

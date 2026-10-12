@@ -289,7 +289,8 @@ def build_public_calls(internal_operation: str, arguments: dict, message: str = 
             metric = None
         if not metrics and not metric:
             metric = "energy"
-        result = {"operation": "values", **window, "bucket": arguments.get("bucket") or "1h",
+        default_bucket = "15m" if internal_operation == "demand_peak_summary" else "1h"
+        result = {"operation": "values", **window, "bucket": arguments.get("bucket") or default_bucket,
                   "aggregation": "max" if internal_operation == "demand_peak_summary" else arguments.get("aggregation") or "auto",
                   "value_mode": "maximum_demand" if internal_operation == "demand_peak_summary" else arguments.get("value_mode") or "auto",
                   "limit": min(int(limit or 500), 2000)}
