@@ -3992,6 +3992,7 @@ def run_highest_demand_device_ranking(turn_id: str, message: str, context: dict,
     device_args = validate_tool_arguments("site_device_list", {
         "site_id": int(context["site_id"]),
         **({"building_id": int(context["building_id"])} if context.get("building_id") else {}),
+        **({"device_id": int(context["device_id"])} if context.get("device_id") else {}),
         "limit": DEMAND_RANKING_MAX_DEVICES + 1,
     })
     device_result = call_authorized_internal_operation(turn_id, "site_device_list", device_args, request_id, message)
@@ -4037,25 +4038,31 @@ def run_highest_demand_device_ranking(turn_id: str, message: str, context: dict,
                     eligible.append(("demand", metric_row))
                 elif (canonical in {"active_power", "power", "active_power_total"} or "active power" in source_name) and unit in {"w", "kw", "mw"}:
                     eligible.append(("active_power", metric_row))
+                elif canonical in {"energy", "consumption_delta"} or ("energy" in source_name and unit in {"wh", "kwh", "mwh"}):
+                    eligible.append(("energy", metric_row))
             if not eligible:
-                excluded.append({"device_id": int(device_id), "device_name": device_name, "reason": "No configured demand or unit-qualified active-power metric"})
+                excluded.append({"device_id": int(device_id), "device_name": device_name, "reason": "No configured demand, active-power, or energy-delta metric"})
                 continue
 
             # Prefer the meter's explicit demand series. Otherwise use measured
             # active power in a compatible unit; never infer kW from current.
-            metric_kind, metric_row = next((item for item in eligible if item[0] == "demand"), eligible[0])
+            metric_kind, metric_row = next(
+                (item for item in eligible if item[0] == "demand"),
+                next((item for item in eligible if item[0] == "active_power"), eligible[0]),
+            )
             source_metric = metric_row.get("metric") or metric_row.get("source_metric") or "demand"
             if metric_kind == "demand":
                 peak_args = build_historical_arguments("demand_peak_summary", device_context, message)
                 per_result = call_authorized_internal_operation(turn_id, "demand_peak_summary", peak_args, request_id, message)
                 per_args = build_public_calls("demand_peak_summary", peak_args, message)[0][1]
             else:
+                is_energy_delta = metric_kind == "energy"
                 peak_args = build_historical_arguments("telemetry_timeseries", {
                     **device_context,
                     "metric": str(source_metric),
                     "bucket": "15m",
-                    "aggregation": "mean",
-                    "value_mode": "measured",
+                    "aggregation": "sum" if is_energy_delta else "mean",
+                    "value_mode": "consumption_delta" if is_energy_delta else "measured",
                     "limit": 2000,
                 }, message)
                 per_result = call_authorized_internal_operation(turn_id, "telemetry_timeseries", peak_args, request_id, message)
@@ -4076,7 +4083,11 @@ def run_highest_demand_device_ranking(turn_id: str, message: str, context: dict,
             peak_time = first_value(summary, ("peak_time", "peak_at", "timestamp", "max_time", "max_at"))
             calculated = None
             if peak is None:
-                calculated = calculate_demand_peak_from_telemetry(per_result, per_args)
+                calculated = (
+                    calculate_demand_peak_from_energy(per_result, per_args)
+                    if metric_kind == "energy"
+                    else calculate_demand_peak_from_telemetry(per_result, per_args)
+                )
                 if calculated:
                     peak_data = calculated["data"]
                     peak = peak_data["peak_kw"]
@@ -4225,6 +4236,59 @@ def calculate_demand_peak_from_telemetry(mcp_result: dict, arguments: dict) -> d
     }
 
 
+def calculate_demand_peak_from_energy(mcp_result: dict, arguments: dict) -> dict | None:
+    """Convert known interval-consumption deltas into interval-average kW."""
+    bucket_hours = {
+        "1m": 1 / 60, "5m": 5 / 60, "15m": 0.25, "30m": 0.5,
+        "1h": 1.0, "hour": 1.0,
+    }.get(str(arguments.get("bucket") or "15m").lower())
+    if not bucket_hours or bucket_hours <= 0:
+        return None
+    data = historical_result_data(mcp_result, ("series", "rows", "items", "buckets", "points"))
+    rows = first_list(data, ("series", "rows", "items", "buckets", "points"))
+    candidates = []
+    energy_to_kwh = {"wh": 0.001, "kwh": 1.0, "mwh": 1000.0}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        points = row.get("points") if isinstance(row.get("points"), list) else [row]
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            value = chart_value(point, ("value", "energy_kwh", "consumption_kwh", "reading", "sum"))
+            unit = str(point.get("unit") or row.get("unit") or data.get("unit") or "").strip().lower()
+            factor = energy_to_kwh.get(unit)
+            if value is None or factor is None:
+                continue
+            energy_kwh = float(value) * factor
+            demand_kw = energy_kwh / bucket_hours
+            timestamp = first_value(point, ("timestamp", "time", "bucket", "date", "start_time"))
+            candidates.append((demand_kw, timestamp))
+    if not candidates:
+        return None
+    peak_kw, peak_time = max(candidates, key=lambda item: item[0])
+    return {
+        "status": "ok",
+        "data": {
+            "peak_kw": round(peak_kw, 4),
+            "peak_time": peak_time,
+            "unit": "kW",
+            "source": "interval consumption delta divided by interval duration",
+            "calculation": f"max(interval kWh / {bucket_hours:g} h)",
+            "sample_count": len(candidates),
+            "bucket": arguments.get("bucket") or "15m",
+            "value_mode": "consumption_delta",
+            "start_time": arguments.get("start_time"),
+            "end_time": arguments.get("end_time"),
+            "device_id": arguments.get("device_id"),
+            "site_id": arguments.get("site_id"),
+            "truncated": bool(data.get("truncated")) or any(
+                isinstance(row, dict) and bool(row.get("truncated")) for row in rows
+            ),
+        },
+    }
+
+
 def try_manual_demand_peak_fallback(turn_id: str, arguments: dict, request_id: str) -> dict:
     telemetry_args = dict(arguments)
     telemetry_args["metric"] = "demand"
@@ -4333,14 +4397,14 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         result = langchain_chat_response(message, request_id, session_id)
         result["resolved_plan"] = resolved_plan_for_result("ok", [], context)
         return result
+    context = dict(context)
+    if requested_device_id(message):
+        context["device_id"] = requested_device_id(message)
     if "demand_peak_summary" in operation_ids and not context.get("device_id") and not wants_highest_demand_device(message):
         result = build_device_choice_response(turn_id, message, context, request_id)
         result["resolved_plan"] = resolved_plan_for_result("clarification", operation_ids, context)
         return result
-    context = dict(context)
     context.setdefault("_time_window", completed_daily_range(message) or requested_historical_range(message))
-    if requested_device_id(message):
-        context["device_id"] = requested_device_id(message)
     save_resolved_turn_context(turn_id, context)
     if wants_highest_demand_device(message) and not context.get("device_id"):
         ranked_results = run_highest_demand_device_ranking(turn_id, message, context, request_id)
@@ -4364,6 +4428,20 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
             "debug_charts": charts,
             "debug_tables": tables,
             "resolved_plan": resolved_plan_for_result("ok", ["demand_peak_summary"], context, ranked_results),
+        }
+    if "demand_peak_summary" in operation_ids and context.get("device_id"):
+        device_results = run_highest_demand_device_ranking(turn_id, message, context, request_id)
+        deterministic_reply = summarize_historical_answers(message, device_results, request_id)
+        refined_reply = refine_historical_answer_with_model(message, device_results, deterministic_reply, request_id)
+        charts = build_charts_from_historical_results(device_results)
+        tables = build_tables_from_historical_results(device_results, message)
+        return {
+            "provider": "daxview-historical-mcp",
+            "reply": refined_reply,
+            "charts": charts,
+            "debug_charts": charts,
+            "debug_tables": tables,
+            "resolved_plan": resolved_plan_for_result("ok", ["demand_peak_summary"], context, device_results),
         }
     results = []
     errors = []

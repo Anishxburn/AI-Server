@@ -41,7 +41,7 @@ NAMES = (
     "wants_highest_demand_device", "run_highest_demand_device_ranking", "choose_historical_operations",
     "resolved_plan_for_result", "readable_historical_errors", "refine_historical_answer_with_model",
     "chart_number", "chart_value", "mcp_structured_result", "historical_result_data",
-    "demand_peak_needs_manual_fallback", "calculate_demand_peak_from_telemetry",
+    "demand_peak_needs_manual_fallback", "calculate_demand_peak_from_telemetry", "calculate_demand_peak_from_energy",
     "try_top_consumers_breakdown_fallback", "redact_debug_value",
 )
 
@@ -851,6 +851,7 @@ class EmsPredictionTests(unittest.TestCase):
         self.env["build_historical_arguments"] = lambda operation, context, message="": {
             "site_id": context["site_id"],
             **({"device_id": context["device_id"]} if context.get("device_id") else {}),
+            **{key: context[key] for key in ("metric", "bucket", "aggregation", "value_mode", "limit") if key in context},
             "start_time": "2026-10-05T00:00:00+08:00",
             "end_time": "2026-10-12T00:00:00+08:00",
             "timezone": "Asia/Kuala_Lumpur",
@@ -862,12 +863,21 @@ class EmsPredictionTests(unittest.TestCase):
                 return {"data": {"devices": [
                     {"device_id": 519, "device_name": "Main Meter", "status": "online"},
                     {"device_id": 520, "device_name": "Current-only Meter", "status": "online"},
-                ], "row_count": 2, "truncated": False}}
+                    {"device_id": 521, "device_name": "Energy-only Meter", "status": "online"},
+                ], "row_count": 3, "truncated": False}}
             if operation == "telemetry_metric_catalog" and arguments["device_id"] == 519:
                 return {"data": {"metrics": [{"metric": "active_power", "source_metric": "Active Power Total", "unit": "kW", "status": "OK", "enabled": True}]}}
             if operation == "telemetry_metric_catalog":
+                if arguments["device_id"] == 521:
+                    return {"data": {"metrics": [{"metric": "energy", "source_metric": "Active Energy Consumed", "unit": "kWh", "status": "OK", "enabled": True}]}}
                 return {"data": {"metrics": [{"metric": "current", "source_metric": "Current L1", "unit": "A", "status": "OK", "enabled": True}]}}
             if operation == "telemetry_timeseries":
+                if arguments["device_id"] == 521:
+                    return {"structuredContent": {"data": {"series": [{
+                        "metric": "energy", "unit": "kWh", "value_mode": "consumption_delta", "points": [
+                            {"timestamp": "2026-10-11T10:00:00+08:00", "value": 2.4},
+                        ],
+                    }]}}}
                 return {"structuredContent": {"data": {"series": [{
                     "metric": "active_power", "unit": "kW", "points": [
                         {"timestamp": "2026-10-11T09:00:00+08:00", "value": 42.5},
@@ -889,8 +899,24 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertEqual(data["ranked_devices"][0]["device_id"], 519)
         self.assertEqual(data["ranked_devices"][0]["peak_kw"], 48.2)
         self.assertEqual(data["ranked_devices"][0]["peak_time"], "11 Oct 2026, 10:00 AM MYT")
+        energy_row = next(row for row in data["ranked_devices"] if row["device_id"] == 521)
+        self.assertEqual(energy_row["peak_kw"], 9.6)
+        self.assertEqual(energy_row["metric"], "energy")
         self.assertEqual(data["excluded_devices"][0]["device_id"], 520)
         self.assertIn("No configured demand", data["excluded_devices"][0]["reason"])
+
+    def test_interval_energy_delta_converts_to_average_kw(self):
+        result = self.env["calculate_demand_peak_from_energy"](
+            {"structuredContent": {"data": {"series": [{
+                "unit": "kWh", "value_mode": "consumption_delta", "points": [
+                    {"timestamp": "2026-10-11T10:00:00+08:00", "value": 1.2},
+                    {"timestamp": "2026-10-11T10:15:00+08:00", "value": 2.4},
+                ],
+            }]}}},
+            {"bucket": "15m", "value_mode": "consumption_delta", "device_id": 521},
+        )
+        self.assertEqual(result["data"]["peak_kw"], 9.6)
+        self.assertEqual(result["data"]["peak_time"], "2026-10-11T10:15:00+08:00")
 
     def test_selected_device_context_does_not_trigger_choice_again(self):
         self.env["resolve_follow_up_message"] = Mock(side_effect=lambda turn, message, context, conversation, request: (message, context))
