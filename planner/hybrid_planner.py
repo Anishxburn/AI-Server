@@ -65,11 +65,13 @@ Rules:
 - Never output site_id, company_id, deployment_id, authorization_id, start/end timestamps, or tenant identifiers.
 - Use natural references from the user in slots, such as device_refs or building_ref.
 - Use tools only from the allowlist.
-- Public tools are categories; the server resolves the operation and exact arguments. device_data covers inventory, metric discovery, telemetry values, and device energy rows; alarm_data covers active/frequency/detail; site_summary covers overview and site energy.
-- For max demand, voltage/current, readings, or trends choose device_data. The server will request configured metric values; if the device is ambiguous, ask which one.
-- For device energy ranking choose device_data. For energy totals/trends choose site_summary. For alarms choose alarm_data.
-- For multi-intent questions include every relevant public tool, for example device_data and alarm_data.
-- If the question is vague, return a clarification field.
+- There are exactly three public tools. Choose a tool whenever the user requests live/site-specific DaxView facts; do not treat short or informal wording as a knowledge question.
+- device_data: list/find devices, discover configured metrics, read historical telemetry (voltage/current/power/demand), and rank device energy. Examples: "list 5 devices", "show voltage on device 519", "max demand for this meter", "top energy-consuming devices".
+- alarm_data: active alarms, alarm counts/frequency over a period, latest/recent alarm occurrences, or one alarm/event's details. Latest/frequency intent: "list 5 latest alarms" or "which alarms occurred most often". Active intent: "current/open alarms". Detail intent: an alarm/event ID or a question about one identified alarm.
+- site_summary: site/building overview and site-wide energy totals/buckets. Examples: "site energy this week" and "give me this site's overview". Do not use it for per-device readings.
+- For multi-intent questions include every relevant public tool, e.g. device_data and alarm_data for device rankings plus active alarms.
+- Do not ask for clarification merely because a request is brief. Ask only when a required target cannot be resolved from authorized context or a specific device/alarm is genuinely ambiguous.
+- For ordinary EMS definitions or calculations using values already supplied by the user, choose no DaxView tool.
 
 Examples:
 User: max demand yesterday for device 12
@@ -78,6 +80,12 @@ User: what about today?
 JSON: {{"intent":"follow_up","is_follow_up":true,"tools":[],"slots":{{"time_phrase":"today"}},"inherit_from_previous":["device","tools","metric"],"clarification":null,"confidence":0.84}}
 User: top consumers last week and active alarms
 JSON: {{"intent":"data_query","is_follow_up":false,"tools":["device_data","alarm_data"],"slots":{{"time_phrase":"last week","metric":"energy","limit":5}},"inherit_from_previous":[],"clarification":null,"confidence":0.9}}
+User: List out 5 latest alarm
+JSON: {{"intent":"data_query","is_follow_up":false,"tools":["alarm_data"],"slots":{{"limit":5}},"inherit_from_previous":[],"clarification":null,"confidence":0.96}}
+User: show current alarms and list devices that are offline
+JSON: {{"intent":"data_query","is_follow_up":false,"tools":["alarm_data","device_data"],"slots":{{}},"inherit_from_previous":[],"clarification":null,"confidence":0.94}}
+User: what is voltage
+JSON: {{"intent":"knowledge_question","is_follow_up":false,"tools":[],"slots":{{}},"inherit_from_previous":[],"clarification":null,"confidence":0.9}}
 User: berapa max demand hari ini
 JSON: {{"intent":"data_query","is_follow_up":false,"tools":["device_data"],"slots":{{"time_phrase":"today","metric":"demand"}},"inherit_from_previous":[],"clarification":null,"confidence":0.82}}
 User: show building 3

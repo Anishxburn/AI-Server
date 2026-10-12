@@ -8,7 +8,9 @@ import re
 import statistics
 import unittest
 from unittest.mock import Mock
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from ems_contracts import question_metrics, metric_clarification, percentage_difference, result_problem
+from contracts.mcp_manifest import public_tool_for_internal
 from contracts.tool_schemas import validate_tool_arguments
 
 
@@ -23,13 +25,13 @@ NAMES = (
     "requested_question_parts", "completed_daily_range", "wants_device_usage_ranking", "wants_all_devices",
     "wants_lowest_consumer", "wants_top_lowest_sum", "wants_device_inventory", "wants_device_capability_discovery",
     "wants_available_parameters_follow_up", "select_historical_operations_without_device_timeseries",
-    "wants_device_metric_timeseries", "explicit_mcp_tool_request", "first_device_id_from_text", "follow_up_metric_from_message",
+    "wants_device_metric_timeseries", "explicit_mcp_tool_request", "planner_default_intents", "select_public_tools", "planner_slot_context", "choose_historical_operations", "first_device_id_from_text", "follow_up_metric_from_message",
     "select_historical_operations", "internal_for_public_operation", "build_historical_arguments", "requested_device_id", "requested_metric",
-    "parse_datetime", "local_bucket_date", "first_dict_with_list", "first_list", "first_value", "predict_daily_energy",
+    "parse_datetime", "format_display_timestamp", "format_answer_timestamps", "local_bucket_date", "first_dict_with_list", "first_list", "first_value", "predict_daily_energy",
     "format_coverage_note", "is_follow_up_message", "resolve_follow_up_message", "needs_ems_library",
     "build_compliance_context", "has_time_scope", "first_regex_int", "needs_device_choice",
     "run_authorized_energy_prediction", "run_daxview_integration_turn",
-    "build_charts_from_historical_results", "summarize_site_energy", "summarize_alarm_frequency",
+    "build_charts_from_historical_results", "build_tables_from_historical_results", "summarize_site_energy", "summarize_alarm_frequency",
     "ensure_historical_answer_coverage", "ranked_consumer_rows", "summarize_top_consumers",
     "summarize_generic_tool", "summarize_historical_answer", "summarize_historical_answers", "summarize_demand_peak", "summarize_site_devices", "device_selection_prompt_from_result",
     "build_device_choice_response",
@@ -48,11 +50,14 @@ def load_functions():
     env = {
         "__builtins__": __builtins__, "date": date, "datetime": datetime,
         "timedelta": timedelta, "timezone": timezone, "math": math,
+        "ZoneInfo": ZoneInfo, "ZoneInfoNotFoundError": ZoneInfoNotFoundError,
+        "AI_DISPLAY_TIMEZONE": "Asia/Kuala_Lumpur",
         "re": re, "statistics": statistics,
         "question_metrics": question_metrics, "metric_clarification": metric_clarification,
         "percentage_difference": percentage_difference,
         "result_problem": result_problem,
         "validate_tool_arguments": validate_tool_arguments,
+        "public_tool_for_internal": public_tool_for_internal,
         "AI_CHAT_MEMORY_ENABLED": False,
         "AI_PLANNER_ENABLED": False,
         "AI_PLANNER_SHADOW_MODE": False,
@@ -112,6 +117,46 @@ class EmsPredictionTests(unittest.TestCase):
         question = "What alarm types occurred most often at this site in the last 7 days? Rank the top five."
         self.assertEqual(self.env["select_historical_operations"](question), ["alarm_frequency_summary"])
         self.assertEqual(self.env["requested_top_limit"](question), 5)
+
+    def test_planner_public_tool_intents_resolve_to_correct_internal_operation(self):
+        intents = self.env["planner_default_intents"]
+        self.assertEqual(intents("List out 5 latest alarm", ["alarm_data"]), ["alarm_frequency_summary"])
+        self.assertEqual(intents("How many active alarms are there?", ["alarm_data"]), ["active_alarm_summary"])
+        self.assertEqual(intents("Show details for alarm event ID 901", ["alarm_data"]), ["alarm_detail_lookup"])
+        self.assertEqual(intents("List available voltage metrics", ["device_data"]), ["telemetry_metric_catalog"])
+        self.assertEqual(intents("Show voltage for device 519", ["device_data"]), ["telemetry_timeseries"])
+        self.assertEqual(intents("Show site energy for this week", ["site_summary"]), ["site_energy_summary"])
+
+    def test_clear_regex_intent_is_not_blocked_by_planner_clarification(self):
+        from types import SimpleNamespace
+        self.env["AI_PLANNER_ENABLED"] = True
+        self.env["AI_PLANNER_SHADOW_MODE"] = False
+        self.env["plan_turn_with_llm"] = Mock(return_value=(SimpleNamespace(
+            tools=["alarm_data"],
+            slots=SimpleNamespace(limit=None, metric=None, building_ref=None, alarm_id=None, device_refs=[]),
+            clarification=SimpleNamespace(question="Which site do you mean?"),
+            confidence=0.9,
+        ), 10))
+        operations, _, _ = self.env["choose_historical_operations"](
+            "List out 5 latest alarm", {"site_id": 17}, "turn", "session", "request"
+        )
+        self.assertEqual(operations, ["alarm_frequency_summary"])
+
+    def test_iso_timestamps_are_rendered_in_readable_site_local_time(self):
+        raw = "Alarm latest: 2026-09-30T19:53:14.552817+00:00."
+        self.assertEqual(
+            self.env["format_answer_timestamps"](raw, "Asia/Kuala_Lumpur"),
+            "Alarm latest: 01 Oct 2026, 3:53 AM MYT.",
+        )
+        self.assertEqual(
+            self.env["format_display_timestamp"]("2026-10-02"),
+            "2026-10-02",
+        )
+        self.env["AI_REFINE_MCP_WITH_MODEL"] = False
+        self.assertEqual(
+            self.env["refine_historical_answer_with_model"]("q", [], raw, "req"),
+            "Alarm latest: 01 Oct 2026, 3:53 AM MYT.",
+        )
 
     def test_latest_alarm_request_routes_and_honors_requested_count(self):
         question = "List out 5 latest alarm"
@@ -299,6 +344,24 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertIn("UMG 512 (ID 379)", answer)
         self.assertIn("first 2026-10-01T00:00:00Z", answer)
         self.assertIn("1 active, 2 resolved", answer)
+
+    def test_debug_table_uses_verified_alarm_rows_and_latest_order(self):
+        tables = self.env["build_tables_from_historical_results"]([{
+            "operation_id": "alarm_frequency_summary",
+            "public_tool": "alarm_data",
+            "operation": "frequency",
+            "arguments": {"start_time": "start", "end_time": "end", "timezone": "UTC"},
+            "result": {"structuredContent": {"data": {"rows": [
+                {"alarm_name": "Older", "device_name": "Meter A", "device_id": 10, "event_count": 8, "last_seen": "2026-10-08T00:00:00Z"},
+                {"alarm_name": "Newer", "device_name": "Meter B", "device_id": 11, "event_count": 1, "last_seen": "2026-10-11T00:00:00Z"},
+            ], "row_count": 2, "truncated": False}}},
+        }], "List out latest alarms")
+        self.assertEqual(len(tables), 1)
+        self.assertEqual(tables[0]["title"], "Latest Alarm Occurrences")
+        self.assertEqual(tables[0]["source_tool"], "alarm_data.frequency")
+        self.assertEqual(tables[0]["rows"][0]["alarm"], "Newer")
+        self.assertEqual(tables[0]["rows"][0]["device_id"], 11)
+        self.assertEqual(tables[0]["time_range"]["timezone"], "UTC")
 
     def test_ranking_sorts_numeric_usage_and_joins_current_status(self):
         self.env["historical_result_data"] = lambda result: result["data"]

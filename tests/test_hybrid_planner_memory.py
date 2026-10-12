@@ -3,7 +3,7 @@ import unittest
 
 from contracts.tool_schemas import TOOL_SCHEMAS, validate_tool_arguments
 from memory.conversation import truncate_reply
-from planner.hybrid_planner import parse_planner_response
+from planner.hybrid_planner import parse_planner_response, planner_system_prompt
 
 
 class HybridPlannerMemoryTests(unittest.TestCase):
@@ -46,6 +46,16 @@ class HybridPlannerMemoryTests(unittest.TestCase):
         }
         with self.assertRaises(ValueError):
             parse_planner_response(payload, {"site_energy_summary"})
+
+    def test_planner_prompt_maps_common_phrasing_to_three_public_tools(self):
+        prompt = planner_system_prompt({
+            "device_data": "Device facts",
+            "alarm_data": "Alarm facts",
+            "site_summary": "Site facts",
+        })
+        self.assertIn('"list 5 latest alarms"', prompt)
+        self.assertIn("choose no DaxView tool", prompt)
+        self.assertIn("site-wide energy totals", prompt)
 
     def test_memory_truncates_assistant_reply(self):
         reply = "x" * 900

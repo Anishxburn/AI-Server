@@ -16,6 +16,7 @@ import uuid
 from pathlib import Path
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from threading import Lock
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
@@ -58,6 +59,7 @@ AI_DEBUG_DASHBOARD_ENABLED = os.getenv("AI_DEBUG_DASHBOARD_ENABLED", "false").lo
 AI_REFINE_MCP_WITH_MODEL = os.getenv("AI_REFINE_MCP_WITH_MODEL", "true").lower() in {"1", "true", "yes", "on"}
 AI_MCP_FALLBACKS_ENABLED = os.getenv("AI_MCP_FALLBACKS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 AI_CHARTS_ENABLED = os.getenv("AI_CHARTS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+AI_DISPLAY_TIMEZONE = os.getenv("AI_DISPLAY_TIMEZONE", "Asia/Kuala_Lumpur")
 AI_PLANNER_ENABLED = os.getenv("AI_PLANNER_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 AI_PLANNER_SHADOW_MODE = os.getenv("AI_PLANNER_SHADOW_MODE", "false").lower() in {"1", "true", "yes", "on"}
 AI_CHAT_MEMORY_ENABLED = os.getenv("AI_CHAT_MEMORY_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
@@ -899,16 +901,28 @@ def planner_default_intents(message: str, tools: list[str]) -> list[str]:
     if "device_data" in tools:
         if wants_device_usage_ranking(message):
             defaults.append("device_energy_breakdown")
-        elif question_metrics(message) or any(term in lowered for term in ("trend", "reading", "maximum demand", "max demand", "peak demand")):
-            defaults.append("telemetry_timeseries")
-        elif any(term in lowered for term in ("available metric", "what metrics", "supports voltage", "supports current")):
+        elif any(term in lowered for term in ("available metric", "what metrics", "supports voltage", "supports current")) or (
+            "metric" in lowered and any(term in lowered for term in ("available", "support", "which", "what"))
+        ):
             defaults.append("telemetry_metric_catalog")
+        elif question_metrics(message) or any(term in lowered for term in ("trend", "reading", "maximum demand", "max demand", "peak demand", "voltage", "current", "power factor", "thd")):
+            defaults.append("telemetry_timeseries")
+        elif wants_device_inventory(message):
+            defaults.append("site_device_list")
         else:
             defaults.append("site_device_list")
     if "alarm_data" in tools:
-        defaults.append("alarm_frequency_summary" if any(term in lowered for term in ("frequency", "most common", "most often", "history")) else "active_alarm_summary")
+        if any(term in lowered for term in ("alarm id", "event id", "alarm detail", "alarm details", "what caused", "explain this alarm")):
+            defaults.append("alarm_detail_lookup")
+        elif any(term in lowered for term in ("latest", "most recent", "frequency", "most common", "most often", "history", "occurred", "occurrence", "how many alarms", "alarm count", "top alarms")):
+            defaults.append("alarm_frequency_summary")
+        else:
+            defaults.append("active_alarm_summary")
     if "site_summary" in tools:
-        defaults.append("site_metadata_summary" if any(term in lowered for term in ("overview", "site detail", "site information")) else "site_energy_summary")
+        if any(term in lowered for term in ("overview", "site detail", "site information", "site metadata", "buildings under")):
+            defaults.append("site_metadata_summary")
+        else:
+            defaults.append("site_energy_summary")
     return defaults
 
 
@@ -1110,7 +1124,7 @@ def choose_historical_operations(message: str, context: dict, turn_id: str, sess
                 "tools": [{"tool": tool, "arguments": {}} for tool in planned_public_tools],
                 "slots": planned_context,
             }
-        if plan.clarification and plan.clarification.question:
+        if plan.clarification and plan.clarification.question and not regex_operations:
             debug_trace_event(
                 "planner_decision_debug",
                 request_id=request_id,
@@ -1126,6 +1140,14 @@ def choose_historical_operations(message: str, context: dict, turn_id: str, sess
                 "tools": [],
                 "slots": planned_context,
             }
+        if plan.clarification and regex_operations:
+            debug_trace_event(
+                "planner_clarification_overridden_debug",
+                request_id=request_id,
+                regex_tools=regex_operations,
+                planner_tools=planned_public_tools,
+                reason="deterministic_intent_available",
+            )
         selected_tools = planned_tools or regex_operations
         debug_trace_event(
             "planner_decision_debug",
@@ -1860,6 +1882,33 @@ def parse_datetime(value) -> datetime | None:
         return datetime.fromisoformat(normalized)
     except ValueError:
         return None
+
+
+def format_display_timestamp(value, timezone_name: str = AI_DISPLAY_TIMEZONE) -> str:
+    if not isinstance(value, str):
+        return str(value) if value is not None else ""
+    if not re.search(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}", value):
+        return value
+    parsed = parse_datetime(value)
+    if not parsed:
+        return value
+    try:
+        zone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, TypeError):
+        zone = timezone(timedelta(hours=8)) if timezone_name == "Asia/Kuala_Lumpur" else timezone.utc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=zone)
+    local = parsed.astimezone(zone)
+    suffix = "MYT" if timezone_name == "Asia/Kuala_Lumpur" else local.tzname() or timezone_name
+    clock = local.strftime("%I:%M %p").lstrip("0")
+    return f"{local.day:02d} {local:%b %Y}, {clock} {suffix}"
+
+
+def format_answer_timestamps(answer: str, timezone_name: str = AI_DISPLAY_TIMEZONE) -> str:
+    pattern = re.compile(
+        r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?\b"
+    )
+    return pattern.sub(lambda match: format_display_timestamp(match.group(0), timezone_name), answer)
 
 
 def format_time_window(data: dict, arguments: dict | None = None) -> str:
@@ -2789,8 +2838,13 @@ def summarize_historical_answers(
 
 
 def refine_historical_answer_with_model(message: str, results: list[dict], deterministic_answer: str, request_id: str) -> str:
+    display_timezone = next((
+        item.get("arguments", {}).get("timezone")
+        for item in results
+        if isinstance(item.get("arguments"), dict) and item["arguments"].get("timezone")
+    ), AI_DISPLAY_TIMEZONE)
     if not AI_REFINE_MCP_WITH_MODEL:
-        return deterministic_answer
+        return format_answer_timestamps(deterministic_answer, display_timezone)
     prompt = build_mcp_refine_prompt(message, results, deterministic_answer, request_id)
     primary_answer = ensure_historical_answer_coverage(
         message, results, deterministic_answer,
@@ -2798,7 +2852,7 @@ def refine_historical_answer_with_model(message: str, results: list[dict], deter
         request_id,
     )
     if not AI_COMPARE_MODEL_ENABLED:
-        return primary_answer
+        return format_answer_timestamps(primary_answer, display_timezone)
     comparison_answers = []
     for model in AI_COMPARE_MODELS:
         if not model or model == CHAT_MODEL:
@@ -2816,7 +2870,7 @@ def refine_historical_answer_with_model(message: str, results: list[dict], deter
             primary_model=CHAT_MODEL,
             compare_models=[model for model, _ in comparison_answers],
         )
-    return primary_answer
+    return format_answer_timestamps(primary_answer, display_timezone)
 
 
 def ensure_historical_answer_coverage(
@@ -2943,6 +2997,7 @@ def build_mcp_refine_prompt(message: str, results: list[dict], deterministic_ans
 Use DaxView MCP data for site-specific facts. Use library excerpts only for relevant general EMS explanations.
 Make it human, clean, and practical.
 Do not invent values, devices, alarms, timestamps, causes, or recommendations not supported by the MCP data.
+Render timestamps as concise local times in the requested/site timezone (for example, "30 Sep 2026, 3:53 PM MYT"). Do not repeat raw ISO timestamps or microseconds in user-facing prose.
 Answer each part of the user's question using the matching tool result. Never present energy consumption as an alarm count.
 When valid site-specific data is present, answer from that data; do not claim the user gave no question or ask them to clarify unless the returned data genuinely lacks a required scope or value.
 Do not include standards, protocols, or library background unless the user asks for them.
@@ -3211,6 +3266,142 @@ def build_charts_from_historical_results(results: list[dict], preview: bool = Fa
         if chart:
             charts.append(chart)
     return charts
+
+
+def build_tables_from_historical_results(results: list[dict], message: str = "") -> list[dict]:
+    """Build debug-only tables from verified MCP rows; never ask the model to invent cells."""
+    tables = []
+    latest_requested = bool(re.search(r"\b(?:latest|most recent)\b", message, re.IGNORECASE))
+    for item in results:
+        operation_id = str(item.get("operation_id") or "")
+        data = historical_result_data(item.get("result") if isinstance(item.get("result"), dict) else {})
+        arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+        rows = []
+        title = ""
+        columns = []
+
+        if operation_id == "alarm_frequency_summary":
+            source_rows = [row for row in first_list(data, ("rows", "alarms", "items")) if isinstance(row, dict)]
+            if latest_requested:
+                source_rows = sorted(
+                    source_rows,
+                    key=lambda row: parse_datetime(
+                        row.get("latest_occurrence") or row.get("last_seen") or row.get("latest_at")
+                    ) or datetime.min.replace(tzinfo=timezone.utc),
+                    reverse=True,
+                )
+            else:
+                source_rows = sorted(
+                    source_rows,
+                    key=lambda row: chart_number(row.get("event_count", row.get("count", row.get("frequency", 0)))) or 0,
+                    reverse=True,
+                )
+            table_limit = min(max(int(arguments.get("limit") or 10), 1), 100)
+            for rank, row in enumerate(source_rows[:table_limit], 1):
+                rows.append({
+                    "rank": rank,
+                    "alarm": row.get("alarm_name") or row.get("name") or row.get("type") or "Alarm",
+                    "device": row.get("device_name") or "",
+                    "device_id": row.get("device_id"),
+                    "severity": row.get("severity") or "",
+                    "occurrences": row.get("event_count", row.get("count", row.get("frequency"))),
+                    "latest": row.get("latest_occurrence") or row.get("last_seen") or row.get("latest_at"),
+                    "active": row.get("active_count"),
+                    "acknowledged": row.get("acknowledged_count"),
+                    "resolved": row.get("resolved_count"),
+                    "closed": row.get("closed_count"),
+                })
+            title = "Latest Alarm Occurrences" if latest_requested else "Alarm Frequency"
+            columns = [
+                ("rank", "#"), ("alarm", "Alarm"), ("device", "Device"), ("device_id", "Device ID"),
+                ("severity", "Severity"), ("occurrences", "Occurrences"), ("latest", "Latest occurrence"),
+                ("active", "Active"), ("acknowledged", "Acknowledged"), ("resolved", "Resolved"), ("closed", "Closed"),
+            ]
+        elif operation_id in {"device_energy_breakdown", "device_energy_ranking", "telemetry_top_consumers"}:
+            measured, _ = ranked_consumer_rows(data)
+            limit = min(max(int(arguments.get("limit") or 20), 1), 100)
+            for rank, (row, amount) in enumerate(measured[:limit], 1):
+                rows.append({
+                    "rank": rank,
+                    "device": row.get("device_name") or row.get("name") or row.get("label") or f"Device {row.get('device_id', '')}",
+                    "device_id": row.get("device_id"),
+                    "value": amount,
+                    "unit": row.get("unit") or data.get("unit") or "kWh",
+                    "status": row.get("status") or row.get("device_status") or "",
+                })
+            title = "Device Energy Ranking"
+            columns = [("rank", "#"), ("device", "Device"), ("device_id", "Device ID"), ("value", "Energy"), ("unit", "Unit"), ("status", "Status")]
+        elif operation_id == "site_device_list":
+            source_rows = first_list(data, ("devices", "rows", "items", "meters"))
+            for row in source_rows[:100]:
+                if not isinstance(row, dict):
+                    continue
+                rows.append({
+                    "device_id": row.get("device_id"),
+                    "device": row.get("device_name") or row.get("name") or row.get("device") or "",
+                    "type": row.get("device_type") or row.get("type") or "",
+                    "status": row.get("status") or row.get("data_status") or "",
+                    "last_seen": row.get("last_seen"),
+                })
+            title = "Site Devices"
+            columns = [("device_id", "Device ID"), ("device", "Device"), ("type", "Type"), ("status", "Status"), ("last_seen", "Last seen")]
+        elif operation_id == "active_alarm_summary":
+            source_rows = first_list(data, ("alarms", "rows", "items"))
+            for rank, row in enumerate(source_rows[:100], 1):
+                if not isinstance(row, dict):
+                    continue
+                rows.append({
+                    "rank": rank,
+                    "alarm": row.get("alarm_name") or row.get("name") or "Alarm",
+                    "device": row.get("device_name") or "",
+                    "device_id": row.get("device_id"),
+                    "severity": row.get("severity") or "",
+                    "status": row.get("status") or "",
+                    "started_at": row.get("started_at") or row.get("first_seen"),
+                })
+            title = "Active Alarms"
+            columns = [("rank", "#"), ("alarm", "Alarm"), ("device", "Device"), ("device_id", "Device ID"), ("severity", "Severity"), ("status", "Status"), ("started_at", "Started")]
+        elif operation_id == "site_energy_summary":
+            source_rows = first_list(data, ("buckets", "rows", "series", "data"))
+            for row in source_rows[:100]:
+                if not isinstance(row, dict):
+                    continue
+                value = chart_value(row, ("value", "kwh", "energy", "consumption"))
+                if value is None:
+                    continue
+                rows.append({
+                    "period": row.get("timestamp") or row.get("bucket") or row.get("date") or row.get("start") or "",
+                    "value": value,
+                    "unit": row.get("unit") or data.get("unit") or "kWh",
+                })
+            title = "Site Energy by Period"
+            columns = [("period", "Period"), ("value", "Energy"), ("unit", "Unit")]
+
+        if rows:
+            display_timezone = arguments.get("timezone") or AI_DISPLAY_TIMEZONE
+            for row in rows:
+                for key in ("latest", "started_at", "last_seen", "period"):
+                    if row.get(key):
+                        row[key] = format_display_timestamp(row[key], display_timezone)
+            tables.append({
+                "title": title,
+                "columns": [{"key": key, "label": label} for key, label in columns],
+                "rows": rows,
+                "row_count": data.get("row_count", len(rows)),
+                "truncated": bool(data.get("truncated")),
+                "source_tool": (
+                    f"{item.get('public_tool')}.{item.get('operation')}"
+                    if item.get("public_tool") and item.get("operation")
+                    else item.get("public_tool") or operation_id
+                ),
+                "operation": item.get("operation") or operation_id,
+                "time_range": {
+                    key: format_display_timestamp(arguments.get(key), display_timezone)
+                    for key in ("start_time", "end_time", "timezone")
+                    if arguments.get(key) is not None
+                },
+            })
+    return tables
 
 
 FOLLOW_UP_PHRASES = (
@@ -3789,11 +3980,13 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         deterministic_reply = summarize_historical_answers(message, ranked_results, request_id)
         refined_reply = refine_historical_answer_with_model(message, ranked_results, deterministic_reply, request_id)
         charts = build_charts_from_historical_results(ranked_results)
+        tables = build_tables_from_historical_results(ranked_results, message)
         return {
             "provider": "daxview-historical-mcp",
             "reply": refined_reply,
             "charts": charts,
             "debug_charts": charts,
+            "debug_tables": tables,
             "resolved_plan": resolved_plan_for_result("ok", ["demand_peak_summary"], context, ranked_results),
         }
     results = []
@@ -3896,18 +4089,21 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         refined_reply += f"\n\nUnavailable detail: {failed_tools}"
     charts = build_charts_from_historical_results(results)
     preview_charts = charts if charts else build_charts_from_historical_results(results, preview=True)
+    tables = build_tables_from_historical_results(results, message)
     debug_trace_event(
         "ai_final_response_debug",
         request_id=request_id,
         model=CHAT_MODEL if AI_REFINE_MCP_WITH_MODEL else "deterministic",
         answer=refined_reply,
         charts=preview_charts,
+        tables=tables,
     )
     return {
         "provider": "daxview-historical-mcp",
         "reply": refined_reply,
         "charts": charts,
         "debug_charts": preview_charts,
+        "debug_tables": tables,
         "resolved_plan": resolved_plan_for_result("ok" if not errors else "no_data", operation_ids, context, results, errors),
     }
 
@@ -3998,6 +4194,7 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
         debug_trace_event(
             "ai_outcome_debug", request_id=request_id, status="completed",
             answer=result["reply"], charts=result.get("debug_charts") or result.get("charts") or [],
+            tables=result.get("debug_tables") or [],
             charts_enabled=AI_CHARTS_ENABLED,
         )
         save_turn_memory(turn_id, result["reply"], result.get("resolved_plan") or {})
@@ -5060,6 +5257,16 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       .chart-item summary { cursor: pointer; }
       .chart-item table { border-collapse: collapse; width: 100%; margin-top: 8px; font-size: 12px; }
       .chart-item th, .chart-item td { padding: 5px 6px; border-bottom: 1px solid #e5ebf3; text-align: left; }
+      .table-grid { display: grid; gap: 10px; margin-top: 10px; }
+      .table-item { border: 1px solid #dbe3ef; min-width: 0; max-width: 100%; background: #fff; }
+      .table-item header { padding: 9px 10px; border-bottom: 1px solid #e5ebf3; display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+      .table-item header strong { font-size: 12px; }
+      .table-meta { color: #64748b; font-size: 11px; }
+      .table-scroll { overflow: auto; max-width: 100%; max-height: 360px; }
+      .data-table { border-collapse: collapse; width: 100%; font-size: 12px; white-space: nowrap; }
+      .data-table th, .data-table td { padding: 7px 9px; border-bottom: 1px solid #e5ebf3; text-align: left; }
+      .data-table th { position: sticky; top: 0; z-index: 1; background: #f8fafc; color: #475569; }
+      .data-table tbody tr:hover { background: #f8fafc; }
       pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #0f172a; color: #dbeafe; border-radius: 6px; padding: 10px; font-size: 12px; line-height: 1.45; margin: 0; }
       .empty { padding: 18px; color: #64748b; }
       @media (max-width: 1100px) { .flow { grid-template-columns: repeat(3, minmax(118px, 1fr)); } .summary-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); } }
@@ -5184,6 +5391,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         const fallback = events.find(event => event.event === "mcp_answer_refine_fallback");
         const answer = outcome?.answer || final?.answer || "";
         const charts = outcome?.charts || final?.charts || [];
+        const tables = outcome?.tables || final?.tables || [];
         const report = outcome?.report || null;
         const error = outcome?.error || failed?.error || "";
         const unavailableCode = unavailable?.error_code || (/DAXVIEW_UNAVAILABLE/.test(error) ? "DAXVIEW_UNAVAILABLE" : "");
@@ -5200,6 +5408,20 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
             <details><summary>View chart values</summary><table><thead><tr><th>Period</th><th>${escapeHtml(series.unit || "Value")}</th></tr></thead><tbody>${valueRows}</tbody></table></details>
           </div>`;
         }).join("");
+        const tableItems = tables.map(table => {
+          const columns = Array.isArray(table.columns) ? table.columns : [];
+          const rows = Array.isArray(table.rows) ? table.rows : [];
+          const heading = `<tr>${columns.map(column => `<th scope="col">${escapeHtml(column.label || column.key || "")}</th>`).join("")}</tr>`;
+          const body = rows.map(row => `<tr>${columns.map(column => `<td>${escapeHtml(row?.[column.key] ?? "")}</td>`).join("")}</tr>`).join("");
+          const range = table.time_range || {};
+          const rangeText = range.start_time || range.end_time
+            ? ` · ${escapeHtml(range.start_time || "")} – ${escapeHtml(range.end_time || "")}${range.timezone ? ` (${escapeHtml(range.timezone)})` : ""}`
+            : "";
+          const truncated = table.truncated ? " · truncated" : "";
+          return `<section class="table-item"><header><strong>${escapeHtml(table.title || "Data")}</strong>
+            <span class="table-meta">${escapeHtml(table.source_tool || "MCP")} · ${escapeHtml(rows.length)} shown${table.row_count != null ? ` of ${escapeHtml(table.row_count)}` : ""}${truncated}${rangeText}</span></header>
+            <div class="table-scroll"><table class="data-table"><thead>${heading}</thead><tbody>${body}</tbody></table></div></section>`;
+        }).join("");
         let state = "";
         if (unavailableCode) state = `DaxView returned ${unavailableCode}. There are no historical values to plot for this request.`;
         else if (error) state = error;
@@ -5209,6 +5431,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         return `<section class="outcome"><h3>Outcome preview</h3>
           ${fallback ? `<div class="outcome-state">Model refinement unavailable; showing the calculated fallback.</div>` : ""}
           ${answer ? `<div class="outcome-answer">${escapeHtml(answer)}</div>` : ""}
+          ${tableItems ? `<div class="table-grid">${tableItems}</div>` : ""}
           ${chartItems ? `<div class="chart-grid">${chartItems}</div>` : ""}
           ${report ? `<details><summary>Report structure</summary><pre>${escapeHtml(JSON.stringify(report, null, 2))}</pre></details>` : ""}
           ${state ? `<div class="outcome-state ${unavailableCode || error ? "fail" : ""}">${escapeHtml(state)}</div>` : ""}
