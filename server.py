@@ -2212,17 +2212,37 @@ def summarize_alarm_frequency(data: dict, arguments: dict | None = None) -> str:
     if not rows:
         lines.append("No alarm-frequency rows were returned for this site and time range.")
     limit = min(max(int((arguments or {}).get("limit") or 10), 1), 20)
-    for index, row in enumerate(rows[:limit], 1):
+    ranked_rows = sorted(
+        (row for row in rows if isinstance(row, dict)),
+        key=lambda row: chart_number(row.get("event_count", row.get("count", row.get("frequency", 0)))) or 0,
+        reverse=True,
+    )
+    for index, row in enumerate(ranked_rows[:limit], 1):
         if not isinstance(row, dict):
             continue
         name = row.get("alarm_name") or row.get("name") or row.get("type") or row.get("severity") or "Alarm"
         count = next((row[key] for key in ("event_count", "count", "frequency", "total", "value") if row.get(key) is not None), None)
         detail = f"{index}. {name} - {format_number(count, 0)} occurrence(s)"
+        device_name = row.get("device_name")
+        device_id = row.get("device_id")
+        if device_name or device_id is not None:
+            detail += f"; device {device_name or ''}" + (f" (ID {device_id})" if device_id is not None else "")
         if row.get("severity"):
             detail += f", severity {row['severity']}"
+        first_seen = row.get("first_seen")
         latest = row.get("latest_occurrence") or row.get("last_seen") or row.get("latest_at")
-        if latest:
-            detail += f", latest {latest}"
+        if first_seen and latest and first_seen != latest:
+            detail += f"; first {first_seen}; latest {latest}"
+        elif latest:
+            detail += f"; latest {latest}"
+        lifecycle = [
+            f"{row[key]} {label}" for key, label in (
+                ("active_count", "active"), ("acknowledged_count", "acknowledged"),
+                ("resolved_count", "resolved"), ("closed_count", "closed"),
+            ) if isinstance(row.get(key), (int, float)) and row[key] > 0
+        ]
+        if lifecycle:
+            detail += "; " + ", ".join(lifecycle)
         lines.append(detail)
     if data.get("row_count") is not None:
         lines.append(f"Rows returned: {data.get('row_count')}.")
@@ -2787,6 +2807,11 @@ def ensure_historical_answer_coverage(
         r"\bhow can i assist you today\b",
         r"\bplease let me know if you have any questions\b",
         r"\bneed help with something specific\b",
+        r"\bno specific question\b",
+        r"\bclarify what you(?:'|’)d like to ask\b",
+        r"\bwhat you(?:'|’)d like to ask\b",
+        r"\bi(?:'|’)m here to help\b",
+        r"\bcould you clarify\b",
     )
     if results and any(re.search(pattern, model_answer, flags=re.IGNORECASE) for pattern in generic_failure_patterns):
         log_event("historical_answer_coverage_fallback", request_id=request_id, missing_items="generic_model_reply")
@@ -2896,6 +2921,7 @@ Use DaxView MCP data for site-specific facts. Use library excerpts only for rele
 Make it human, clean, and practical.
 Do not invent values, devices, alarms, timestamps, causes, or recommendations not supported by the MCP data.
 Answer each part of the user's question using the matching tool result. Never present energy consumption as an alarm count.
+When valid site-specific data is present, answer from that data; do not claim the user gave no question or ask them to clarify unless the returned data genuinely lacks a required scope or value.
 Do not include standards, protocols, or library background unless the user asks for them.
 For predictions, label every future value as an estimate and retain the method, coverage, and backtest error.
 Answer every numbered request below. If a value was not returned, state that for the affected request.

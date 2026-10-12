@@ -29,7 +29,7 @@ NAMES = (
     "format_coverage_note", "is_follow_up_message", "resolve_follow_up_message", "needs_ems_library",
     "build_compliance_context", "has_time_scope", "first_regex_int", "needs_device_choice",
     "run_authorized_energy_prediction", "run_daxview_integration_turn",
-    "build_charts_from_historical_results", "summarize_site_energy",
+    "build_charts_from_historical_results", "summarize_site_energy", "summarize_alarm_frequency",
     "ensure_historical_answer_coverage", "ranked_consumer_rows", "summarize_top_consumers",
     "summarize_generic_tool", "summarize_historical_answer", "summarize_historical_answers", "summarize_demand_peak", "summarize_site_devices", "device_selection_prompt_from_result",
     "build_device_choice_response",
@@ -246,6 +246,37 @@ class EmsPredictionTests(unittest.TestCase):
             "request",
         )
         self.assertEqual(answer, deterministic)
+
+    def test_clarification_style_llm_reply_cannot_replace_alarm_data_answer(self):
+        deterministic = (
+            "Alarm frequency summary returned by Daxview MCP:\n"
+            "1. Device Offline - 3 occurrence(s); device UMG 512 (ID 379); 3 resolved"
+        )
+        model_answer = (
+            "It seems you've sent a command or prompt, but there's no specific question provided. "
+            "Could you clarify what you'd like to ask? I'm here to help!"
+        )
+        self.env["log_event"] = Mock()
+        answer = self.env["ensure_historical_answer_coverage"](
+            "Which alarm occurred most often?",
+            [{"operation_id": "alarm_frequency_summary", "result": {"structuredContent": {"data": {"rows": []}}}}],
+            deterministic,
+            model_answer,
+            "request",
+        )
+        self.assertEqual(answer, deterministic)
+        self.env["log_event"].assert_called_once()
+
+    def test_alarm_frequency_summary_includes_device_and_lifecycle_details(self):
+        answer = self.env["summarize_alarm_frequency"]({"rows": [
+            {"alarm_name": "Device Offline", "device_id": 379, "device_name": "UMG 512",
+             "event_count": 3, "first_seen": "2026-10-01T00:00:00Z", "last_seen": "2026-10-02T00:00:00Z",
+             "active_count": 1, "resolved_count": 2},
+        ], "row_count": 1}, {"limit": 5})
+        self.assertIn("3 occurrence(s)", answer)
+        self.assertIn("UMG 512 (ID 379)", answer)
+        self.assertIn("first 2026-10-01T00:00:00Z", answer)
+        self.assertIn("1 active, 2 resolved", answer)
 
     def test_ranking_sorts_numeric_usage_and_joins_current_status(self):
         self.env["historical_result_data"] = lambda result: result["data"]
