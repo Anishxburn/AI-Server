@@ -363,6 +363,31 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertEqual(tables[0]["rows"][0]["device_id"], 11)
         self.assertEqual(tables[0]["time_range"]["timezone"], "UTC")
 
+    def test_debug_alarm_table_falls_back_to_populated_aliases(self):
+        tables = self.env["build_tables_from_historical_results"]([{
+            "operation_id": "alarm_frequency_summary",
+            "arguments": {"timezone": "Asia/Kuala_Lumpur"},
+            "result": {"data": {"rows": [{
+                "alarm_name": None,
+                "alarm_type": "High Voltage",
+                "device_name": None,
+                "meter_name": "Main Meter",
+                "deviceId": 519,
+                "event_count": None,
+                "occurrence_count": 2,
+                "last_seen_at": "2026-10-11T03:30:00Z",
+                "resolved_count": None,
+                "resolved": 2,
+            }]}}
+        }], "Show latest alarm")
+        row = tables[0]["rows"][0]
+        self.assertEqual(row["alarm"], "High Voltage")
+        self.assertEqual(row["device"], "Main Meter")
+        self.assertEqual(row["device_id"], 519)
+        self.assertEqual(row["occurrences"], 2)
+        self.assertEqual(row["resolved"], 2)
+        self.assertIn("11 Oct 2026", row["latest"])
+
     def test_ranking_sorts_numeric_usage_and_joins_current_status(self):
         self.env["historical_result_data"] = lambda result: result["data"]
         self.env["first_value"] = lambda row, keys: next((row[key] for key in keys if row.get(key) is not None), None)

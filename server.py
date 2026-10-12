@@ -3285,31 +3285,33 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
             if latest_requested:
                 source_rows = sorted(
                     source_rows,
-                    key=lambda row: parse_datetime(
-                        row.get("latest_occurrence") or row.get("last_seen") or row.get("latest_at")
-                    ) or datetime.min.replace(tzinfo=timezone.utc),
+                    key=lambda row: parse_datetime(first_value(row, (
+                        "latest_occurrence", "last_occurrence", "last_seen", "last_seen_at", "latest_at",
+                    ))) or datetime.min.replace(tzinfo=timezone.utc),
                     reverse=True,
                 )
             else:
                 source_rows = sorted(
                     source_rows,
-                    key=lambda row: chart_number(row.get("event_count", row.get("count", row.get("frequency", 0)))) or 0,
+                    key=lambda row: chart_number(first_value(row, (
+                        "event_count", "occurrence_count", "alarm_count", "count", "frequency",
+                    ))) or 0,
                     reverse=True,
                 )
             table_limit = min(max(int(arguments.get("limit") or 10), 1), 100)
             for rank, row in enumerate(source_rows[:table_limit], 1):
                 rows.append({
                     "rank": rank,
-                    "alarm": row.get("alarm_name") or row.get("name") or row.get("type") or "Alarm",
-                    "device": row.get("device_name") or "",
-                    "device_id": row.get("device_id"),
-                    "severity": row.get("severity") or "",
-                    "occurrences": row.get("event_count", row.get("count", row.get("frequency"))),
-                    "latest": row.get("latest_occurrence") or row.get("last_seen") or row.get("latest_at"),
-                    "active": row.get("active_count"),
-                    "acknowledged": row.get("acknowledged_count"),
-                    "resolved": row.get("resolved_count"),
-                    "closed": row.get("closed_count"),
+                    "alarm": first_value(row, ("alarm_name", "alarm_type", "alarm", "name", "type")) or "Alarm",
+                    "device": first_value(row, ("device_name", "meter_name", "device")) or "",
+                    "device_id": first_value(row, ("device_id", "deviceId")),
+                    "severity": first_value(row, ("severity", "priority")) or "",
+                    "occurrences": first_value(row, ("event_count", "occurrence_count", "alarm_count", "count", "frequency")),
+                    "latest": first_value(row, ("latest_occurrence", "last_occurrence", "last_seen", "last_seen_at", "latest_at")),
+                    "active": first_value(row, ("active_count", "active")),
+                    "acknowledged": first_value(row, ("acknowledged_count", "acknowledged")),
+                    "resolved": first_value(row, ("resolved_count", "resolved")),
+                    "closed": first_value(row, ("closed_count", "closed")),
                 })
             title = "Latest Alarm Occurrences" if latest_requested else "Alarm Frequency"
             columns = [
@@ -5259,12 +5261,12 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       .chart-item th, .chart-item td { padding: 5px 6px; border-bottom: 1px solid #e5ebf3; text-align: left; }
       .table-grid { display: grid; gap: 10px; margin-top: 10px; }
       .table-item { border: 1px solid #dbe3ef; min-width: 0; max-width: 100%; background: #fff; }
-      .table-item header { padding: 9px 10px; border-bottom: 1px solid #e5ebf3; display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
-      .table-item header strong { font-size: 12px; }
+      .table-item-head { padding: 9px 10px; border-bottom: 1px solid #e5ebf3; display: flex; justify-content: space-between; gap: 12px; align-items: baseline; background: #f8fafc; color: #172033; }
+      .table-item-head strong { font-size: 12px; }
       .table-meta { color: #64748b; font-size: 11px; }
       .table-scroll { overflow: auto; max-width: 100%; max-height: 360px; }
       .data-table { border-collapse: collapse; width: 100%; font-size: 12px; white-space: nowrap; }
-      .data-table th, .data-table td { padding: 7px 9px; border-bottom: 1px solid #e5ebf3; text-align: left; }
+      .data-table th, .data-table td { padding: 7px 9px; border-bottom: 1px solid #e5ebf3; text-align: left; color: #172033 !important; }
       .data-table th { position: sticky; top: 0; z-index: 1; background: #f8fafc; color: #475569; }
       .data-table tbody tr:hover { background: #f8fafc; }
       pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #0f172a; color: #dbeafe; border-radius: 6px; padding: 10px; font-size: 12px; line-height: 1.45; margin: 0; }
@@ -5412,13 +5414,21 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
           const columns = Array.isArray(table.columns) ? table.columns : [];
           const rows = Array.isArray(table.rows) ? table.rows : [];
           const heading = `<tr>${columns.map(column => `<th scope="col">${escapeHtml(column.label || column.key || "")}</th>`).join("")}</tr>`;
-          const body = rows.map(row => `<tr>${columns.map(column => `<td>${escapeHtml(row?.[column.key] ?? "")}</td>`).join("")}</tr>`).join("");
+          const body = rows.map(row => `<tr>${columns.map((column, index) => {
+            const wanted = String(column.key || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+            const actualKey = row && !Array.isArray(row)
+              ? Object.keys(row).find(key => key.toLowerCase().replace(/[^a-z0-9]/g, "") === wanted)
+              : null;
+            const value = row?.[column.key] ?? (actualKey ? row[actualKey] : Array.isArray(row) ? row[index] : null);
+            const display = value == null || value === "" ? "Not reported" : typeof value === "object" ? JSON.stringify(value) : value;
+            return `<td>${escapeHtml(display)}</td>`;
+          }).join("")}</tr>`).join("");
           const range = table.time_range || {};
           const rangeText = range.start_time || range.end_time
             ? ` · ${escapeHtml(range.start_time || "")} – ${escapeHtml(range.end_time || "")}${range.timezone ? ` (${escapeHtml(range.timezone)})` : ""}`
             : "";
           const truncated = table.truncated ? " · truncated" : "";
-          return `<section class="table-item"><header><strong>${escapeHtml(table.title || "Data")}</strong>
+          return `<section class="table-item"><header class="table-item-head"><strong>${escapeHtml(table.title || "Data")}</strong>
             <span class="table-meta">${escapeHtml(table.source_tool || "MCP")} · ${escapeHtml(rows.length)} shown${table.row_count != null ? ` of ${escapeHtml(table.row_count)}` : ""}${truncated}${rangeText}</span></header>
             <div class="table-scroll"><table class="data-table"><thead>${heading}</thead><tbody>${body}</tbody></table></div></section>`;
         }).join("");
