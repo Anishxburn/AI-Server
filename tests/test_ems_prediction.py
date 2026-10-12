@@ -113,6 +113,28 @@ class EmsPredictionTests(unittest.TestCase):
         self.assertEqual(self.env["select_historical_operations"](question), ["alarm_frequency_summary"])
         self.assertEqual(self.env["requested_top_limit"](question), 5)
 
+    def test_latest_alarm_request_routes_and_honors_requested_count(self):
+        question = "List out 5 latest alarm"
+        self.assertEqual(self.env["select_historical_operations"](question), ["alarm_frequency_summary"])
+        self.assertEqual(self.env["requested_top_limit"](question), 5)
+        self.env["requested_historical_range"] = Mock(return_value={
+            "start": "2026-10-05T00:00:00+00:00",
+            "end": "2026-10-12T00:00:00+00:00",
+            "timezone": "Asia/Kuala_Lumpur",
+        })
+        args = self.env["build_historical_arguments"]("alarm_frequency_summary", {"site_id": 17}, question)
+        self.assertEqual(args["limit"], 5)
+        self.assertEqual(args["start"], "2026-10-05T00:00:00+00:00")
+        self.assertEqual(args["end"], "2026-10-12T00:00:00+00:00")
+
+    def test_latest_alarm_rows_sort_by_timestamp_not_frequency(self):
+        answer = self.env["summarize_alarm_frequency"]({"rows": [
+            {"alarm_name": "Frequent but older", "event_count": 9, "last_seen": "2026-10-08T00:00:00Z"},
+            {"alarm_name": "Recent", "event_count": 1, "last_seen": "2026-10-11T00:00:00Z"},
+        ]}, {"limit": 2}, "List out 5 latest alarm")
+        self.assertLess(answer.index("Recent"), answer.index("Frequent but older"))
+        self.assertIn("Latest alarm occurrences", answer)
+
     def test_combined_daily_energy_question_uses_site_summary(self):
         question = "Show this site's daily energy use for the last 7 days and what was the highest and lowest reading?"
         self.assertEqual(self.env["select_historical_operations"](question), ["site_energy_summary"])

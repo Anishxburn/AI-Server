@@ -135,7 +135,8 @@ DAXVIEW_TOOL_KEYWORDS = {
         "alarm frequency", "frequent alarm", "most alarms", "alarm summary",
         "alarm history", "repeated alarms", "historical alarms",
         "alarm types", "alarms occurred most often", "most common alarms",
-        "which alarms occurred", "top alarms",
+        "which alarms occurred", "top alarms", "latest alarm", "latest alarms",
+        "most recent alarm", "most recent alarms",
     },
     "site_metadata_summary": {
         "what site", "current site", "site details", "details about this site",
@@ -754,11 +755,18 @@ def select_historical_operation(message: str) -> str | None:
 
 
 def requested_top_limit(message: str) -> int | None:
-    match = re.search(r"\btop\s+(\d{1,2}|five|ten)\b", message, re.IGNORECASE)
+    match = re.search(
+        r"\btop\s+(\d{1,2}|five|ten)\b"
+        r"|\b(\d{1,2}|five|ten)\s+(?:latest|most recent)\s+alarms?\b"
+        r"|\b(?:latest|most recent|last)\s+(\d{1,2}|five|ten)\s+alarms?\b",
+        message,
+        re.IGNORECASE,
+    )
     if not match:
         return None
-    value = {"five": 5, "ten": 10}.get(match.group(1).lower())
-    return value if value is not None else min(max(int(match.group(1)), 1), 20)
+    token = next(group for group in match.groups() if group is not None)
+    value = {"five": 5, "ten": 10}.get(token.lower())
+    return value if value is not None else min(max(int(token), 1), 20)
 
 
 def requested_forecast_days(message: str) -> int | None:
@@ -2205,18 +2213,33 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
     return "\n".join(lines)
 
 
-def summarize_alarm_frequency(data: dict, arguments: dict | None = None) -> str:
+def summarize_alarm_frequency(data: dict, arguments: dict | None = None, message: str = "") -> str:
     rows = data.get("rows") or data.get("alarms") or data.get("items")
     rows = rows if isinstance(rows, list) else []
-    lines = ["Alarm frequency summary returned by Daxview MCP:"]
+    latest_requested = bool(re.search(r"\b(?:latest|most recent)\b", message, re.IGNORECASE))
+    lines = [
+        "Latest alarm occurrences returned by Daxview MCP:"
+        if latest_requested
+        else "Alarm frequency summary returned by Daxview MCP:"
+    ]
     if not rows:
-        lines.append("No alarm-frequency rows were returned for this site and time range.")
+        lines.append("No alarm rows were returned for this site and time range.")
     limit = min(max(int((arguments or {}).get("limit") or 10), 1), 20)
-    ranked_rows = sorted(
-        (row for row in rows if isinstance(row, dict)),
-        key=lambda row: chart_number(row.get("event_count", row.get("count", row.get("frequency", 0)))) or 0,
-        reverse=True,
-    )
+    valid_rows = [row for row in rows if isinstance(row, dict)]
+    if latest_requested:
+        ranked_rows = sorted(
+            valid_rows,
+            key=lambda row: parse_datetime(
+                row.get("latest_occurrence") or row.get("last_seen") or row.get("latest_at")
+            ) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+    else:
+        ranked_rows = sorted(
+            valid_rows,
+            key=lambda row: chart_number(row.get("event_count", row.get("count", row.get("frequency", 0)))) or 0,
+            reverse=True,
+        )
     for index, row in enumerate(ranked_rows[:limit], 1):
         if not isinstance(row, dict):
             continue
@@ -2637,7 +2660,7 @@ def summarize_historical_answer(
     if operation_id == "site_energy_summary":
         return summarize_site_energy(data, message, arguments)
     if operation_id == "alarm_frequency_summary":
-        return summarize_alarm_frequency(data, arguments)
+        return summarize_alarm_frequency(data, arguments, message)
     if operation_id == "energy_forecast":
         return summarize_energy_forecast(data)
     if operation_id == "active_alarm_summary":
