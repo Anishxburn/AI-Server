@@ -1064,6 +1064,10 @@ def select_historical_operations(message: str) -> list[str]:
         return ["demand_peak_summary"]
     if re.search(r"\b(?:maximum|highest|peak)\b", lowered) and re.search(r"\b(?:power|kw|watt)\b", lowered):
         return ["demand_peak_summary"]
+    if requested_device_id(message) is not None and question_metrics(message) and re.search(
+        r"\b(?:latest|most recent|current)\b", lowered
+    ):
+        return ["latest_telemetry_snapshot"]
     # The word "list" is common in alarm requests; resolve alarm intent before
     # the generic device-inventory heuristic can claim the request.
     asks_for_other_data = any(
@@ -1564,7 +1568,12 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
         args["metric"] = str(context.get("metric") or requested_metric(message) or "frequency")
         args["start_time"] = args.pop("start")
         args["end_time"] = args.pop("end")
-        args["bucket"] = "1d"
+        start_dt = parse_datetime(args["start_time"])
+        end_dt = parse_datetime(args["end_time"])
+        duration = (end_dt - start_dt) if start_dt and end_dt else timedelta(days=8)
+        # Preserve the timestamp of the actual maximum for short windows. Larger
+        # windows use hourly maxima to stay within the telemetry point limit.
+        args["bucket"] = "raw" if duration <= timedelta(days=7) else "1h"
         args["aggregation"] = "max"
         args["value_mode"] = "measured"
         args["limit"] = min(int(context.get("limit") or 1000), 2000)
@@ -2841,15 +2850,52 @@ def summarize_metric_ranking(data: dict, message: str, arguments: dict | None = 
             + (f"; {row['status']}" if row.get("status") else "")
         )
     if rows:
-        lines.append(f"Showing {min(len(rows), limit)} of {len(rows)} device(s) with usable readings. Values are ranked by the highest returned frequency reading in the period.")
+        lines.append(f"Ranked {min(len(rows), limit)} of {len(rows)} device(s) with usable readings, from {data.get('device_count', len(rows))} devices scanned. Values are ranked by the highest measured frequency in the period.")
     excluded = data.get("excluded_devices") if isinstance(data.get("excluded_devices"), list) else []
     if excluded:
-        lines.append(f"{len(excluded)} device(s) could not be ranked because frequency readings or supported units were unavailable.")
+        reasons = {}
+        for row in excluded:
+            reason = str(row.get("reason") or "Readings unavailable")
+            reasons[reason] = reasons.get(reason, 0) + 1
+        reason_summary = "; ".join(f"{count} {reason.lower()}" for reason, count in reasons.items())
+        lines.append(f"{len(excluded)} device(s) were excluded: {reason_summary}.")
+        for row in excluded[:5]:
+            name = row.get("device_name") or f"Device {row.get('device_id')}"
+            lines.append(f"- {name} (ID {row.get('device_id')}): {row.get('reason') or 'readings unavailable'}.")
     if data.get("truncated_device_scan"):
         lines.append("The device list was truncated, so this may not include every device in the site.")
     if data.get("truncated_readings"):
         lines.append("Some readings were truncated, so a device's highest value may be understated.")
     return "\n".join(lines)
+
+
+def summarize_latest_telemetry(data: dict, arguments: dict | None = None) -> str:
+    requested_metrics = (arguments or {}).get("metrics")
+    metric = str((requested_metrics[0] if isinstance(requested_metrics, list) and requested_metrics else None) or (arguments or {}).get("metric") or "requested metric")
+    device_id = (arguments or {}).get("device_id")
+    series_rows = first_list(data, ("series", "rows", "items", "readings", "results"))
+    candidates = []
+    for series in series_rows:
+        if not isinstance(series, dict):
+            continue
+        series_metric = str(first_value(series, ("metric", "source_metric", "name")) or metric)
+        points = series.get("points") if isinstance(series.get("points"), list) else [series]
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            value = chart_value(point, ("value", "reading", "last", "latest", "frequency", "frequency_hz"))
+            if value is None:
+                continue
+            timestamp = first_value(point, ("timestamp", "time", "datetime", "recorded_at", "last_seen"))
+            parsed = parse_datetime(timestamp) if timestamp else None
+            candidates.append((parsed or datetime.min.replace(tzinfo=timezone.utc), value, timestamp, series_metric, point.get("unit") or series.get("unit")))
+    if not candidates:
+        scope = f" for device {device_id}" if device_id is not None else ""
+        return f"DaxView returned no {metric} readings{scope} in the latest telemetry result."
+    _, value, timestamp, series_metric, unit = max(candidates, key=lambda item: item[0])
+    unit = unit or data.get("unit")
+    label = f"{series_metric}{f' ({unit})' if unit else ''}"
+    return f"Latest {label} reading for device {device_id if device_id is not None else ''}: {format_number(value, 4)}{f' {unit}' if unit else ''}" + (f", recorded at {format_display_timestamp(timestamp)}." if timestamp else "; timestamp not returned.")
 
 
 def summarize_demand_peak(data: dict, message: str, arguments: dict | None = None) -> str:
@@ -2973,6 +3019,8 @@ def summarize_historical_answer(
         return summarize_top_consumers(data, arguments, message)
     if operation_id == "telemetry_metric_ranking":
         return summarize_metric_ranking(data, message, arguments)
+    if operation_id == "latest_telemetry_snapshot":
+        return summarize_latest_telemetry(data, arguments)
     if operation_id == "site_energy_summary":
         return summarize_site_energy(data, message, arguments)
     if operation_id == "alarm_frequency_summary":
@@ -3169,7 +3217,26 @@ def ensure_historical_answer_coverage(
     for item in results:
         operation_id = item.get("operation_id")
         data = historical_result_data(item.get("result") or {})
-        if operation_id == "site_device_list":
+        if operation_id == "latest_telemetry_snapshot":
+            latest_match = re.search(r"^Latest .* reading[^:]*:\s*([\d,]+(?:\.\d+)?)", deterministic_answer, re.MULTILINE)
+            expected_value = latest_match.group(1) if latest_match else None
+            if expected_value and expected_value not in model_answer:
+                log_event("historical_answer_coverage_fallback", request_id=request_id, missing_items="latest_telemetry_value")
+                return deterministic_answer
+        elif operation_id == "telemetry_metric_ranking":
+            rows = first_list(data, ("ranked_devices", "rankings", "devices"))
+            expected = rows[:min(len(rows), requested_top_limit(message) or 3)]
+            for row in expected:
+                name = str(row.get("device_name") or "").strip()
+                value = format_number(row.get("value"), 4)
+                if (name and name.casefold() not in model_answer.casefold()) or value not in model_answer:
+                    log_event("historical_answer_coverage_fallback", request_id=request_id, missing_items="frequency_ranking")
+                    return deterministic_answer
+            excluded = first_list(data, ("excluded_devices",))
+            if excluded and str(len(excluded)) not in model_answer:
+                log_event("historical_answer_coverage_fallback", request_id=request_id, missing_items="frequency_exclusions")
+                return deterministic_answer
+        elif operation_id == "site_device_list":
             rows = first_list(data, ("devices", "rows", "items", "meters"))
             expected = [
                 str(row.get("device_name") or row.get("name") or row.get("meter_name") or "").strip()
@@ -3701,9 +3768,51 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
                     "unit": row.get("unit") or "Hz",
                     "highest_at": row.get("peak_time") or "",
                     "status": row.get("status") or "",
+                    "data_status": row.get("data_status") or "",
+                    "last_seen": row.get("last_seen") or "",
+                    "samples": row.get("sample_count"),
+                    "result": "Ranked",
+                    "reason": "",
+                })
+            excluded_rows = first_list(data, ("excluded_devices",))
+            for row in excluded_rows[:max(0, 100 - len(rows))]:
+                if not isinstance(row, dict):
+                    continue
+                rows.append({
+                    "rank": "",
+                    "device": row.get("device_name") or f"Device {row.get('device_id', '')}",
+                    "device_id": row.get("device_id"),
+                    "frequency": "",
+                    "unit": "",
+                    "highest_at": "",
+                    "status": row.get("status") or "",
+                    "data_status": row.get("data_status") or "",
+                    "last_seen": row.get("last_seen") or "",
+                    "samples": "",
+                    "result": "Excluded",
+                    "reason": row.get("reason") or "Readings unavailable",
                 })
             title = "Frequency Ranking"
-            columns = [("rank", "#"), ("device", "Device"), ("device_id", "Device ID"), ("frequency", "Frequency"), ("unit", "Unit"), ("highest_at", "Highest at"), ("status", "Status")]
+            columns = [("rank", "Rank"), ("device", "Device"), ("device_id", "Device ID"), ("frequency", "Highest frequency"), ("unit", "Unit"), ("highest_at", "Occurred at"), ("samples", "Samples"), ("status", "Device status"), ("data_status", "Data freshness"), ("last_seen", "Last seen"), ("result", "Ranking result"), ("reason", "Exclusion reason")]
+        elif operation_id == "latest_telemetry_snapshot":
+            source_rows = first_list(data, ("series", "rows", "items", "readings", "results"))
+            for series in source_rows[:100]:
+                if not isinstance(series, dict):
+                    continue
+                points = series.get("points") if isinstance(series.get("points"), list) else [series]
+                valid_points = [point for point in points if isinstance(point, dict) and chart_value(point, ("value", "reading", "last", "latest", "frequency", "frequency_hz")) is not None]
+                if not valid_points:
+                    continue
+                point = max(valid_points, key=lambda p: parse_datetime(first_value(p, ("timestamp", "time", "datetime", "recorded_at"))) or datetime.min.replace(tzinfo=timezone.utc))
+                rows.append({
+                    "device_id": arguments.get("device_id"),
+                    "metric": first_value(series, ("metric", "source_metric", "name")) or "",
+                    "value": chart_value(point, ("value", "reading", "last", "latest", "frequency", "frequency_hz")),
+                    "unit": point.get("unit") or series.get("unit") or "",
+                    "timestamp": first_value(point, ("timestamp", "time", "datetime", "recorded_at")) or "",
+                })
+            title = "Latest Telemetry Reading"
+            columns = [("device_id", "Device ID"), ("metric", "Metric"), ("value", "Value"), ("unit", "Unit"), ("timestamp", "Recorded at")]
         elif operation_id == "site_device_list":
             source_rows = first_list(data, ("devices", "rows", "items", "meters"))
             for row in source_rows[:100]:
@@ -4397,10 +4506,13 @@ def run_device_metric_ranking(turn_id: str, message: str, context: dict, request
                 or "frequency" in str(row.get("source_metric") or row.get("name") or "").lower()
             ) and row.get("enabled") is not False and str(row.get("status") or "ok").lower() in {"ok", "available", "supported"}), None)
             if not match:
-                excluded.append({"device_id": int(device_id), "device_name": device_name, "reason": "No configured frequency metric"})
+                excluded.append({"device_id": int(device_id), "device_name": device_name, "status": device.get("status") or device.get("data_status"), "last_seen": device.get("last_seen"), "data_status": device.get("data_status"), "reason": "No configured frequency metric"})
                 continue
 
             metric_name = str(match.get("source_metric") or match.get("metric") or metric)
+            start_dt = parse_datetime(time_window.get("start") or time_window.get("start_time"))
+            end_dt = parse_datetime(time_window.get("end") or time_window.get("end_time"))
+            range_duration = (end_dt - start_dt) if start_dt and end_dt else timedelta(days=8)
             request_args = {
                 **base,
                 "device_id": int(device_id),
@@ -4408,7 +4520,7 @@ def run_device_metric_ranking(turn_id: str, message: str, context: dict, request
                 "start_time": time_window.get("start") or time_window.get("start_time"),
                 "end_time": time_window.get("end") or time_window.get("end_time"),
                 "timezone": time_window.get("timezone") or "Asia/Kuala_Lumpur",
-                "bucket": "1d",
+                "bucket": "raw" if range_duration <= timedelta(days=7) else "1h",
                 "aggregation": "max",
                 "value_mode": "measured",
                 "limit": 1000,
@@ -4434,10 +4546,14 @@ def run_device_metric_ranking(turn_id: str, message: str, context: dict, request
                     timestamp = first_value(point, ("timestamp", "time", "bucket", "date", "start_time"))
                     candidates.append((float(value) * factor, timestamp))
             if not candidates:
-                excluded.append({"device_id": int(device_id), "device_name": device_name, "reason": "No numeric readings with a recognized Hz or kHz unit"})
+                excluded.append({"device_id": int(device_id), "device_name": device_name, "status": device.get("status") or device.get("data_status"), "last_seen": device.get("last_seen"), "data_status": device.get("data_status"), "reason": "No numeric readings with a recognized Hz or kHz unit"})
                 continue
 
-            highest, peak_time = max(candidates, key=lambda item: item[0])
+            positive_candidates = [item for item in candidates if item[0] > 0]
+            if not positive_candidates:
+                excluded.append({"device_id": int(device_id), "device_name": device_name, "status": device.get("status") or device.get("data_status"), "last_seen": device.get("last_seen"), "data_status": device.get("data_status"), "reason": "No positive frequency readings"})
+                continue
+            highest, peak_time = max(positive_candidates, key=lambda item: item[0])
             ranked.append({
                 "device_id": int(device_id),
                 "device_name": device_name,
@@ -4446,12 +4562,16 @@ def run_device_metric_ranking(turn_id: str, message: str, context: dict, request
                 "peak_time": format_display_timestamp(peak_time) if peak_time else None,
                 "sample_count": len(candidates),
                 "status": device.get("status") or device.get("data_status"),
+                "data_status": device.get("data_status"),
+                "last_seen": device.get("last_seen"),
+                "age_seconds": device.get("age_seconds"),
+                "expected_interval_seconds": device.get("expected_interval_seconds"),
                 "metric": metric_name,
                 "truncated": bool(values_data.get("truncated")) or any(bool(row.get("truncated")) for row in series_rows if isinstance(row, dict)),
             })
         except Exception as error:
             log_event("metric_device_rank_step_failed", request_id=request_id, device_id=device_id, metric=metric, error=str(error))
-            excluded.append({"device_id": int(device_id), "device_name": device_name, "reason": "Frequency readings unavailable"})
+            excluded.append({"device_id": int(device_id), "device_name": device_name, "status": device.get("status") or device.get("data_status"), "last_seen": device.get("last_seen"), "data_status": device.get("data_status"), "reason": "Frequency readings unavailable"})
 
     ranked.sort(key=lambda row: row["value"], reverse=True)
     data = {
