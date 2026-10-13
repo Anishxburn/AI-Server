@@ -1864,6 +1864,8 @@ def execute_authorized_internal_operation(
                 ("device_data", "energy_rows"): "device_energy_breakdown",
                 ("alarm_data", "frequency"): "alarm_frequency_summary",
                 ("site_summary", "overview"): "site_metadata_summary",
+                ("device_data", "list"): "site_device_list",
+                ("alarm_data", "active"): "active_alarm_summary",
             }.get((tool_name, normalized["operation"]), internal_operation)
         records.append({
             "operation_id": record_operation,
@@ -2331,7 +2333,7 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
     has_specific_dates = bool(requested_date_set)
     has_specific_months = bool(requested_months)
     include_range_summary = wants_relative_summary(message)
-    lines = ["Site energy summary returned by Daxview MCP:"]
+    lines = ["Site energy summary:"]
     summary_keys = ("total", "total_value", "value", "total_kwh", "consumption", "energy")
     total_value = next((data.get(key) for key in summary_keys if data.get(key) is not None), None)
     if total_value is not None and not has_specific_dates and not has_specific_months:
@@ -2476,9 +2478,9 @@ def summarize_alarm_frequency(data: dict, arguments: dict | None = None, message
     rows = rows if isinstance(rows, list) else []
     latest_requested = bool(re.search(r"\b(?:latest|most recent)\b", message, re.IGNORECASE))
     lines = [
-        "Latest alarm occurrences returned by Daxview MCP:"
+        "Latest alarm occurrences:"
         if latest_requested
-        else "Alarm frequency summary returned by Daxview MCP:"
+        else "Alarm frequency summary:"
     ]
     if not rows:
         lines.append("No alarm rows were returned for this site and time range.")
@@ -2696,7 +2698,7 @@ def summarize_meter_status(data: dict) -> str:
 
 def summarize_generic_tool(operation_id: str, data: dict) -> str:
     title = operation_id.replace("_", " ").title()
-    lines = [f"{title} returned by DaxView MCP:"]
+    lines = [f"{title}:"]
     if not data:
         lines.append("No structured data was returned.")
         return "\n".join(lines)
@@ -2943,7 +2945,7 @@ def summarize_historical_answer(
         return summarize_site_metadata(data)
     if operation_id == "site_device_list":
         return summarize_site_devices(data)
-    if operation_id == "meter_status_summary":
+    if operation_id in {"meter_status_summary", "site_device_list"}:
         return summarize_meter_status(data)
     if operation_id == "demand_peak_summary":
         return summarize_demand_peak(data, message, arguments)
@@ -3407,7 +3409,7 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
         for row in rows[:10]:
             if not isinstance(row, dict):
                 continue
-            value = chart_value(row, ("count", "frequency", "total", "value"))
+            value = chart_value(row, ("event_count", "occurrence_count", "alarm_count", "count", "frequency", "total", "value"))
             if value is not None:
                 labels.append(chart_label(row, "alarm"))
                 values.append(value)
@@ -3421,7 +3423,7 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
                 labels.append(label)
                 values.append(value)
         return build_chart_spec("bar", "Active Alarm Counts (total includes severities)", labels, values, "alarm(s)", "Alarms")
-    if operation_id == "meter_status_summary":
+    if operation_id in {"meter_status_summary", "site_device_list"}:
         labels = []
         values = []
         for key, label in (("online_count", "Online"), ("offline_count", "Offline"), ("stale_count", "Stale"), ("unknown_count", "Unknown")):
@@ -3441,6 +3443,19 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
             values = list(counts.values())
         return build_chart_spec("donut", "Meter Status", labels, values, "device(s)", "Devices")
     if operation_id == "demand_peak_summary":
+        ranked_devices = first_list(data, ("ranked_devices", "rankings", "devices"))
+        if ranked_devices:
+            labels = []
+            values = []
+            for row in ranked_devices[:10]:
+                if not isinstance(row, dict):
+                    continue
+                value = chart_value(row, ("peak_kw", "max_demand_kw", "maximum_demand_kw", "max_kw"))
+                if value is not None:
+                    labels.append(chart_label(row, "device"))
+                    values.append(value)
+            if labels:
+                return build_chart_spec("bar", "Peak Demand by Device", labels, values, "kW", "Maximum demand")
         rows = first_list(data, ("rows", "items", "peaks", "series"))
         labels = []
         values = []
@@ -3591,6 +3606,36 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
                 })
             title = "Device Energy Ranking"
             columns = [("rank", "#"), ("device", "Device"), ("device_id", "Device ID"), ("value", "Energy"), ("unit", "Unit"), ("status", "Status")]
+        elif operation_id == "demand_peak_summary":
+            source_rows = first_list(data, ("ranked_devices", "rankings", "devices", "rows", "peaks"))
+            for rank, row in enumerate(source_rows[:100], 1):
+                if not isinstance(row, dict):
+                    continue
+                peak = first_value(row, ("peak_kw", "max_demand_kw", "maximum_demand_kw", "peak_demand_kw", "max_kw", "value"))
+                if peak is None:
+                    continue
+                device_id = first_value(row, ("device_id", "id", "meter_id"))
+                rows.append({
+                    "rank": rank,
+                    "device": first_value(row, ("device_name", "name", "meter_name")) or (f"Device {device_id}" if device_id is not None else ""),
+                    "device_id": device_id,
+                    "maximum_demand": peak,
+                    "unit": row.get("unit") or "kW",
+                    "peak_time": first_value(row, ("peak_time", "peak_at", "timestamp", "max_time", "max_at")),
+                })
+            if not rows:
+                peak = first_value(data, ("peak_kw", "max_demand_kw", "maximum_demand_kw", "peak_demand_kw", "max_kw"))
+                if peak is not None:
+                    rows.append({
+                        "rank": 1,
+                        "device": first_value(data, ("device_name", "name")) or "",
+                        "device_id": first_value(data, ("device_id", "id")),
+                        "maximum_demand": peak,
+                        "unit": data.get("unit") or "kW",
+                        "peak_time": first_value(data, ("peak_time", "peak_at", "timestamp", "max_time", "max_at")),
+                    })
+            title = "Maximum Demand Ranking" if len(rows) > 1 else "Maximum Demand"
+            columns = [("rank", "#"), ("device", "Device"), ("device_id", "Device ID"), ("maximum_demand", "Maximum demand"), ("unit", "Unit"), ("peak_time", "Peak time")]
         elif operation_id == "site_device_list":
             source_rows = first_list(data, ("devices", "rows", "items", "meters"))
             for row in source_rows[:100]:
@@ -3636,6 +3681,19 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
                 })
             title = "Site Energy by Period"
             columns = [("period", "Period"), ("value", "Energy"), ("unit", "Unit")]
+        elif operation_id == "site_metadata_summary":
+            site = data.get("site") if isinstance(data.get("site"), dict) else data
+            fields = (
+                ("Site", first_value(site, ("name", "site_name"))),
+                ("Site ID", first_value(site, ("id", "site_id"))),
+                ("Timezone", first_value(site, ("timezone", "timezone_name"))),
+                ("Location", first_value(site, ("location", "address", "city"))),
+                ("Buildings", first_value(data, ("building_count", "total_buildings"))),
+                ("Devices", first_value(data, ("device_count", "total_devices"))),
+            )
+            rows = [{"detail": label, "value": value} for label, value in fields if value not in (None, "")]
+            title = "Site Overview"
+            columns = [("detail", "Detail"), ("value", "Value")]
 
         if rows:
             display_timezone = arguments.get("timezone") or AI_DISPLAY_TIMEZONE
@@ -3820,6 +3878,14 @@ def follow_up_metric_from_message(message: str) -> str | None:
 def resolve_follow_up_message(turn_id: str, message: str, context: dict, conversation_id: str, request_id: str) -> tuple[str, dict]:
     previous = previous_daxview_turn(conversation_id, turn_id)
     if not previous or not previous.get("user_message"):
+        if is_follow_up_message(message):
+            debug_trace_event(
+                "daxview_follow_up_context_missing",
+                request_id=request_id,
+                turn_id=turn_id,
+                conversation_id=conversation_id,
+                reason="no_prior_turn_in_same_conversation",
+            )
         return message, context
     previous_message = str(previous["user_message"])
     previous_answer = str(previous.get("assistant_reply") or "")
@@ -3883,6 +3949,29 @@ def resolve_follow_up_message(turn_id: str, message: str, context: dict, convers
                 "", prior_question, flags=re.IGNORECASE,
             )
         resolved = f"{message}. Regarding {prior_question}"
+    if is_follow_up_message(message) and reusable and not select_historical_operations(resolved):
+        prior_operations = []
+        for planned in previous_plan.get("tools", []) if isinstance(previous_plan.get("tools"), list) else []:
+            if not isinstance(planned, dict):
+                continue
+            name = str(planned.get("tool") or "")
+            arguments = planned.get("arguments") if isinstance(planned.get("arguments"), dict) else {}
+            operation = arguments.get("operation")
+            if name in {
+                "site_device_list", "telemetry_metric_catalog", "telemetry_timeseries", "demand_peak_summary",
+                "site_energy_summary", "device_energy_breakdown", "device_energy_ranking", "telemetry_top_consumers",
+                "active_alarm_summary", "alarm_frequency_summary", "alarm_detail_lookup", "site_metadata_summary",
+                "meter_status_summary", "power_quality_summary", "report_summary",
+            }:
+                intent = name
+            elif name in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
+                intent = internal_for_public_operation(name, operation)
+            else:
+                intent = ""
+            if intent and intent not in prior_operations:
+                prior_operations.append(intent)
+        if prior_operations:
+            merged_context["_follow_up_operation_ids"] = prior_operations
     log_event(
         "daxview_follow_up_resolved",
         request_id=request_id,
@@ -3890,6 +3979,32 @@ def resolve_follow_up_message(turn_id: str, message: str, context: dict, convers
         previous_turn_id=str(previous.get("id")),
     )
     return resolved, merged_context
+
+
+def answer_presentation(message: str, operation_ids: list[str], results: list[dict], charts: list[dict], tables: list[dict]) -> dict:
+    """Classify the response so clients can present it as an answer, ranking, or report."""
+    lowered = message.lower()
+    result_operations = {str(item.get("operation_id") or "") for item in results}
+    if "report_summary" in operation_ids or any(term in lowered for term in ("report", "management summary", "site health summary")):
+        kind = "report"
+    elif result_operations & {"demand_peak_summary", "device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers"} or re.search(r"\b(?:top|rank|ranking)\b", lowered):
+        kind = "ranking"
+    elif result_operations & {"active_alarm_summary", "alarm_frequency_summary", "alarm_detail_lookup"}:
+        kind = "alarm_summary"
+    elif result_operations & {"site_metadata_summary", "site_device_list", "meter_status_summary", "site_energy_summary"}:
+        kind = "site_summary"
+    elif result_operations & {"telemetry_timeseries", "power_quality_summary"}:
+        kind = "trend"
+    else:
+        kind = "answer"
+    return {
+        "type": kind,
+        "show_chart": bool(charts),
+        "show_table": bool(tables),
+        "sections": list(dict.fromkeys(
+            str(table.get("title") or "Data") for table in tables if isinstance(table, dict)
+        )),
+    }
 
 
 def historical_argument_clarification(error: ValueError, operation_id: str) -> str:
@@ -4405,6 +4520,14 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     if clarification:
         return {"provider": "daxview-question-filter", "reply": clarification, "resolved_plan": resolved_plan_for_result("clarification", [], context)}
     operation_ids, context, planner_plan = choose_historical_operations(message, context, turn_id, session_id, request_id)
+    if not operation_ids and context.get("_follow_up_operation_ids"):
+        operation_ids = []
+        for operation in context["_follow_up_operation_ids"]:
+            try:
+                public_tool_for_internal(operation)
+            except ValueError:
+                continue
+            operation_ids.append(operation)
     debug_trace_event(
         "daxview_tool_selection_debug",
         request_id=request_id,
@@ -4450,10 +4573,13 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         refined_reply = refine_historical_answer_with_model(message, demand_results, deterministic_reply, request_id)
         charts = build_charts_from_historical_results(demand_results)
         tables = build_tables_from_historical_results(demand_results, message)
+        presentation = answer_presentation(message, operation_ids, demand_results, charts, tables)
         return {
             "provider": "daxview-historical-mcp",
             "reply": refined_reply,
             "charts": charts,
+            "tables": tables,
+            "presentation": presentation,
             "debug_charts": charts,
             "debug_tables": tables,
             "resolved_plan": resolved_plan_for_result("ok", operation_ids, context, demand_results),
@@ -4473,10 +4599,13 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         refined_reply = refine_historical_answer_with_model(message, ranked_results, deterministic_reply, request_id)
         charts = build_charts_from_historical_results(ranked_results)
         tables = build_tables_from_historical_results(ranked_results, message)
+        presentation = answer_presentation(message, operation_ids, ranked_results, charts, tables)
         return {
             "provider": "daxview-historical-mcp",
             "reply": refined_reply,
             "charts": charts,
+            "tables": tables,
+            "presentation": presentation,
             "debug_charts": charts,
             "debug_tables": tables,
             "resolved_plan": resolved_plan_for_result("ok", ["demand_peak_summary"], context, ranked_results),
@@ -4487,10 +4616,13 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         refined_reply = refine_historical_answer_with_model(message, device_results, deterministic_reply, request_id)
         charts = build_charts_from_historical_results(device_results)
         tables = build_tables_from_historical_results(device_results, message)
+        presentation = answer_presentation(message, operation_ids, device_results, charts, tables)
         return {
             "provider": "daxview-historical-mcp",
             "reply": refined_reply,
             "charts": charts,
+            "tables": tables,
+            "presentation": presentation,
             "debug_charts": charts,
             "debug_tables": tables,
             "resolved_plan": resolved_plan_for_result("ok", ["demand_peak_summary"], context, device_results),
@@ -4596,6 +4728,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     charts = build_charts_from_historical_results(results)
     preview_charts = charts if charts else build_charts_from_historical_results(results, preview=True)
     tables = build_tables_from_historical_results(results, message)
+    presentation = answer_presentation(message, operation_ids, results, charts, tables)
     debug_trace_event(
         "ai_final_response_debug",
         request_id=request_id,
@@ -4608,6 +4741,8 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         "provider": "daxview-historical-mcp",
         "reply": refined_reply,
         "charts": charts,
+        "tables": tables,
+        "presentation": presentation,
         "debug_charts": preview_charts,
         "debug_tables": tables,
         "resolved_plan": resolved_plan_for_result("ok" if not errors else "no_data", operation_ids, context, results, errors),
@@ -4694,6 +4829,10 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
         message_event = {"text": result["reply"]}
         if result.get("charts"):
             message_event["charts"] = result["charts"]
+        if result.get("tables"):
+            message_event["tables"] = result["tables"]
+        if result.get("presentation"):
+            message_event["presentation"] = result["presentation"]
         add_job_event(job_id, "message", message_event)
         update_job_status(job_id, "completed")
         add_job_event(job_id, "completed", {"status": "completed"})

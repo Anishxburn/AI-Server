@@ -221,6 +221,10 @@ def build_public_calls(internal_operation: str, arguments: dict, message: str = 
     if internal_operation in {"site_metadata_summary", "report_summary"}:
         if internal_operation == "report_summary":
             calls = [("site_summary", {"operation": "overview", **base, "limit": 100})]
+            calls.extend([
+                ("device_data", {"operation": "list", **base, "limit": 100}),
+                ("alarm_data", {"operation": "active", **base, "status": "open", "limit": 50}),
+            ])
             if start and end:
                 calls.extend([
                     ("site_summary", {"operation": "energy", **window, "bucket": "day", "limit": 100}),
