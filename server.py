@@ -5263,10 +5263,37 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
         add_job_event(job_id, "message", message_event)
         update_job_status(job_id, "completed")
         add_job_event(job_id, "completed", {"status": "completed"})
+        result_tables = result.get("debug_tables") or result.get("tables") or []
+        result_charts = result.get("debug_charts") or result.get("charts") or []
+        presentation = result.get("presentation") or {}
+        plan_tools = (result.get("resolved_plan") or {}).get("tools") or []
+        generation = {
+            "answer": {
+                "builder": "refine_historical_answer_with_model" if AI_REFINE_MCP_WITH_MODEL else "summarize_historical_answers",
+                "model": CHAT_MODEL if AI_REFINE_MCP_WITH_MODEL else "deterministic",
+            },
+            "inputs": {"selected_operations_and_arguments": plan_tools},
+            "charts": {
+                "builder": "build_charts_from_historical_results / chart_from_historical_result",
+                "count": len(result_charts),
+                "specs": result_charts,
+            },
+            "tables": {
+                "builder": "build_tables_from_historical_results",
+                "count": len(result_tables),
+                "tables": result_tables,
+            },
+            "report": {
+                "builder": "summarize_historical_answers / answer_presentation",
+                "type": presentation.get("type") or "answer",
+                "presentation": presentation,
+                "report_data": result.get("report"),
+            },
+        }
         debug_trace_event(
             "ai_outcome_debug", request_id=request_id, status="completed",
-            answer=result["reply"], charts=result.get("debug_charts") or result.get("charts") or [],
-            tables=result.get("debug_tables") or [],
+            answer=result["reply"], charts=result_charts,
+            tables=result_tables, generation=generation,
             charts_enabled=AI_CHARTS_ENABLED,
         )
         save_turn_memory(turn_id, result["reply"], result.get("resolved_plan") or {})
@@ -6318,7 +6345,15 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       .inspectors { display: grid; gap: 12px; padding: 12px 14px; border-bottom: 1px solid #e5ebf3; }
       .outcome { padding: 14px; border-bottom: 1px solid #e5ebf3; }
       .outcome h3 { margin: 0 0 10px; font-size: 14px; }
-      .outcome-answer { white-space: pre-wrap; line-height: 1.55; font-size: 13px; max-width: 85ch; }
+      .outcome-answer { line-height: 1.6; font-size: 13px; max-width: 90ch; }
+      .answer-section { padding: 0 0 12px; margin: 0 0 12px; border-bottom: 1px solid #e5ebf3; }
+      .answer-section:last-child { border-bottom: 0; margin-bottom: 0; }
+      .answer-heading { margin: 0 0 7px; color: #0f766e; font-size: 13px; font-weight: 750; }
+      .answer-line { margin: 3px 0; overflow-wrap: anywhere; }
+      .answer-line strong { display: inline; color: #172033; }
+      .generation-details { margin-top: 12px; border: 1px solid #dbe3ef; background: #f8fafc; padding: 10px; }
+      .generation-details summary { cursor: pointer; font-size: 12px; font-weight: 700; }
+      .generation-details pre { margin-top: 8px; max-height: 480px; overflow: auto; }
       .outcome-state { margin-top: 10px; padding: 9px 10px; border-left: 3px solid #94a3b8; background: #f8fafc; font-size: 12px; }
       .outcome-state.fail { border-left-color: #ef4444; background: #fef2f2; color: #991b1b; }
       .inspectors h3 { margin: 0 0 8px; font-size: 13px; }
@@ -6460,6 +6495,100 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
           ${payloadHtml ? `<div><h3>Data payloads</h3>${payloadHtml}</div>` : ""}
         </section>`;
       }
+      function appendInlineText(parent, text) {
+        const pattern = /\\*\\*(.+?)\\*\\*/g;
+        let cursor = 0;
+        let match;
+        while ((match = pattern.exec(text)) !== null) {
+          parent.append(document.createTextNode(text.slice(cursor, match.index)));
+          const strong = document.createElement("strong");
+          strong.textContent = match[1];
+          parent.append(strong);
+          cursor = pattern.lastIndex;
+        }
+        parent.append(document.createTextNode(text.slice(cursor)));
+      }
+      function renderReadableAnswer(text) {
+        let normalized = String(text || "").replace(/\\r/g, "");
+        normalized = normalized.replace(/^Site energy summary\\s+Site energy summary:/im, "Site energy summary:");
+        normalized = normalized.replace(/^(Site energy summary:|Active alarms Summary:|telemetry_timeseries(?:\\s+Telemetry Timeseries)?:|Quick read:)\\s*/gim, "$1\\n");
+        normalized = normalized.replace(/^(Top energy-consuming devices)\\s+(?=Device ranking for this site)/gim, "$1\\n");
+        normalized = normalized.replace(/\\s+(?=(?:Site energy summary:|telemetry_timeseries\\b|Active alarms Summary:|Top energy-consuming devices\\b|Quick read:))/gi, "\\n\\n");
+        normalized = normalized.replace(/\\s+(?=(?:Daily values(?: \\([^)]*\\))?:|Total:|Summary:|Latest active alarms:|Device ranking for this site|Showing \\d+ measured|Energy:|Alarms:|Consumption leader:|Data check:|Coverage check:))/g, "\\n");
+        const root = document.createElement("div");
+        root.className = "outcome-answer";
+        const headings = /^(?:Site energy summary:?|telemetry_timeseries(?:\\s+Telemetry Timeseries)?:?|Active alarms(?: Summary)?:?|Top energy-consuming devices:?|Quick read:?)$/i;
+        normalized.split(/\\n\\s*\\n/).filter(section => section.trim()).forEach(sectionText => {
+          const section = document.createElement("section");
+          section.className = "answer-section";
+          const lines = sectionText.split("\\n").filter(line => line.trim());
+          lines.forEach((rawLine, index) => {
+            const line = rawLine.trim();
+            if (headings.test(line) || (index === 0 && line.endsWith(":") && line.length < 48)) {
+              const heading = document.createElement("h4");
+              heading.className = "answer-heading";
+              appendInlineText(heading, line.replace(/:$/, ""));
+              section.append(heading);
+              return;
+            }
+            const row = document.createElement("div");
+            row.className = "answer-line";
+            const labelMatch = line.match(/^([-•]\\s*)?([^:]{1,44}:)(\\s*)(.*)$/);
+            if (labelMatch) {
+              if (labelMatch[1]) row.append(document.createTextNode(labelMatch[1]));
+              const label = document.createElement("strong");
+              appendInlineText(label, labelMatch[2]);
+              row.append(label, document.createTextNode(labelMatch[3]));
+              appendInlineText(row, labelMatch[4]);
+            } else {
+              appendInlineText(row, line);
+            }
+            section.append(row);
+          });
+          root.append(section);
+        });
+        return root;
+      }
+      function tableColumn(column) {
+        if (typeof column === "string") return { key: column, label: column };
+        if (Array.isArray(column)) return { key: column[0], label: column[1] || column[0] };
+        return {
+          key: column?.key || column?.field || column?.name || column?.accessorKey || column?.dataIndex || column?.label || column?.title || "",
+          label: column?.label || column?.title || column?.name || column?.key || column?.field || "",
+        };
+      }
+      function tableCellValue(row, column, index) {
+        let source = row?.data ?? row?.values ?? row?.cells ?? row?.record ?? row;
+        if (Array.isArray(source)) source = source[index];
+        else if (source && typeof source === "object") {
+          const normalize = value => String(value ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+          const aliases = {
+            rank: ["index", "number", "#"], period: ["date", "timestamp", "bucket", "time"],
+            value: ["energy", "reading", "amount", "consumption", "kwh"],
+            device: ["device_name", "meter_name", "name"], device_id: ["deviceid", "meter_id", "id"],
+            alarm: ["alarm_name", "alarm_type", "type", "name"], severity: ["priority"],
+            started_at: ["started", "first_seen", "start_time"], latest: ["latest_occurrence", "last_seen", "last_occurrence", "latest_at"],
+            frequency: ["value", "reading", "frequency_hz"], highest_at: ["peak_time", "timestamp", "time"],
+            maximum_demand: ["peak_kw", "max_demand_kw", "value"],
+          };
+          const wanted = [column.key, column.label, ...(aliases[normalize(column.key)] || [])].map(normalize).filter(Boolean);
+          const actual = Object.keys(source).find(key => wanted.includes(normalize(key)));
+          source = actual !== undefined ? source[actual] : Object.values(source)[index];
+        }
+        if (source && typeof source === "object") source = source.value ?? source.text ?? source.label ?? source.name ?? JSON.stringify(source);
+        return source == null || source === "" ? "—" : source;
+      }
+      function renderGenerationDetails(outcome, final) {
+        const details = outcome?.generation || final?.generation;
+        if (!details) return "";
+        return `<details class="generation-details"><summary>Generation details · charts, tables, and report</summary>
+          <p><strong>Answer:</strong> ${escapeHtml(details.answer?.builder || "not recorded")}${details.answer?.model ? ` · ${escapeHtml(details.answer.model)}` : ""}</p>
+          <p><strong>Inputs:</strong> selected operation IDs and sanitized arguments shown below.</p>
+          <p><strong>Charts:</strong> ${escapeHtml(details.charts?.builder || "not requested")} · ${escapeHtml(details.charts?.count ?? 0)} chart(s).</p>
+          <p><strong>Tables:</strong> ${escapeHtml(details.tables?.builder || "not requested")} · ${escapeHtml(details.tables?.count ?? 0)} table(s).</p>
+          <p><strong>Report/presentation:</strong> ${escapeHtml(details.report?.builder || "not generated")} · ${escapeHtml(details.report?.type || "no report type recorded")}.</p>
+          <pre>${escapeHtml(JSON.stringify(details, null, 2))}</pre></details>`;
+      }
       function renderOutcome(events) {
         const outcome = events.find(event => event.event === "ai_outcome_debug" || event.event === "sandbox_outcome_debug");
         const final = events.find(event => event.event === "ai_final_response_debug");
@@ -6470,6 +6599,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         const charts = outcome?.charts || final?.charts || [];
         const tables = outcome?.tables || final?.tables || [];
         const report = outcome?.report || null;
+        const generationHtml = renderGenerationDetails(outcome, final);
         const error = outcome?.error || failed?.error || "";
         const unavailableCode = unavailable?.error_code || (/DAXVIEW_UNAVAILABLE/.test(error) ? "DAXVIEW_UNAVAILABLE" : "");
         const chartExpected = events.some(event => event.event === "sandbox_outcome_debug" ||
@@ -6486,27 +6616,11 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
           </div>`;
         }).join("");
         const tableItems = tables.map(table => {
-          const columns = Array.isArray(table.columns) ? table.columns : [];
+          const columns = Array.isArray(table.columns) ? table.columns.map(tableColumn) : [];
           const rows = Array.isArray(table.rows) ? table.rows : [];
           const heading = `<tr>${columns.map(column => `<th scope="col">${escapeHtml(column.label || column.key || "")}</th>`).join("")}</tr>`;
           const body = rows.map(row => `<tr>${columns.map((column, index) => {
-            const wanted = String(column.key || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-            const sourceRow = row && !Array.isArray(row) ? (row.data || row.values || row) : row;
-            const aliases = {
-              rank: ["index", "number"], alarm: ["alarm_name", "alarm_type", "type", "name"],
-              device: ["device_name", "meter_name"], severity: ["priority"],
-              first_seen: ["first_occurrence", "started_at"], latest: ["latest_occurrence", "last_seen", "last_occurrence", "latest_at"],
-              occurrences: ["event_count", "occurrence_count", "frequency", "count"],
-              active: ["active_count"], acknowledged: ["acknowledged_count"],
-              resolved: ["resolved_count"], closed: ["closed_count"], alarm_id: ["alarm_event_id", "event_id"],
-            };
-            const candidateKeys = [column.key, ...(aliases[column.key] || [])].map(key => String(key).toLowerCase().replace(/[^a-z0-9]/g, ""));
-            const actualKey = sourceRow && !Array.isArray(sourceRow)
-              ? Object.keys(sourceRow).find(key => candidateKeys.includes(key.toLowerCase().replace(/[^a-z0-9]/g, "")))
-              : null;
-            const value = sourceRow?.[column.key] ?? (actualKey ? sourceRow[actualKey] : Array.isArray(sourceRow) ? sourceRow[index] : null);
-            const display = value == null || value === "" ? "" : typeof value === "object" ? JSON.stringify(value) : value;
-            return `<td>${escapeHtml(display)}</td>`;
+            return `<td>${escapeHtml(tableCellValue(row, column, index))}</td>`;
           }).join("")}</tr>`).join("");
           const range = table.time_range || {};
           const rangeText = range.start_time || range.end_time
@@ -6525,10 +6639,11 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         else if (chartExpected && !charts.length) state = "No numeric chart data was available for this answer.";
         return `<section class="outcome"><h3>Outcome preview</h3>
           ${fallback ? `<div class="outcome-state">Model refinement unavailable; showing the calculated fallback.</div>` : ""}
-          ${answer ? `<div class="outcome-answer">${escapeHtml(answer)}</div>` : ""}
+          ${answer ? renderReadableAnswer(answer).outerHTML : ""}
           ${tableItems ? `<div class="table-grid">${tableItems}</div>` : ""}
           ${chartItems ? `<div class="chart-grid">${chartItems}</div>` : ""}
           ${report ? `<details><summary>Report structure</summary><pre>${escapeHtml(JSON.stringify(report, null, 2))}</pre></details>` : ""}
+          ${generationHtml}
           ${state ? `<div class="outcome-state ${unavailableCode || error ? "fail" : ""}">${escapeHtml(state)}</div>` : ""}
         </section>`;
       }
