@@ -3043,6 +3043,96 @@ def summarize_historical_answer(
     return summarize_generic_tool(operation_id, data)
 
 
+def summarize_result_takeaway(results: list[dict]) -> str:
+    """Add a short, data-grounded overview after a multi-part site answer."""
+    by_operation = {
+        item.get("operation_id"): item
+        for item in results
+        if isinstance(item, dict) and item.get("operation_id")
+    }
+    lines = []
+    energy_item = by_operation.get("site_energy_summary")
+    energy_data = historical_result_data(energy_item.get("result") or {}) if energy_item else {}
+    energy_days = []
+    if energy_data:
+        buckets = first_list(energy_data, ("buckets", "rows", "series", "data"))
+        for row in buckets:
+            if not isinstance(row, dict):
+                continue
+            stamp = first_value(row, ("timestamp", "bucket", "start", "date"))
+            value = chart_value(row, ("value", "kwh", "energy", "total_kwh"))
+            label = local_bucket_date(stamp, "Asia/Kuala_Lumpur") if isinstance(stamp, str) else None
+            if label and value is not None:
+                energy_days.append((label, value))
+    energy_days.sort()
+    if len(energy_days) >= 2:
+        low_day, low_value = min(energy_days, key=lambda item: item[1])
+        high_day, high_value = max(energy_days, key=lambda item: item[1])
+        latest_day, latest_value = energy_days[-1]
+        previous_day, previous_value = energy_days[-2]
+        change = percentage_difference(latest_value, previous_value)
+        change_text = (
+            f" The latest returned day ({latest_day}) is {format_number(abs(change), 1)}% "
+            f"{'above' if latest_value > previous_value else 'below' if latest_value < previous_value else 'the same as'} {previous_day}."
+            if change is not None else ""
+        )
+        lines.append(
+            f"- Energy: highest daily use was {format_energy_value(high_value, 1.0, 'kWh', 2)} on {high_day}; "
+            f"lowest was {format_energy_value(low_value, 1.0, 'kWh', 2)} on {low_day}.{change_text}"
+        )
+
+    alarm_item = by_operation.get("active_alarm_summary")
+    alarm_data = historical_result_data(alarm_item.get("result") or {}) if alarm_item else {}
+    if alarm_data:
+        active = first_value(alarm_data, ("active_count", "total_active"))
+        critical = first_value(alarm_data, ("critical_count", "critical"))
+        warning = first_value(alarm_data, ("warning_count", "warning"))
+        if active is not None:
+            alarm_line = f"- Alarms: {format_number(active, 0)} active"
+            if critical is not None:
+                alarm_line += f", including {format_number(critical, 0)} critical"
+            if warning is not None:
+                alarm_line += f" and {format_number(warning, 0)} warning"
+            alarm_line += ". Prioritize the listed critical/offline alarms for review." if (critical or 0) > 0 else "."
+            lines.append(alarm_line)
+
+    ranking_item = next((
+        item for item in results
+        if item.get("operation_id") in {"device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers"}
+    ), None)
+    ranking_data = historical_result_data(ranking_item.get("result") or {}) if ranking_item else {}
+    if ranking_data:
+        measured, _ = ranked_consumer_rows(ranking_data)
+        if measured:
+            row, value = measured[0]
+            name = row.get("device_name") or row.get("name") or row.get("label") or f"Device {row.get('device_id', 'unknown')}"
+            lines.append(f"- Consumption leader: {name} is highest among the returned devices at {format_number(value, 2)} kWh for the selected period.")
+            total = first_value(energy_data, ("total", "total_value", "value", "total_kwh", "consumption", "energy"))
+            top_five_sum = sum(amount for _, amount in measured[:5])
+            if isinstance(total, (int, float)) and total > 0 and top_five_sum > 0 and total / top_five_sum > 100:
+                lines.append(
+                    f"- Data check: the site total ({format_number(total, 2)} kWh) is much larger than the returned top-five total ({format_number(top_five_sum, 2)} kWh). Confirm the time range, meter scope, and units before comparing them directly."
+                )
+
+    telemetry_item = by_operation.get("telemetry_timeseries")
+    if telemetry_item and energy_days:
+        telemetry_data = historical_result_data(telemetry_item.get("result") or {})
+        telemetry_rows = first_list(telemetry_data, ("series", "rows", "items"))
+        timestamps = [
+            parse_datetime(first_value(row, ("last_seen", "last_timestamp", "timestamp")))
+            for row in telemetry_rows if isinstance(row, dict)
+        ]
+        timestamps = [stamp for stamp in timestamps if stamp]
+        if timestamps:
+            latest_telemetry_day = max(timestamps).astimezone(timezone(timedelta(hours=8))).date().isoformat()
+            if energy_days[-1][0] > latest_telemetry_day:
+                lines.append(
+                    f"- Coverage check: the daily energy list reaches {energy_days[-1][0]}, while the detailed telemetry timestamp reaches {latest_telemetry_day}; verify the newest day's completeness."
+                )
+
+    return "Quick read:\n" + "\n".join(lines) if lines else ""
+
+
 def summarize_historical_answers(
     message: str,
     results: list[dict],
@@ -3144,6 +3234,9 @@ def summarize_historical_answers(
             item.get("arguments"),
         )
         sections.append(f"{title}\n{summary}")
+    takeaway = summarize_result_takeaway(results)
+    if takeaway:
+        sections.append(takeaway)
     return "\n\n".join(sections)
 
 
