@@ -6377,6 +6377,9 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       .table-debug { margin: 8px 10px; }
       .table-debug summary { color: #475569; cursor: pointer; font-size: 11px; }
       .table-debug pre { margin-top: 6px; max-height: 260px; overflow: auto; }
+      .table-raw-preview { margin: 8px 10px; }
+      .table-raw-preview strong { font-size: 11px; color: #475569; }
+      .table-raw-preview pre { margin-top: 5px; max-height: 220px; overflow: auto; }
       .table-scroll { overflow: auto; max-width: 100%; max-height: 360px; }
       .data-table { border-collapse: collapse; width: 100%; font-size: 12px; white-space: nowrap; }
       .data-table th, .data-table td { padding: 7px 9px; border-bottom: 1px solid #e5ebf3; text-align: left; color: #172033 !important; }
@@ -6633,6 +6636,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
           return `<section class="table-item"><header class="table-item-head"><strong>${escapeHtml(table.title || "Data")}</strong>
             <span class="table-meta">${escapeHtml(table.source_tool || "MCP")} · ${escapeHtml(rows.length)} shown${table.row_count != null ? ` of ${escapeHtml(table.row_count)}` : ""}${truncated}${rangeText}</span></header>
             <div class="table-scroll"><table class="data-table"><thead>${heading || "<tr><th>Data</th></tr>"}</thead><tbody>${body}</tbody></table></div>
+            <div class="table-raw-preview"><strong>Raw row data (first 5 records)</strong><pre>${escapeHtml(JSON.stringify(rows.slice(0, 5), null, 2))}</pre></div>
             <details class="table-debug"><summary>Inspect raw table payload</summary><pre>${escapeHtml(JSON.stringify({columns: table.columns, sample_rows: rows.slice(0, 3), row_count: table.row_count}, null, 2))}</pre></details></section>`;
         }).join("");
         let state = "";
