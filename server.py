@@ -6374,6 +6374,9 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       .table-item-head { padding: 9px 10px; border-bottom: 1px solid #e5ebf3; display: flex; justify-content: space-between; gap: 12px; align-items: baseline; background: #f8fafc; color: #172033; }
       .table-item-head strong { font-size: 12px; }
       .table-meta { color: #64748b; font-size: 11px; }
+      .table-debug { margin: 8px 10px; }
+      .table-debug summary { color: #475569; cursor: pointer; font-size: 11px; }
+      .table-debug pre { margin-top: 6px; max-height: 260px; overflow: auto; }
       .table-scroll { overflow: auto; max-width: 100%; max-height: 360px; }
       .data-table { border-collapse: collapse; width: 100%; font-size: 12px; white-space: nowrap; }
       .data-table th, .data-table td { padding: 7px 9px; border-bottom: 1px solid #e5ebf3; text-align: left; color: #172033 !important; }
@@ -6621,7 +6624,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
           const heading = `<tr>${columns.map(column => `<th scope="col">${escapeHtml(column.label || column.key || "")}</th>`).join("")}</tr>`;
           const body = rows.map(row => `<tr>${columns.map((column, index) => {
             return `<td>${escapeHtml(tableCellValue(row, column, index))}</td>`;
-          }).join("")}</tr>`).join("");
+          }).join("")}</tr>`).join("") || `<tr><td colspan="${Math.max(columns.length, 1)}">No rows were returned for this table.</td></tr>`;
           const range = table.time_range || {};
           const rangeText = range.start_time || range.end_time
             ? ` · ${escapeHtml(range.start_time || "")} – ${escapeHtml(range.end_time || "")}${range.timezone ? ` (${escapeHtml(range.timezone)})` : ""}`
@@ -6629,7 +6632,8 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
           const truncated = table.truncated ? " · truncated" : "";
           return `<section class="table-item"><header class="table-item-head"><strong>${escapeHtml(table.title || "Data")}</strong>
             <span class="table-meta">${escapeHtml(table.source_tool || "MCP")} · ${escapeHtml(rows.length)} shown${table.row_count != null ? ` of ${escapeHtml(table.row_count)}` : ""}${truncated}${rangeText}</span></header>
-            <div class="table-scroll"><table class="data-table"><thead>${heading}</thead><tbody>${body}</tbody></table></div></section>`;
+            <div class="table-scroll"><table class="data-table"><thead>${heading || "<tr><th>Data</th></tr>"}</thead><tbody>${body}</tbody></table></div>
+            <details class="table-debug"><summary>Inspect raw table payload</summary><pre>${escapeHtml(JSON.stringify({columns: table.columns, sample_rows: rows.slice(0, 3), row_count: table.row_count}, null, 2))}</pre></details></section>`;
         }).join("");
         let state = "";
         if (unavailableCode) state = `DaxView returned ${unavailableCode}. There are no historical values to plot for this request.`;
