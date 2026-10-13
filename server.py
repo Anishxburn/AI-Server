@@ -1026,7 +1026,9 @@ def planner_default_intents(message: str, tools: list[str]) -> list[str]:
     lowered = message.lower()
     defaults = []
     if "device_data" in tools:
-        if wants_device_usage_ranking(message):
+        if re.search(r"\b(?:maximum demand|max demand|peak demand|highest demand|maximum kw|max kw|peak kw|highest kw)\b", lowered):
+            defaults.append("demand_peak_summary")
+        elif wants_device_usage_ranking(message):
             defaults.append("device_energy_breakdown")
         elif any(term in lowered for term in ("available metric", "what metrics", "supports voltage", "supports current")) or (
             "metric" in lowered and any(term in lowered for term in ("available", "support", "which", "what"))
@@ -1058,6 +1060,10 @@ def select_historical_operations(message: str) -> list[str]:
     if explicit_tool:
         return [explicit_tool]
     lowered = message.lower()
+    if re.search(r"\b(?:maximum demand|max demand|peak demand|highest demand|maximum kw|max kw|peak kw|highest kw)\b", lowered):
+        return ["demand_peak_summary"]
+    if re.search(r"\b(?:maximum|highest|peak)\b", lowered) and re.search(r"\b(?:power|kw|watt)\b", lowered):
+        return ["demand_peak_summary"]
     # The word "list" is common in alarm requests; resolve alarm intent before
     # the generic device-inventory heuristic can claim the request.
     asks_for_other_data = any(
@@ -1254,7 +1260,13 @@ def choose_historical_operations(message: str, context: dict, turn_id: str, sess
         plan, latency_ms = plan_turn_with_llm(message, history, context, request_id)
         planned_context = planner_slot_context(message, context, plan)
         planned_public_tools = [tool for tool in plan.tools if tool in DAXVIEW_ALLOWED_HISTORICAL_TOOLS]
-        planned_tools = [intent for intent in regex_operations if public_tool_for_internal(intent)[0] in planned_public_tools]
+        demand_intent = "demand_peak_summary" in regex_operations
+        if demand_intent and "device_data" in planned_public_tools:
+            # A timed-out/ambiguous planner must not replace deterministic demand routing
+            # with a generic device inventory request.
+            planned_tools = ["demand_peak_summary"]
+        else:
+            planned_tools = [intent for intent in regex_operations if public_tool_for_internal(intent)[0] in planned_public_tools]
         if not planned_tools:
             planned_tools = planner_default_intents(message, planned_public_tools)
         if AI_PLANNER_SHADOW_MODE or not AI_PLANNER_ENABLED:
@@ -3919,6 +3931,8 @@ def readable_historical_errors(errors: list[dict]) -> str:
             parts.append(f"{label} returned no data for the requested scope and time range.")
         elif "UNAVAILABLE" in error:
             parts.append(f"{label} is currently unavailable from DaxView.")
+        elif "404" in error or "NOT FOUND" in error.upper():
+            parts.append("The DaxView MCP endpoint returned HTTP 404. Check that DAXVIEW_MCP_URL points to the deployed /mcp endpoint and that the MCP service is available.")
         else:
             parts.append(f"{label} could not be retrieved: {error}")
     return " ".join(parts)
@@ -3995,8 +4009,11 @@ def run_highest_demand_device_ranking(turn_id: str, message: str, context: dict,
         **({"device_id": int(context["device_id"])} if context.get("device_id") else {}),
         "limit": DEMAND_RANKING_MAX_DEVICES + 1,
     })
-    device_result = call_authorized_internal_operation(turn_id, "site_device_list", device_args, request_id, message)
     normalized_args = build_public_calls("site_device_list", device_args, message)[0][1]
+    device_plan = request_daxview_data_plan(turn_id, "device_data", normalized_args, request_id)
+    device_result = call_authorized_historical_tool(
+        "device_data", str(device_plan["authorization_id"]), normalized_args, request_id
+    )
     device_data = historical_result_data(device_result)
     devices = first_list(device_data, ("devices", "rows", "items", "meters"))
     selectable = [device for device in devices if isinstance(device, dict) and (device.get("device_id") or device.get("id") or device.get("meter_id"))]
@@ -4021,7 +4038,11 @@ def run_highest_demand_device_ranking(turn_id: str, message: str, context: dict,
         try:
             device_context = {**context, "device_id": int(device_id)}
             metric_args = build_historical_arguments("telemetry_metric_catalog", device_context, message)
-            metric_result = call_authorized_internal_operation(turn_id, "telemetry_metric_catalog", metric_args, request_id, message)
+            public_metric_args = build_public_calls("telemetry_metric_catalog", metric_args, message)[0][1]
+            metric_plan = request_daxview_data_plan(turn_id, "device_data", public_metric_args, request_id)
+            metric_result = call_authorized_historical_tool(
+                "device_data", str(metric_plan["authorization_id"]), public_metric_args, request_id
+            )
             metric_data = historical_result_data(metric_result)
             metric_rows = first_list(metric_data, ("metrics", "rows", "items", "series"))
             eligible = []
@@ -4053,8 +4074,10 @@ def run_highest_demand_device_ranking(turn_id: str, message: str, context: dict,
             source_metric = metric_row.get("metric") or metric_row.get("source_metric") or "demand"
             if metric_kind == "demand":
                 peak_args = build_historical_arguments("demand_peak_summary", device_context, message)
-                per_result = call_authorized_internal_operation(turn_id, "demand_peak_summary", peak_args, request_id, message)
                 per_args = build_public_calls("demand_peak_summary", peak_args, message)[0][1]
+                per_plan = request_daxview_data_plan(turn_id, "device_data", per_args, request_id)
+                per_args = normalize_mcp_arguments("device_data", per_plan.get("arguments") or per_args)
+                per_result = call_authorized_historical_tool("device_data", str(per_plan["authorization_id"]), per_args, request_id)
             else:
                 is_energy_delta = metric_kind == "energy"
                 peak_args = build_historical_arguments("telemetry_timeseries", {
@@ -4065,8 +4088,10 @@ def run_highest_demand_device_ranking(turn_id: str, message: str, context: dict,
                     "value_mode": "consumption_delta" if is_energy_delta else "measured",
                     "limit": 2000,
                 }, message)
-                per_result = call_authorized_internal_operation(turn_id, "telemetry_timeseries", peak_args, request_id, message)
                 per_args = build_public_calls("telemetry_timeseries", peak_args, message)[0][1]
+                per_plan = request_daxview_data_plan(turn_id, "device_data", per_args, request_id)
+                per_args = normalize_mcp_arguments("device_data", per_plan.get("arguments") or per_args)
+                per_result = call_authorized_historical_tool("device_data", str(per_plan["authorization_id"]), per_args, request_id)
 
             per_data = historical_result_data(per_result)
             if metric_kind == "active_power":
@@ -4406,6 +4431,33 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         return result
     context.setdefault("_time_window", completed_daily_range(message) or requested_historical_range(message))
     save_resolved_turn_context(turn_id, context)
+    if "demand_peak_summary" in operation_ids:
+        if not context.get("device_id") and not wants_highest_demand_device(message):
+            result = build_device_choice_response(turn_id, message, context, request_id)
+            result["resolved_plan"] = resolved_plan_for_result("clarification", operation_ids, context)
+            return result
+        demand_results = run_highest_demand_device_ranking(turn_id, message, context, request_id)
+        if demand_results and demand_results[0].get("clarification"):
+            return {
+                "provider": "daxview-question-filter",
+                "reply": demand_results[0]["clarification"],
+                "input_type": "select",
+                "choices": demand_results[0].get("choices") or [],
+                "submit_template": "max demand for device ID {value} for the same period",
+                "resolved_plan": resolved_plan_for_result("clarification", operation_ids, context, demand_results),
+            }
+        deterministic_reply = summarize_historical_answers(message, demand_results, request_id)
+        refined_reply = refine_historical_answer_with_model(message, demand_results, deterministic_reply, request_id)
+        charts = build_charts_from_historical_results(demand_results)
+        tables = build_tables_from_historical_results(demand_results, message)
+        return {
+            "provider": "daxview-historical-mcp",
+            "reply": refined_reply,
+            "charts": charts,
+            "debug_charts": charts,
+            "debug_tables": tables,
+            "resolved_plan": resolved_plan_for_result("ok", operation_ids, context, demand_results),
+        }
     if wants_highest_demand_device(message) and not context.get("device_id"):
         ranked_results = run_highest_demand_device_ranking(turn_id, message, context, request_id)
         if ranked_results and ranked_results[0].get("clarification"):

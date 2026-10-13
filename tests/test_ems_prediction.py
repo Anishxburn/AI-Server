@@ -61,6 +61,9 @@ def load_functions():
         "validate_tool_arguments": validate_tool_arguments,
         "public_tool_for_internal": public_tool_for_internal,
         "build_public_calls": build_public_calls,
+        "normalize_mcp_arguments": __import__("contracts.mcp_manifest", fromlist=["normalize_mcp_arguments"]).normalize_mcp_arguments,
+        "request_daxview_data_plan": Mock(return_value={"authorization_id": "authorized"}),
+        "call_authorized_historical_tool": Mock(return_value={}),
         "DEMAND_RANKING_MAX_DEVICES": 20,
         "AI_CHAT_MEMORY_ENABLED": False,
         "MONTH_NAMES": next(
@@ -859,19 +862,19 @@ class EmsPredictionTests(unittest.TestCase):
         }
 
         def call(turn_id, operation, arguments, request_id, message=""):
-            if operation == "site_device_list":
+            if operation == "device_data" and arguments["operation"] == "list":
                 return {"data": {"devices": [
                     {"device_id": 519, "device_name": "Main Meter", "status": "online"},
                     {"device_id": 520, "device_name": "Current-only Meter", "status": "online"},
                     {"device_id": 521, "device_name": "Energy-only Meter", "status": "online"},
                 ], "row_count": 3, "truncated": False}}
-            if operation == "telemetry_metric_catalog" and arguments["device_id"] == 519:
+            if operation == "device_data" and arguments["operation"] == "metrics" and arguments["device_id"] == 519:
                 return {"data": {"metrics": [{"metric": "active_power", "source_metric": "Active Power Total", "unit": "kW", "status": "OK", "enabled": True}]}}
-            if operation == "telemetry_metric_catalog":
+            if operation == "device_data" and arguments["operation"] == "metrics":
                 if arguments["device_id"] == 521:
                     return {"data": {"metrics": [{"metric": "energy", "source_metric": "Active Energy Consumed", "unit": "kWh", "status": "OK", "enabled": True}]}}
                 return {"data": {"metrics": [{"metric": "current", "source_metric": "Current L1", "unit": "A", "status": "OK", "enabled": True}]}}
-            if operation == "telemetry_timeseries":
+            if operation == "device_data" and arguments["operation"] == "values":
                 if arguments["device_id"] == 521:
                     return {"structuredContent": {"data": {"series": [{
                         "metric": "energy", "unit": "kWh", "value_mode": "consumption_delta", "points": [
@@ -887,6 +890,10 @@ class EmsPredictionTests(unittest.TestCase):
             raise AssertionError(f"Unexpected operation: {operation}")
 
         self.env["call_authorized_internal_operation"] = call
+        self.env["request_daxview_data_plan"] = lambda turn, tool, args, request: {"authorization_id": "authorized", "arguments": args}
+        self.env["call_authorized_historical_tool"] = lambda tool, auth, args, request: call(
+            "turn", "device_data", args, "request"
+        )
         self.env["debug_trace_event"] = Mock()
         results = self.env["run_highest_demand_device_ranking"](
             "turn", question, {"site_id": 17, "_time_window": {
