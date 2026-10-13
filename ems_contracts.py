@@ -20,7 +20,7 @@ def question_metrics(message):
     patterns = {
         "demand": r"\b(?:demand|kw)\b", "energy": r"\b(?:energy|kwh|mwh|consumption|usage)\b",
         "voltage": r"\b(?:voltage|volts?|sag|swell)\b", "current": r"\b(?:amperes?|amps?|electrical current|phase current|current trend|current reading)\b",
-        "power_factor": r"\bpower factor\b", "frequency": r"\bfrequency\b", "thd": r"\b(?:thd|harmonics?)\b",
+        "power_factor": r"\bpower factor\b", "frequency": r"\b(?:frequency|hertz|khz|hz)\b", "thd": r"\b(?:thd|harmonics?)\b",
     }
     for metric, pattern in patterns.items():
         if re.search(pattern, text):

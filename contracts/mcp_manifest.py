@@ -49,6 +49,7 @@ def public_tool_for_internal(operation_id: str) -> tuple[str, str]:
         "telemetry_metric_catalog": ("device_data", "metrics"),
         "data_availability_summary": ("device_data", "metrics"),
         "telemetry_timeseries": ("device_data", "values"),
+        "telemetry_metric_ranking": ("device_data", "values"),
         "latest_telemetry_snapshot": ("device_data", "values"),
         "power_quality_summary": ("device_data", "values"),
         "demand_peak_summary": ("device_data", "values"),
@@ -283,20 +284,22 @@ def build_public_calls(internal_operation: str, arguments: dict, message: str = 
         elif arguments.get("alarm_id"):
             result["alarm_id"] = arguments["alarm_id"]
         return [("alarm_data", result)]
-    if internal_operation in {"telemetry_timeseries", "power_quality_summary", "demand_peak_summary", "anomaly_detection_summary"}:
+    if internal_operation in {"telemetry_timeseries", "telemetry_metric_ranking", "power_quality_summary", "demand_peak_summary", "anomaly_detection_summary"}:
         metrics = arguments.get("metrics")
         metric = arguments.get("metric")
         if internal_operation == "demand_peak_summary":
             metric = "demand"
+        elif internal_operation == "telemetry_metric_ranking":
+            metric = arguments.get("metric") or "frequency"
         elif internal_operation == "power_quality_summary":
             metrics = [item for item in ("voltage", "thd", "power_factor") if item in message.lower()]
             metric = None
         if not metrics and not metric:
             metric = "energy"
-        default_bucket = "15m" if internal_operation == "demand_peak_summary" else "1h"
+        default_bucket = "15m" if internal_operation == "demand_peak_summary" else "1d" if internal_operation == "telemetry_metric_ranking" else "1h"
         result = {"operation": "values", **window, "bucket": arguments.get("bucket") or default_bucket,
-                  "aggregation": "max" if internal_operation == "demand_peak_summary" else arguments.get("aggregation") or "auto",
-                  "value_mode": "maximum_demand" if internal_operation == "demand_peak_summary" else arguments.get("value_mode") or "auto",
+                  "aggregation": "max" if internal_operation in {"demand_peak_summary", "telemetry_metric_ranking"} else arguments.get("aggregation") or "auto",
+                  "value_mode": "maximum_demand" if internal_operation == "demand_peak_summary" else "measured" if internal_operation == "telemetry_metric_ranking" else arguments.get("value_mode") or "auto",
                   "limit": min(int(limit or 500), 2000)}
         if metrics:
             result["metrics"] = metrics[:20]
