@@ -3037,15 +3037,10 @@ def summarize_historical_answer(
         return summarize_meter_status(data)
     if operation_id == "demand_peak_summary":
         return summarize_demand_peak(data, message, arguments)
-    if operation_id in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
-        return summarize_generic_tool(operation_id, data)
-    context = {
-        "enabled": True,
-        "tools": [operation_id],
-        "results": [{"tool": operation_id, "result": mcp_result}],
-        "errors": [],
-    }
-    return ask_ollama(message, retrieve_context(message), request_id, context)
+    # MCP tool results have already supplied the facts. Keep a deterministic
+    # summary as the fallback for any internal operation without a specialized
+    # formatter; the Ollama call is optional answer polishing, not a dependency.
+    return summarize_generic_tool(operation_id, data)
 
 
 def summarize_historical_answers(
