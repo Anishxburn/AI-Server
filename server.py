@@ -925,6 +925,151 @@ def wants_device_usage_ranking(message: str) -> bool:
     return has_device and has_usage and has_rank
 
 
+def wants_sitewide_energy_total(message: str) -> bool:
+    lowered = message.lower()
+    asks_kwh = bool(re.search(r"\b(?:kwh|kilowatt[- ]?hours?|energy|consumption|usage)\b", lowered))
+    if not asks_kwh or wants_device_usage_ranking(message):
+        return False
+    asks_sitewide = bool(re.search(
+        r"\b(?:overall|site[- ]wide|whole site|entire site|all devices?|all meters?|all of (?:the )?(?:our )?devices?|total site|site total|"
+        r"total energy|total kwh|combined energy)\b",
+        lowered,
+    ))
+    asks_total = bool(re.search(r"\b(?:overall|total|sum|combined)\b", lowered))
+    return asks_sitewide and asks_total
+
+
+DEVICE_REFERENCE_STOPWORDS = {
+    "a", "an", "and", "are", "at", "by", "can", "check", "device", "devices", "for", "get",
+    "give", "how", "i", "in", "is", "it", "last", "me", "meter", "meters", "of", "on", "please",
+    "reading", "show", "the", "this", "to", "today", "tomorrow", "trend", "what", "when", "where",
+    "which", "with", "yesterday", "voltage", "volt", "volts", "current", "amp", "amps", "amperes",
+    "energy", "kwh", "mwh", "consumption", "usage", "demand", "kw", "power", "factor", "frequency",
+    "hz", "thd", "parameter", "parameters", "metric", "metrics", "latest", "recent", "now", "value",
+    "values", "hour", "hours", "day", "days", "week", "weeks", "month", "months", "for", "past",
+    "last", "time", "series", "timeseries", "plot", "chart", "table", "available", "data", "please",
+    "overall", "all", "site", "total", "sitewide", "highest", "top", "rank", "ranking", "consumer",
+    "consumers", "most", "used", "use", "using", "used", "usage",
+}
+
+
+def has_named_device_reference(message: str) -> bool:
+    if requested_device_id(message) is not None:
+        return False
+    tokens = re.findall(r"[a-z0-9]+", message.lower())
+    return any(token not in DEVICE_REFERENCE_STOPWORDS for token in tokens)
+
+
+def wants_named_device_metric_query(message: str) -> bool:
+    return bool(
+        question_metrics(message)
+        and not wants_sitewide_energy_total(message)
+        and not wants_device_usage_ranking(message)
+        and not wants_device_inventory(message)
+        and has_named_device_reference(message)
+    )
+
+
+def normalize_device_name(value: object) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(value or "").lower()))
+
+
+def resolve_named_device_reference(turn_id: str, message: str, context: dict, request_id: str) -> dict:
+    """Resolve a user-facing device name against this site's authorized inventory."""
+    if not context.get("site_id"):
+        return {"status": "clarification", "reply": "Select a site first, then ask for the device by name."}
+    reference_tokens = {
+        token for token in normalize_device_name(message).split()
+        if token not in DEVICE_REFERENCE_STOPWORDS
+    }
+    if not reference_tokens:
+        return {"status": "clarification", "reply": "Which device name should I use?"}
+    try:
+        inventory_context = {key: value for key, value in context.items() if key != "device_id"}
+        inventory_context["limit"] = 100
+        inventory_args = build_historical_arguments("site_device_list", inventory_context)
+        inventory_result = call_authorized_internal_operation(
+            turn_id, "site_device_list", inventory_args, request_id, message
+        )
+        inventory = historical_result_data(inventory_result)
+        devices = first_list(inventory, ("devices", "rows", "items", "meters"))
+    except Exception as error:
+        log_event("device_name_lookup_failed", request_id=request_id, error=str(error))
+        return {
+            "status": "unavailable",
+            "reply": "I couldn't look up device names from the selected site. Please retry after the DaxView device list is available.",
+        }
+
+    matches = []
+    normalized_message = f" {normalize_device_name(message)} "
+    for device in devices:
+        if not isinstance(device, dict):
+            continue
+        name = first_value(device, ("device_name", "name", "meter_name", "label"))
+        device_id = first_value(device, ("device_id", "id", "meter_id"))
+        if not name or device_id is None:
+            continue
+        normalized_name = normalize_device_name(name)
+        name_tokens = set(normalized_name.split())
+        if not name_tokens:
+            continue
+        if f" {normalized_name} " in normalized_message:
+            score = 1.0
+        else:
+            score = len(name_tokens & reference_tokens) / len(name_tokens)
+        if score:
+            matches.append((score, str(name), device_id, device))
+    matches.sort(key=lambda item: (-item[0], item[1].lower()))
+    if not matches:
+        return {
+            "status": "clarification",
+            "reply": "I couldn't match that name to a device at this site. Please use the device name as it appears in the device list.",
+        }
+
+    top_score = matches[0][0]
+    close_matches = [item for item in matches if item[0] >= max(0.45, top_score - 0.1)]
+    unique_top = len(close_matches) == 1
+    if top_score >= 0.72 and unique_top:
+        score, name, device_id, device = matches[0]
+        try:
+            numeric_id = int(device_id)
+        except (TypeError, ValueError):
+            numeric_id = None
+        if numeric_id is not None:
+            debug_trace_event(
+                "device_name_resolved_debug",
+                request_id=request_id,
+                device_name=name,
+                device_id=numeric_id,
+                match_score=round(score, 3),
+            )
+            return {"status": "matched", "device_id": numeric_id, "device_name": name}
+
+    candidates = close_matches if len(close_matches) > 1 else matches[:5]
+    choices = []
+    seen_names = set()
+    unique_name_count = len({item[1].lower() for item in candidates})
+    for _, name, device_id, device in candidates:
+        if name.lower() in seen_names:
+            continue
+        seen_names.add(name.lower())
+        detail = str(device.get("status") or device.get("data_status") or "")
+        device_type = device.get("device_type") or device.get("type") or device.get("model")
+        if device_type:
+            detail = f"{detail} · {device_type}" if detail else str(device_type)
+        choices.append({"label": name, "value": str(device_id), "description": detail})
+    if len(close_matches) > 1 or unique_name_count > 1:
+        prompt = "I found several devices with similar names. Which one do you mean?"
+    else:
+        prompt = "I couldn't confidently match that device name. Choose the closest device name or provide a more specific name."
+    debug_trace_event(
+        "device_name_match_ambiguous_debug",
+        request_id=request_id,
+        candidates=[item[1] for item in candidates],
+    )
+    return {"status": "clarification", "reply": prompt, "choices": choices}
+
+
 def wants_lowest_consumer(message: str) -> bool:
     lowered = message.lower()
     return bool(re.search(r"\b(?:lowest|least|minimum|smallest)\b", lowered) and re.search(r"\b(?:device|meter|consumer|energy|consume|consumption|usage)\b", lowered))
@@ -945,7 +1090,8 @@ def wants_device_inventory(message: str) -> bool:
         term in lowered for term in ("energy", "kwh", "consumption", "usage", "demand")
     ):
         return False
-    if wants_device_usage_ranking(message) or wants_highest_demand_device(message):
+    if (wants_device_usage_ranking(message) or wants_highest_demand_device(message)
+            or wants_sitewide_energy_total(message) or wants_named_device_metric_query(message)):
         return False
     if re.search(r"\b(?:top|highest|maximum|peak|rank|ranking)\b", lowered) and question_metrics(message):
         return False
@@ -1060,6 +1206,10 @@ def select_historical_operations(message: str) -> list[str]:
     if explicit_tool:
         return [explicit_tool]
     lowered = message.lower()
+    if wants_sitewide_energy_total(message):
+        return ["site_energy_summary"]
+    if wants_named_device_metric_query(message):
+        return ["telemetry_timeseries"]
     if re.search(r"\b(?:maximum demand|max demand|peak demand|highest demand|maximum kw|max kw|peak kw|highest kw)\b", lowered):
         return ["demand_peak_summary"]
     if re.search(r"\b(?:maximum|highest|peak)\b", lowered) and re.search(r"\b(?:power|kw|watt)\b", lowered):
@@ -1129,6 +1279,8 @@ def select_historical_operations(message: str) -> list[str]:
         term in lowered for term in ("top consumer", "top device", "by device", "which device")
     ) and not wants_device_usage_ranking(message):
         operations = [name for name in operations if name not in {"device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers"}]
+    if wants_sitewide_energy_total(message):
+        return ["site_energy_summary"]
     if "energy_forecast" in operations and not any(
         term in lowered for term in ("compare", "comparison", "difference", "top consumer", "energy summary")
     ):
@@ -1247,7 +1399,7 @@ def planner_slot_context(message: str, context: dict, plan) -> dict:
     if slots.device_refs:
         for ref in slots.device_refs:
             match = re.search(r"\d+", str(ref))
-            if match:
+            if match and not wants_named_device_metric_query(message):
                 merged["device_id"] = int(match.group(0))
                 break
     return merged
@@ -1273,6 +1425,17 @@ def choose_historical_operations(message: str, context: dict, turn_id: str, sess
             request_id=request_id,
             planner_skipped=True,
             reason="deterministic_top_consumer_route",
+            regex_tools=regex_operations,
+            selected_tools=regex_operations,
+            context=context,
+        )
+        return regex_operations, context, None
+    if AI_PLANNER_ENABLED and not AI_PLANNER_SHADOW_MODE and wants_named_device_metric_query(message):
+        debug_trace_event(
+            "planner_intention_debug",
+            request_id=request_id,
+            planner_skipped=True,
+            reason="deterministic_named_device_route",
             regex_tools=regex_operations,
             selected_tools=regex_operations,
             context=context,
@@ -2205,8 +2368,8 @@ def summarize_top_consumers(data: dict, arguments: dict | None = None, message: 
     if measured and (wants_lowest_consumer(message) or wants_top_lowest_sum(message)):
         top_row, top_amount = measured[0]
         low_row, low_amount = measured[-1]
-        top_name = top_row.get("device_name") or top_row.get("name") or top_row.get("label") or f"Device {top_row.get('device_id', 'unknown')}"
-        low_name = low_row.get("device_name") or low_row.get("name") or low_row.get("label") or f"Device {low_row.get('device_id', 'unknown')}"
+        top_name = top_row.get("device_name") or top_row.get("name") or top_row.get("label") or "Unnamed device"
+        low_name = low_row.get("device_name") or low_row.get("name") or low_row.get("label") or "Unnamed device"
         lines.append(f"Direct answer for {time_window}:")
         lines.append(f"- Highest energy-consuming device: {top_name} at {format_number(top_amount, 2)} kWh.")
         lines.append(f"- Lowest energy-consuming device: {low_name} at {format_number(low_amount, 2)} kWh.")
@@ -2226,7 +2389,7 @@ def summarize_top_consumers(data: dict, arguments: dict | None = None, message: 
             row.get("device_name")
             or row.get("name")
             or row.get("label")
-            or f"Device {row.get('device_id', 'unknown')}"
+            or "Unnamed device"
         )
         precision = int(row.get("precision") if isinstance(row.get("precision"), int) else 2)
         value = format_number(amount, precision)
@@ -2370,16 +2533,21 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
     has_specific_dates = bool(requested_date_set)
     has_specific_months = bool(requested_months)
     include_range_summary = wants_relative_summary(message)
-    lines = ["Site energy summary:"]
+    total_only = wants_sitewide_energy_total(message)
+    lines = ["Overall site energy for the requested period:" if total_only else "Site energy summary:"]
     summary_keys = ("total", "total_value", "value", "total_kwh", "consumption", "energy")
     total_value = next((data.get(key) for key in summary_keys if data.get(key) is not None), None)
     if total_value is not None and not has_specific_dates and not has_specific_months:
-        lines.append(f"Total: {format_energy_value(total_value, conversion_factor, display_unit, precision)}.")
+        title = "Total for the requested range" if total_only else "Total"
+        lines.append(f"{title}: {format_energy_value(total_value, conversion_factor, display_unit, precision)}.")
     buckets = data.get("buckets") or data.get("rows") or data.get("series") or data.get("data")
     daily_values = {}
+    daily_kwh_values = {}
     complete_window = completed_daily_range(message) is not None and bool(arguments and arguments.get("bucket") == "day")
     if isinstance(buckets, list) and buckets:
-        if has_specific_months:
+        if total_only:
+            pass
+        elif has_specific_months:
             lines.append("Requested monthly values:")
         else:
             lines.append("Daily values (complete local days):" if complete_window else "Requested daily values:" if has_specific_dates else "Daily values:")
@@ -2391,6 +2559,12 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
             label = local_bucket_date(timestamp, timezone_name) if isinstance(timestamp, str) else None
             label = label or timestamp or "period"
             value = item.get("value") if item.get("value") is not None else item.get("kwh")
+            numeric_value = chart_number(value)
+            if numeric_value is not None:
+                bucket_unit = str(item.get("unit") or unit).lower()
+                to_kwh = {"wh": 0.001, "kwh": 1.0, "mwh": 1000.0, "gwh": 1000000.0}.get(bucket_unit)
+                if to_kwh is not None:
+                    daily_kwh_values[str(label)] = daily_kwh_values.get(str(label), 0.0) + numeric_value * to_kwh
             if complete_window and arguments:
                 start_day = parse_datetime(arguments.get("start"))
                 end_day = parse_datetime(arguments.get("end"))
@@ -2399,13 +2573,13 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
                     last_day = end_day.astimezone(timezone(timedelta(hours=8))).date().isoformat()
                     if not first_day <= str(label) < last_day:
                         continue
-            if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
-                daily_values[str(label)] = float(value)
+        if numeric_value is not None:
+            daily_values[str(label)] = numeric_value
             if has_specific_months:
                 continue
             if has_specific_dates and not include_range_summary and str(label) not in requested_date_set:
                 continue
-            if shown_rows < 31:
+            if shown_rows < 31 and not total_only:
                 row_unit = item.get("unit") or unit
                 row_factor, row_display_unit, row_precision = requested_energy_unit(message, row_unit)
                 lines.append(f"- {label}: {format_energy_value(value, row_factor, row_display_unit, row_precision if row_factor != 1.0 else precision)}")
@@ -2414,6 +2588,13 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
             lines.append(f"Showing 31 of {len(daily_values)} daily row(s).")
     elif total_value is None:
         lines.append("No energy values were returned for this site and time range.")
+    if total_only and total_value is None and daily_kwh_values:
+        total_kwh = sum(daily_kwh_values.values())
+        total_factor, total_unit, total_precision = requested_energy_unit(message, "kWh")
+        lines.append(
+            f"Total across returned readings: "
+            f"{format_energy_value(total_kwh, total_factor, total_unit, total_precision)}."
+        )
     if data.get("complete") is False:
         lines.append("Completeness: the MCP marked this requested energy range incomplete; treat totals as partial evidence.")
     wants_highest, wants_lowest = requested_energy_extrema(message)
@@ -2503,7 +2684,7 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
     coverage_note = format_coverage_note(data)
     if coverage_note:
         lines.append(coverage_note)
-    compliance_note = format_compliance_context(build_compliance_context(message, ["site_energy_summary"]))
+    compliance_note = "" if total_only else format_compliance_context(build_compliance_context(message, ["site_energy_summary"]))
     if compliance_note:
         lines.append("")
         lines.append(compliance_note)
@@ -2544,9 +2725,8 @@ def summarize_alarm_frequency(data: dict, arguments: dict | None = None, message
         count = next((row[key] for key in ("event_count", "count", "frequency", "total", "value") if row.get(key) is not None), None)
         detail = f"{index}. {name} - {format_number(count, 0)} occurrence(s)"
         device_name = row.get("device_name")
-        device_id = row.get("device_id")
-        if device_name or device_id is not None:
-            detail += f"; device {device_name or ''}" + (f" (ID {device_id})" if device_id is not None else "")
+        if device_name:
+            detail += f"; device {device_name}"
         if row.get("severity"):
             detail += f", severity {row['severity']}"
         first_seen = row.get("first_seen")
@@ -2640,7 +2820,7 @@ def summarize_site_metadata(data: dict) -> str:
     return "\n".join(lines)
 
 
-def summarize_site_devices(data: dict) -> str:
+def summarize_site_devices(data: dict, message: str = "") -> str:
     devices = first_list(data, ("devices", "rows", "items", "meters"))
     lines = []
     total = data.get("device_count") or data.get("meter_count") or data.get("row_count") or len(devices)
@@ -2648,54 +2828,52 @@ def summarize_site_devices(data: dict) -> str:
         scope = data.get("building_name") or data.get("site_name")
         lines.append(f"Scope: {scope}")
     if total:
-        lines.append(f"Total devices returned: {total}")
+        lines.append(f"{total} device(s) found.")
     if not devices:
         lines.append("No devices were returned.")
         return "\n".join(lines)
 
+    lowered = message.lower()
+    wants_status = bool(re.search(r"\b(?:status|online|offline|stale|reporting|last seen)\b", lowered))
+    wants_parameters = bool(re.search(r"\b(?:parameter|parameters|metric|metrics|capabilities|supported data|available data|what data)\b", lowered))
     status_counts: dict[str, int] = {}
     for device in devices:
         if isinstance(device, dict):
             status = str(device.get("status") or device.get("connection_status") or device.get("state") or "unknown")
             status_counts[status] = status_counts.get(status, 0) + 1
-    if status_counts:
+    if status_counts and wants_status:
         lines.append("Status counts:")
         for status, count in sorted(status_counts.items()):
             lines.append(f"- {status.title()}: {count}")
 
-    lines.append("Sample devices:")
-    for index, device in enumerate(devices[:10], 1):
+    shown = min(len(devices), 20)
+    lines.append("Devices:")
+    for index, device in enumerate(devices[:shown], 1):
         if not isinstance(device, dict):
             lines.append(f"- {index}. {device}")
             continue
         status = str(device.get("status") or device.get("connection_status") or device.get("state") or "unknown")
         name = device.get("device_name") or device.get("name") or device.get("meter_name") or "Unnamed device"
-        device_id = device.get("device_id") or device.get("id") or device.get("meter_id") or "unknown"
-        device_type = device.get("device_type") or device.get("type") or device.get("model")
         last_seen = device.get("last_updated") or device.get("last_seen") or device.get("last_telemetry_at")
         metrics = first_value(device, (
             "supported_metrics", "metrics", "metric_names", "telemetry_metrics",
             "parameters", "parameter_names", "available_parameters", "capabilities",
         ))
-        details = [f"ID {device_id}", status.title()]
-        if device_type:
-            details.append(str(device_type))
-        if device.get("has_data") is not None:
-            details.append(f"has data {device.get('has_data')}")
-        if last_seen:
-            details.append(f"last seen {last_seen}")
-        lines.append(f"- {index}. {name} ({', '.join(details)})")
-        if metrics:
+        detail = f" — {status.title()}" if wants_status else ""
+        if wants_status and last_seen and "last seen" in lowered:
+            detail += f", last seen {format_display_timestamp(str(last_seen), AI_DISPLAY_TIMEZONE)}"
+        lines.append(f"- {name}{detail}")
+        if wants_parameters and metrics:
             if isinstance(metrics, list):
                 metric_text = ", ".join(str(item) for item in metrics[:12])
                 if len(metrics) > 12:
                     metric_text += f", +{len(metrics) - 12} more"
             else:
                 metric_text = str(metrics)
-            lines.append(f"  Parameters: {metric_text}")
+            lines.append(f"  Available parameters: {metric_text}")
 
-    if len(devices) > 10:
-        lines.append(f"Showing 10 of {len(devices)} device(s).")
+    if len(devices) > shown:
+        lines.append(f"Showing {shown} of {len(devices)} device(s).")
     return "\n".join(lines)
 
 
@@ -2723,11 +2901,10 @@ def summarize_meter_status(data: dict) -> str:
             lines.append(f"- {index}. {row}")
             continue
         name = row.get("device_name") or row.get("name") or "Unnamed device"
-        device_id = row.get("device_id") or row.get("id") or "unknown"
         status = row.get("status") or row.get("data_status") or "unknown"
         last_seen = row.get("last_seen") or row.get("last_updated") or row.get("last_telemetry_at")
         last_seen_text = f", last seen {last_seen}" if last_seen else ""
-        lines.append(f"- {index}. {name} (ID {device_id}) - {status}{last_seen_text}")
+        lines.append(f"- {index}. {name} - {status}{last_seen_text}")
     if len(rows) > len(focus_rows):
         lines.append(f"Showing {len(focus_rows)} of {len(rows)} device(s).")
     return "\n".join(lines)
@@ -2742,11 +2919,8 @@ def summarize_generic_tool(operation_id: str, data: dict) -> str:
 
     scalar_keys = (
         "status",
-        "site_id",
         "site_name",
-        "building_id",
         "building_name",
-        "device_id",
         "device_name",
         "metric",
         "unit",
@@ -2791,7 +2965,6 @@ def summarize_generic_tool(operation_id: str, data: dict) -> str:
     if rows:
         lines.append("Rows:")
         preferred_row_keys = (
-            "device_id",
             "device_name",
             "name",
             "metric",
@@ -2836,7 +3009,7 @@ def summarize_generic_tool(operation_id: str, data: dict) -> str:
                     break
             if len(parts) < 10:
                 for key, value in row.items():
-                    if key in used_keys or value is None or isinstance(value, (dict, list)):
+                    if key in used_keys or key.lower() in {"device_id", "meter_id", "deviceid", "meterid", "site_id", "building_id", "id"} or value is None or isinstance(value, (dict, list)):
                         continue
                     parts.append(f"{key}={value}")
                     if len(parts) >= 10:
@@ -2861,7 +3034,7 @@ def summarize_metric_ranking(data: dict, message: str, arguments: dict | None = 
     limit = len(rows) if show_all else requested_top_limit(message) or 10
     for rank, row in enumerate(rows[:limit], 1):
         lines.append(
-            f"{rank}. {row.get('device_name') or 'Device'} (ID {row.get('device_id')}): "
+            f"{rank}. {row.get('device_name') or 'Unnamed device'}: "
             f"{format_number(row.get('value'), 4)} Hz"
             + (f"; highest at {row['peak_time']}" if row.get("peak_time") else "")
             + (f"; {row['status']}" if row.get("status") else "")
@@ -2877,8 +3050,8 @@ def summarize_metric_ranking(data: dict, message: str, arguments: dict | None = 
         reason_summary = "; ".join(f"{count} {reason.lower()}" for reason, count in reasons.items())
         lines.append(f"{len(excluded)} device(s) were excluded: {reason_summary}.")
         for row in excluded[:5]:
-            name = row.get("device_name") or f"Device {row.get('device_id')}"
-            lines.append(f"- {name} (ID {row.get('device_id')}): {row.get('reason') or 'readings unavailable'}.")
+            name = row.get("device_name") or "Unnamed device"
+            lines.append(f"- {name}: {row.get('reason') or 'readings unavailable'}.")
     if data.get("truncated_device_scan"):
         lines.append("The device list was truncated, so this may not include every device in the site.")
     if data.get("truncated_readings"):
@@ -2907,12 +3080,15 @@ def summarize_latest_telemetry(data: dict, arguments: dict | None = None) -> str
             parsed = parse_datetime(timestamp) if timestamp else None
             candidates.append((parsed or datetime.min.replace(tzinfo=timezone.utc), value, timestamp, series_metric, point.get("unit") or series.get("unit")))
     if not candidates:
-        scope = f" for device {device_id}" if device_id is not None else ""
+        device_name = (arguments or {}).get("_device_name")
+        scope = f" for {device_name}" if device_name else ""
         return f"DaxView returned no {metric} readings{scope} in the latest telemetry result."
     _, value, timestamp, series_metric, unit = max(candidates, key=lambda item: item[0])
     unit = unit or data.get("unit")
     label = f"{series_metric}{f' ({unit})' if unit else ''}"
-    return f"Latest {label} reading for device {device_id if device_id is not None else ''}: {format_number(value, 4)}{f' {unit}' if unit else ''}" + (f", recorded at {format_display_timestamp(timestamp)}." if timestamp else "; timestamp not returned.")
+    device_name = (arguments or {}).get("_device_name")
+    scope = f" for {device_name}" if device_name else ""
+    return f"Latest {label} reading{scope}: {format_number(value, 4)}{f' {unit}' if unit else ''}" + (f", recorded at {format_display_timestamp(timestamp)}." if timestamp else "; timestamp not returned.")
 
 
 def summarize_demand_peak(data: dict, message: str, arguments: dict | None = None) -> str:
@@ -2930,7 +3106,7 @@ def summarize_demand_peak(data: dict, message: str, arguments: dict | None = Non
                     diff = f" ({format_number(pct, 1)}% below top)"
             status = f", {row.get('status')}" if row.get("status") else ""
             lines.append(
-                f"{index}. {row.get('device_name') or 'Device'} (ID {row.get('device_id')}): "
+                f"{index}. {row.get('device_name') or 'Unnamed device'}: "
                 f"{format_number(row.get('peak_kw'), 2)} kW{diff}{status}"
                 + (f", peak at {row['peak_time']}" if row.get("peak_time") else "")
                 + (f", metric {row['metric']}" if row.get("metric") else "")
@@ -2943,7 +3119,7 @@ def summarize_demand_peak(data: dict, message: str, arguments: dict | None = Non
         if excluded:
             lines.append(f"Excluded {len(excluded)} device(s) with unsupported metrics, missing readings, or unusable units.")
             for row in excluded[:5]:
-                name = row.get("device_name") or f"Device {row.get('device_id')}"
+                name = row.get("device_name") or "Unnamed device"
                 lines.append(f"- {name}: {row.get('reason') or 'not eligible'}.")
         if data.get("truncated_device_scan"):
             lines.append("The device inventory was truncated; this is not a complete site-wide ranking.")
@@ -2958,7 +3134,8 @@ def summarize_demand_peak(data: dict, message: str, arguments: dict | None = Non
         source = next((row for row in rows if isinstance(row, dict) and first_value(row, peak_keys) is not None), summary)
     device_id = first_value(source, ("device_id", "meter_id")) or (arguments or {}).get("device_id")
     device_name = first_value(source, ("device_name", "meter_name", "name"))
-    heading = f"Max demand for {device_name or f'device ID {device_id}'}" if device_id or device_name else "Max demand"
+    device_name = device_name or (arguments or {}).get("_device_name")
+    heading = f"Max demand for {device_name}" if device_name else "Max demand"
     lines = [f"{heading} (historical, {format_time_window(data, arguments)}):"]
     peak = first_value(source, peak_keys)
     if peak is None:
@@ -3049,7 +3226,7 @@ def summarize_historical_answer(
     if operation_id == "site_metadata_summary":
         return summarize_site_metadata(data)
     if operation_id == "site_device_list":
-        return summarize_site_devices(data)
+        return summarize_site_devices(data, message)
     if operation_id in {"meter_status_summary", "site_device_list"}:
         return summarize_meter_status(data)
     if operation_id == "demand_peak_summary":
@@ -3122,7 +3299,7 @@ def summarize_result_takeaway(results: list[dict]) -> str:
         measured, _ = ranked_consumer_rows(ranking_data)
         if measured:
             row, value = measured[0]
-            name = row.get("device_name") or row.get("name") or row.get("label") or f"Device {row.get('device_id', 'unknown')}"
+            name = row.get("device_name") or row.get("name") or row.get("label") or "Unnamed device"
             lines.append(f"- Consumption leader: {name} is highest among the returned devices at {format_number(value, 2)} kWh for the selected period.")
             total = first_value(energy_data, ("total", "total_value", "value", "total_kwh", "consumption", "energy"))
             top_five_sum = sum(amount for _, amount in measured[:5])
@@ -3207,9 +3384,9 @@ def summarize_historical_answers(
             matched = by_id.get(str(device_id)) if device_id is not None else None
             if device_id is not None:
                 ranked_ids.add(str(device_id))
-            name = row.get("device_name") or row.get("name") or f"Device {device_id or 'unknown'}"
+            name = row.get("device_name") or row.get("name") or "Unnamed device"
             status = (matched or {}).get("status") or (matched or {}).get("connection_status") or row.get("status")
-            lines.append(f"{index}. {name} (ID {device_id or 'unknown'}): {status or 'status unavailable'}")
+            lines.append(f"{index}. {name}: {status or 'status unavailable'}")
         if not measured:
             lines.append("No measured devices could be matched to current status.")
         if wants_all_devices(message):
@@ -3219,8 +3396,7 @@ def summarize_historical_answers(
                 lines.append("Other devices (usage not returned, so not ranked):")
                 for device in unranked:
                     name = device.get("device_name") or device.get("name") or "Unnamed device"
-                    device_id = device.get("device_id") or device.get("id") or device.get("meter_id") or "unknown"
-                    lines.append(f"- {name} (ID {device_id})")
+                    lines.append(f"- {name}")
             total = device_data.get("device_count") or device_data.get("row_count") or len(devices)
             if str(total).isdigit() and int(total) > len(devices):
                 lines.append(f"Device inventory returned {len(devices)} of {total} devices; the rest are not shown.")
@@ -3266,6 +3442,8 @@ def refine_historical_answer_with_model(message: str, results: list[dict], deter
     if not AI_REFINE_MCP_WITH_MODEL:
         return format_answer_timestamps(deterministic_answer, display_timezone)
     prompt = build_mcp_refine_prompt(message, results, deterministic_answer, request_id)
+    if wants_sitewide_energy_total(message):
+        return format_answer_timestamps(deterministic_answer, display_timezone)
     primary_answer = ensure_historical_answer_coverage(
         message, results, deterministic_answer,
         run_mcp_refine_model(prompt, request_id, CHAT_MODEL, deterministic_answer, role="primary"),
@@ -3448,6 +3626,8 @@ def build_mcp_refine_prompt(message: str, results: list[dict], deterministic_ans
         "errors": [],
     }
     raw_context = format_daxview_context(mcp_context)
+    if wants_named_device_metric_query(message):
+        raw_context = re.sub(r"\b(?:device_id|meter_id)\s*[:=]\s*\d+", "", raw_context, flags=re.IGNORECASE)
     question_parts = requested_question_parts(message)
     question_plan = "\n".join(f"{index}. {part}" for index, part in enumerate(question_parts, 1))
     library_section = ""
@@ -3467,14 +3647,17 @@ Make it human, clean, and practical.
 Do not invent values, devices, alarms, timestamps, causes, or recommendations not supported by the MCP data.
 Render timestamps as concise local times in the requested/site timezone (for example, "30 Sep 2026, 3:53 PM MYT"). Do not repeat raw ISO timestamps or microseconds in user-facing prose.
 Answer each part of the user's question using the matching tool result. Never present energy consumption as an alarm count.
+Include only the requested metric, device, time range, and necessary data-quality caveat. Do not add supported-parameter lists, unrelated status fields, IDs, or other returned fields unless the user asks for them.
 When valid site-specific data is present, answer from that data; do not claim the user gave no question or ask them to clarify unless the returned data genuinely lacks a required scope or value.
 Do not include standards, protocols, or library background unless the user asks for them.
 For predictions, label every future value as an estimate and retain the method, coverage, and backtest error.
 Answer every numbered request below. If a value was not returned, state that for the affected request.
 When daily values are requested, retain every date and its value from the deterministic draft.
+Do not show internal device IDs in user-facing text or tables. Refer to devices by name; use a device-name choice when the name is ambiguous.
 Keep the answer concise but useful:
 - Start with the direct answer.
 - Use short sections and bullets.
+- For a single-metric question, answer with that metric only; do not turn the response into a device inventory or capability report.
 - Mention the tool/data limitation only if a requested value is missing.
 - Hide backend/internal terms such as MCP, row_count, source_count, aggregation, authorization_id, request_id, and JSON field names.
 - If the user asks for max demand, explain whether the result is site-level, building-level, or device-level based on the data. If device-level detail is missing, say which follow-up question would retrieve it.
@@ -3729,7 +3912,9 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
                 break
         pairs = sorted((label, value) for label, value in pairs if label and value is not None)
         metric = (arguments or {}).get("metric", "Telemetry")
-        return build_chart_spec("line", f"{str(metric).title()} History", [p[0] for p in pairs],
+        device_name = (arguments or {}).get("_device_name")
+        title = f"{device_name} — {str(metric).title()} History" if device_name else f"{str(metric).title()} History"
+        return build_chart_spec("line", title, [p[0] for p in pairs],
                                 [p[1] for p in pairs], str(data.get("unit") or ""), str(metric))
     if operation_id == "energy_forecast":
         rows = first_list(data, ("forecast", "rows", "series", "items"))
@@ -3794,11 +3979,10 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
             table_limit = min(max(int(arguments.get("limit") or 10), 1), 100)
             for rank, row in enumerate(source_rows[:table_limit], 1):
                 device_name = first_value(row, ("device_name", "meter_name", "device"))
-                device_id = first_value(row, ("device_id", "deviceId"))
                 rows.append({
                     "rank": rank,
                     "alarm": first_value(row, ("alarm_name", "alarm_type", "alarm", "name", "type")) or "Alarm",
-                    "device": f"{device_name} (ID {device_id})" if device_name and device_id is not None else device_name or (f"ID {device_id}" if device_id is not None else ""),
+                    "device": device_name or "Unnamed device",
                     "severity": first_value(row, ("severity", "priority")) or "",
                     "occurrences": first_value(row, ("event_count", "occurrence_count", "alarm_count", "count", "frequency")),
                     "first_seen": first_value(row, ("first_seen", "first_occurrence", "started_at")),
@@ -3822,14 +4006,13 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
             for rank, (row, amount) in enumerate(measured[:limit], 1):
                 rows.append({
                     "rank": rank,
-                    "device": row.get("device_name") or row.get("name") or row.get("label") or f"Device {row.get('device_id', '')}",
-                    "device_id": row.get("device_id"),
+                    "device": row.get("device_name") or row.get("name") or row.get("label") or "Unnamed device",
                     "value": amount,
                     "unit": row.get("unit") or data.get("unit") or "kWh",
                     "status": row.get("status") or row.get("device_status") or "",
                 })
             title = "Device Energy Ranking"
-            columns = [("rank", "#"), ("device", "Device"), ("device_id", "Device ID"), ("value", "Energy"), ("unit", "Unit"), ("status", "Status")]
+            columns = [("rank", "#"), ("device", "Device"), ("value", "Energy"), ("unit", "Unit"), ("status", "Status")]
         elif operation_id == "demand_peak_summary":
             source_rows = first_list(data, ("ranked_devices", "rankings", "devices", "rows", "peaks"))
             for rank, row in enumerate(source_rows[:100], 1):
@@ -3841,8 +4024,7 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
                 device_id = first_value(row, ("device_id", "id", "meter_id"))
                 rows.append({
                     "rank": rank,
-                    "device": first_value(row, ("device_name", "name", "meter_name")) or (f"Device {device_id}" if device_id is not None else ""),
-                    "device_id": device_id,
+                    "device": first_value(row, ("device_name", "name", "meter_name")) or "Unnamed device",
                     "maximum_demand": peak,
                     "unit": row.get("unit") or "kW",
                     "peak_time": first_value(row, ("peak_time", "peak_at", "timestamp", "max_time", "max_at")),
@@ -3853,13 +4035,12 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
                     rows.append({
                         "rank": 1,
                         "device": first_value(data, ("device_name", "name")) or "",
-                        "device_id": first_value(data, ("device_id", "id")),
                         "maximum_demand": peak,
                         "unit": data.get("unit") or "kW",
                         "peak_time": first_value(data, ("peak_time", "peak_at", "timestamp", "max_time", "max_at")),
                     })
             title = "Maximum Demand Ranking" if len(rows) > 1 else "Maximum Demand"
-            columns = [("rank", "#"), ("device", "Device"), ("device_id", "Device ID"), ("maximum_demand", "Maximum demand"), ("unit", "Unit"), ("peak_time", "Peak time")]
+            columns = [("rank", "#"), ("device", "Device"), ("maximum_demand", "Maximum demand"), ("unit", "Unit"), ("peak_time", "Peak time")]
         elif operation_id == "telemetry_metric_ranking":
             source_rows = first_list(data, ("ranked_devices", "rankings", "devices"))
             for rank, row in enumerate(source_rows[:100], 1):
@@ -3867,8 +4048,7 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
                     continue
                 rows.append({
                     "rank": rank,
-                    "device": row.get("device_name") or f"Device {row.get('device_id', '')}",
-                    "device_id": row.get("device_id"),
+                    "device": row.get("device_name") or "Unnamed device",
                     "frequency": row.get("value"),
                     "unit": row.get("unit") or "Hz",
                     "highest_at": row.get("peak_time") or "",
@@ -3885,8 +4065,7 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
                     continue
                 rows.append({
                     "rank": "",
-                    "device": row.get("device_name") or f"Device {row.get('device_id', '')}",
-                    "device_id": row.get("device_id"),
+                    "device": row.get("device_name") or "Unnamed device",
                     "frequency": "",
                     "unit": "",
                     "highest_at": "",
@@ -3898,7 +4077,7 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
                     "reason": row.get("reason") or "Readings unavailable",
                 })
             title = "Frequency Ranking"
-            columns = [("rank", "Rank"), ("device", "Device"), ("device_id", "Device ID"), ("frequency", "Highest frequency"), ("unit", "Unit"), ("highest_at", "Occurred at"), ("samples", "Samples"), ("status", "Device status"), ("data_status", "Data freshness"), ("last_seen", "Last seen"), ("result", "Ranking result"), ("reason", "Exclusion reason")]
+            columns = [("rank", "Rank"), ("device", "Device"), ("frequency", "Highest frequency"), ("unit", "Unit"), ("highest_at", "Occurred at"), ("samples", "Samples"), ("status", "Device status"), ("data_status", "Data freshness"), ("last_seen", "Last seen"), ("result", "Ranking result"), ("reason", "Exclusion reason")]
         elif operation_id == "latest_telemetry_snapshot":
             source_rows = first_list(data, ("series", "rows", "items", "readings", "results"))
             for series in source_rows[:100]:
@@ -3910,28 +4089,26 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
                     continue
                 point = max(valid_points, key=lambda p: parse_datetime(first_value(p, ("timestamp", "time", "datetime", "recorded_at"))) or datetime.min.replace(tzinfo=timezone.utc))
                 rows.append({
-                    "device_id": arguments.get("device_id"),
                     "metric": first_value(series, ("metric", "source_metric", "name")) or "",
                     "value": chart_value(point, ("value", "reading", "last", "latest", "frequency", "frequency_hz")),
                     "unit": point.get("unit") or series.get("unit") or "",
                     "timestamp": first_value(point, ("timestamp", "time", "datetime", "recorded_at")) or "",
                 })
             title = "Latest Telemetry Reading"
-            columns = [("device_id", "Device ID"), ("metric", "Metric"), ("value", "Value"), ("unit", "Unit"), ("timestamp", "Recorded at")]
+            columns = [("metric", "Metric"), ("value", "Value"), ("unit", "Unit"), ("timestamp", "Recorded at")]
         elif operation_id == "site_device_list":
             source_rows = first_list(data, ("devices", "rows", "items", "meters"))
             for row in source_rows[:100]:
                 if not isinstance(row, dict):
                     continue
                 rows.append({
-                    "device_id": row.get("device_id"),
                     "device": row.get("device_name") or row.get("name") or row.get("device") or "",
                     "type": row.get("device_type") or row.get("type") or "",
                     "status": row.get("status") or row.get("data_status") or "",
                     "last_seen": row.get("last_seen"),
                 })
             title = "Site Devices"
-            columns = [("device_id", "Device ID"), ("device", "Device"), ("type", "Type"), ("status", "Status"), ("last_seen", "Last seen")]
+            columns = [("device", "Device"), ("type", "Type"), ("status", "Status"), ("last_seen", "Last seen")]
         elif operation_id == "active_alarm_summary":
             source_rows = first_list(data, ("alarms", "rows", "items"))
             for rank, row in enumerate(source_rows[:100], 1):
@@ -3941,13 +4118,12 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
                     "rank": rank,
                     "alarm": row.get("alarm_name") or row.get("name") or "Alarm",
                     "device": row.get("device_name") or "",
-                    "device_id": row.get("device_id"),
                     "severity": row.get("severity") or "",
                     "status": row.get("status") or "",
                     "started_at": row.get("started_at") or row.get("first_seen"),
                 })
             title = "Active Alarms"
-            columns = [("rank", "#"), ("alarm", "Alarm"), ("device", "Device"), ("device_id", "Device ID"), ("severity", "Severity"), ("status", "Status"), ("started_at", "Started")]
+            columns = [("rank", "#"), ("alarm", "Alarm"), ("device", "Device"), ("severity", "Severity"), ("status", "Status"), ("started_at", "Started")]
         elif operation_id == "site_energy_summary":
             source_rows = first_list(data, ("buckets", "rows", "series", "data"))
             for row in source_rows[:100]:
@@ -3967,7 +4143,6 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
             site = data.get("site") if isinstance(data.get("site"), dict) else data
             fields = (
                 ("Site", first_value(site, ("name", "site_name"))),
-                ("Site ID", first_value(site, ("id", "site_id"))),
                 ("Timezone", first_value(site, ("timezone", "timezone_name"))),
                 ("Location", first_value(site, ("location", "address", "city"))),
                 ("Buildings", first_value(data, ("building_count", "total_buildings"))),
@@ -4293,16 +4468,13 @@ def answer_presentation(message: str, operation_ids: list[str], results: list[di
 def historical_argument_clarification(error: ValueError, operation_id: str) -> str:
     detail = str(error).lower()
     if "device_id" in detail:
-        return (
-            "I need the specific device ID before I can request a telemetry time series. "
-            "Try: `Show the voltage trend for device ID 380 for the last 24 hours.`"
-        )
+        return "I need a device name and time range before I can request a telemetry time series. Try: `Show the voltage trend for the 96S2 Freezer for the last 24 hours.`"
     if "alarm_id" in detail:
         return "I need the alarm ID before I can look up alarm details. Try: `Show details for alarm ID 123`."
     if "site_id" in detail:
         return "Choose a DaxView site before I access historical data."
     if operation_id == "telemetry_timeseries":
-        return "Choose a device ID and time range before I request telemetry time-series data."
+        return "Choose a device name and time range before I request telemetry time-series data."
     return "Choose a site and time range before I access DaxView historical data."
 
 
@@ -4347,7 +4519,7 @@ def device_selection_prompt_from_result(mcp_result: dict) -> tuple[str, list[dic
     choices = []
     lines = [
         "Which device should I use for the max-demand check?",
-        "Select a device, or reply with its ID (for example, `device ID 380 for the last 7 days`).",
+        "Select a device by name, or type part of its name.",
         "",
         "Available devices:",
     ]
@@ -4360,21 +4532,21 @@ def device_selection_prompt_from_result(mcp_result: dict) -> tuple[str, list[dic
             continue
         status = device.get("status") or device.get("connection_status") or device.get("state") or "unknown"
         device_type = device.get("device_type") or device.get("type") or device.get("model")
-        detail = f"{name} (ID {device_id}, {str(status).title()}"
+        detail = f"{name} ({str(status).title()}"
         if device_type:
             detail += f", {device_type}"
         detail += ")"
         if index <= 12:
             lines.append(f"{index}. {detail}")
-        description = f"ID {device_id} | {status}"
+        description = str(status)
         if device_type:
             description += f" | {device_type}"
-        choices.append({"label": f"{name} (ID {device_id})", "value": str(device_id), "description": description})
+        choices.append({"label": name, "value": str(device_id), "description": description})
     total = data.get("device_count") or data.get("meter_count") or data.get("row_count") or len(devices)
     if total and len(devices) > 12:
         lines.append(f"Showing the first 12 of {len(devices)} returned devices here; {len(choices)} are selectable.")
     if not choices:
-        lines.append("No selectable devices were returned. Please provide the device ID manually.")
+        lines.append("No selectable devices were returned. Please check the site device list.")
     return "\n".join(lines), choices
 
 
@@ -4387,7 +4559,7 @@ def build_device_choice_response(turn_id: str, message: str, context: dict, requ
         log_event("daxview_device_choice_failed", request_id=request_id, turn_id=turn_id, error=str(error))
         prompt = (
             "Which device should I use for the max-demand check? "
-            "Reply with the device ID, for example: `device ID 380 for the last 7 days`."
+            "Reply with the device name, or a distinctive part of it."
         )
         choices = []
     window = re.search(
@@ -4401,7 +4573,7 @@ def build_device_choice_response(turn_id: str, message: str, context: dict, requ
         "fields": ["device_id"],
         "input_type": "select",
         "choices": choices,
-        "submit_template": f"max demand for device ID {{value}} for {time_scope}",
+        "submit_template": f"max demand for {{value}} for {time_scope}",
     }
 
 
@@ -4971,6 +5143,19 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     context = dict(context)
     if requested_device_id(message):
         context["device_id"] = requested_device_id(message)
+    if wants_named_device_metric_query(message):
+        device_match = resolve_named_device_reference(turn_id, message, context, request_id)
+        if device_match.get("status") != "matched":
+            return {
+                "provider": "daxview-question-filter",
+                "reply": device_match.get("reply") or "Which device should I use?",
+                "input_type": "select" if device_match.get("choices") else "text",
+                "choices": device_match.get("choices") or [],
+                "resolved_plan": resolved_plan_for_result("clarification", operation_ids, context),
+            }
+        context["device_id"] = device_match["device_id"]
+        context["_device_name"] = device_match["device_name"]
+        save_resolved_turn_context(turn_id, context)
     if "demand_peak_summary" in operation_ids and not context.get("device_id") and not wants_highest_demand_device(message):
         result = build_device_choice_response(turn_id, message, context, request_id)
         result["resolved_plan"] = resolved_plan_for_result("clarification", operation_ids, context)
@@ -5003,6 +5188,23 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
             "debug_tables": tables,
             "resolved_plan": resolved_plan_for_result("ok", operation_ids, context, metric_results),
         }
+    if wants_sitewide_energy_total(message):
+        operation_results = execute_authorized_internal_operation(
+            turn_id, "site_energy_summary", build_historical_arguments("site_energy_summary", context, message), request_id, message
+        )
+        deterministic_reply = summarize_historical_answers(message, operation_results, request_id)
+        refined_reply = refine_historical_answer_with_model(message, operation_results, deterministic_reply, request_id)
+        tables = build_tables_from_historical_results(operation_results, message)
+        return {
+            "provider": "daxview-historical-mcp",
+            "reply": refined_reply,
+            "charts": [],
+            "tables": tables,
+            "presentation": answer_presentation(message, ["site_energy_summary"], operation_results, [], tables),
+            "debug_charts": [],
+            "debug_tables": tables,
+            "resolved_plan": resolved_plan_for_result("ok", ["site_energy_summary"], context, operation_results),
+        }
     if "demand_peak_summary" in operation_ids:
         if not context.get("device_id") and not wants_highest_demand_device(message):
             result = build_device_choice_response(turn_id, message, context, request_id)
@@ -5015,7 +5217,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
                 "reply": demand_results[0]["clarification"],
                 "input_type": "select",
                 "choices": demand_results[0].get("choices") or [],
-                "submit_template": "max demand for device ID {value} for the same period",
+                "submit_template": "max demand for {value} for the same period",
                 "resolved_plan": resolved_plan_for_result("clarification", operation_ids, context, demand_results),
             }
         deterministic_reply = summarize_historical_answers(message, demand_results, request_id)
@@ -5041,7 +5243,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
                 "reply": ranked_results[0]["clarification"],
                 "input_type": "select",
                 "choices": ranked_results[0].get("choices") or [],
-                "submit_template": "max demand for device ID {value} for the same period",
+                "submit_template": "max demand for {value} for the same period",
                 "resolved_plan": resolved_plan_for_result("clarification", operation_ids, context, ranked_results),
             }
         deterministic_reply = summarize_historical_answers(message, ranked_results, request_id)
@@ -5086,6 +5288,8 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         try:
             step_context = {**context, "metric": metric} if metric else context
             arguments = build_historical_arguments(operation_id, step_context, message)
+            if context.get("_device_name"):
+                arguments["_device_name"] = context["_device_name"]
             debug_trace_event(
                 "daxview_tool_arguments_debug",
                 request_id=request_id,
@@ -5575,7 +5779,7 @@ def sandbox_calculation_fallback(message: str, facts: dict) -> str | None:
     if ranking and any(word in message.lower() for word in ("rank", "top", "highest", "lowest")):
         rows = sorted(ranking, key=lambda row: float(row.get("energy_kwh") or 0), reverse=True)
         lines = ["The LLM did not finish; these are the calculated synthetic sample device rankings:"]
-        lines.extend(f"{index}. {row['name']} (ID {row['device_id']}): {row['energy_kwh']:,.2f} kWh"
+        lines.extend(f"{index}. {row['name']}: {row['energy_kwh']:,.2f} kWh"
                      for index, row in enumerate(rows[:5], 1))
         return "\n".join(lines)
     demand = facts.get("peak_demand_kw")

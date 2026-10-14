@@ -21,6 +21,7 @@ FUNCTIONS = {
 }
 NAMES = (
     "requested_top_limit", "connected_load_calculation_answer", "requested_forecast_days", "requested_energy_extrema", "format_number", "format_time_window", "format_display_timestamp",
+    "wants_sitewide_energy_total", "has_named_device_reference", "wants_named_device_metric_query", "normalize_device_name", "resolve_named_device_reference",
     "reading_detail",
     "requested_question_parts", "completed_daily_range", "wants_device_usage_ranking", "wants_all_devices",
     "supplied_demand_readings_answer", "requested_historical_range", "default_historical_range",
@@ -70,6 +71,11 @@ def load_functions():
             ast.literal_eval(node.value)
             for node in TREE.body
             if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "MONTH_NAMES" for target in node.targets)
+        ),
+        "DEVICE_REFERENCE_STOPWORDS": next(
+            ast.literal_eval(node.value)
+            for node in TREE.body
+            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "DEVICE_REFERENCE_STOPWORDS" for target in node.targets)
         ),
         "load_conversation_history": lambda conversation_id, turn_id: [],
         "AI_PLANNER_ENABLED": False,
