@@ -25,7 +25,7 @@
       plugins: {legend: {display: datasets.length > 1 || type === 'doughnut', position: 'bottom'}},
       scales: type === 'doughnut' ? {} : {
         x: {ticks: {maxTicksLimit: 8, maxRotation: 25}, grid: {display: false}},
-        y: {beginAtZero: true, title: {display: true, text: spec.series[0]?.unit || 'kWh'}},
+        y: {beginAtZero: spec.beginAtZero !== false, title: {display: true, text: spec.series[0]?.unit || 'kWh'}},
       },
     }});
     charts.set(canvas, chart);

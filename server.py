@@ -1633,18 +1633,29 @@ def default_historical_range() -> dict:
 def relative_historical_range(message: str) -> tuple[datetime, datetime] | None:
     lowered = message.lower()
     end = datetime.now(timezone.utc)
-    match = re.search(r"\b(?:last\s+|for\s+)?(\d{1,3})\s*[- ]?\s*(day|days|week|weeks|month|months)\b", lowered)
+    match = re.search(
+        r"\b(?:last\s+|past\s+|for\s+)?(\d{1,3})\s*[- ]?\s*"
+        r"(minute|minutes|min|mins|hour|hours|hr|hrs|day|days|week|weeks|month|months)\b",
+        lowered,
+    )
     if not match:
         return None
     amount = int(match.group(1))
     unit = match.group(2)
-    if unit.startswith("week"):
+    if unit in {"minute", "minutes", "min", "mins"}:
+        duration = timedelta(minutes=amount)
+    elif unit in {"hour", "hours", "hr", "hrs"}:
+        duration = timedelta(hours=amount)
+    elif unit.startswith("week"):
         days = amount * 7
+        duration = timedelta(days=days)
     elif unit.startswith("month"):
         days = amount * 30
+        duration = timedelta(days=days)
     else:
         days = amount
-    return end - timedelta(days=max(days, 1)), end
+        duration = timedelta(days=days)
+    return end - max(duration, timedelta(minutes=1)), end
 
 
 def wants_relative_summary(message: str) -> bool:
@@ -3369,6 +3380,115 @@ def summarize_energy_forecast(data: dict) -> str:
     return "\n".join(lines)
 
 
+def telemetry_series_points(data: dict) -> list[dict]:
+    """Return time-sorted, independently labeled telemetry series."""
+    output = []
+    for index, source in enumerate(first_list(data, ("series", "rows", "buckets", "data")), 1):
+        if not isinstance(source, dict):
+            continue
+        points = source.get("points") if isinstance(source.get("points"), list) else [source]
+        normalized = []
+        for point in points:
+            if not isinstance(point, dict):
+                continue
+            stamp = first_value(point, ("timestamp", "date", "bucket", "time"))
+            value = chart_number(first_value(point, ("value", "average", "avg", "reading")))
+            parsed = parse_datetime(stamp) if isinstance(stamp, str) else None
+            if parsed is None or value is None:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            key = parsed.astimezone(timezone.utc).isoformat()
+            normalized.append((key, value))
+        normalized.sort(key=lambda item: item[0])
+        if not normalized:
+            continue
+        name = first_value(source, ("phase", "source_metric", "metric", "name")) or f"Series {index}"
+        output.append({
+            "name": str(name),
+            "unit": str(source.get("unit") or data.get("unit") or ""),
+            "aggregation": str(source.get("aggregation") or ""),
+            "points": normalized,
+        })
+    return output
+
+
+def format_chart_timestamp(value: str, timezone_name: str = AI_DISPLAY_TIMEZONE) -> str:
+    parsed = parse_datetime(value)
+    if not parsed:
+        return value
+    try:
+        zone = ZoneInfo(timezone_name)
+    except (ZoneInfoNotFoundError, TypeError):
+        zone = timezone(timedelta(hours=8)) if timezone_name == "Asia/Kuala_Lumpur" else timezone.utc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    local = parsed.astimezone(zone)
+    # Short category labels stay legible on dense hourly charts. The chart's
+    # summary gives the full date range and timezone for context.
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return f"{local.day} {local:%b %Y}"
+    hour = local.strftime("%I %p").lstrip("0")
+    return f"{local.day} {local:%b}, {hour}"
+
+
+def summarize_telemetry_timeseries(
+    data: dict,
+    arguments: dict | None = None,
+) -> str:
+    series = telemetry_series_points(data)
+    if not series:
+        return "DaxView returned no numeric telemetry points for this device and time range."
+
+    arguments = arguments or {}
+    timezone_name = arguments.get("timezone") or AI_DISPLAY_TIMEZONE
+    device = data.get("device") if isinstance(data.get("device"), dict) else {}
+    device_name = first_value(device, ("device_name", "name", "label")) or arguments.get("_device_name")
+    metric = str(arguments.get("metric") or first_value(series[0], ("metric",)) or "Telemetry").replace("_", " ").title()
+    all_points = [point for item in series for point in item["points"]]
+    first_stamp = min(stamp for stamp, _ in all_points)
+    last_stamp = max(stamp for stamp, _ in all_points)
+    period = f"{format_display_timestamp(first_stamp, timezone_name)} to {format_display_timestamp(last_stamp, timezone_name)}"
+    lines = [f"{metric} trend{f' for {device_name}' if device_name else ''}:", f"Period: {period}."]
+
+    overall_values = []
+    aggregation_labels = set()
+    for item in series:
+        values = [value for _, value in item["points"]]
+        overall_values.extend(values)
+        if item["aggregation"]:
+            aggregation_labels.add(item["aggregation"].lower())
+        average = sum(values) / len(values)
+        first_value_reading = values[0]
+        last_value_reading = values[-1]
+        delta = last_value_reading - first_value_reading
+        sign = "+" if delta > 0 else ""
+        unit = f" {item['unit']}" if item["unit"] else ""
+        lines.append(
+            f"- {item['name']}: average {format_number(average, 2)}{unit}; "
+            f"range {format_number(min(values), 2)} to {format_number(max(values), 2)}{unit}; "
+            f"first-to-last {format_number(first_value_reading, 2)} to "
+            f"{format_number(last_value_reading, 2)}{unit} ({sign}{format_number(delta, 2)}{unit})."
+        )
+
+    unit = next((item["unit"] for item in series if item["unit"]), "")
+    unit_text = f" {unit}" if unit else ""
+    lines.append(
+        f"Summary: {len(series)} plotted series with {sum(len(item['points']) for item in series):,} "
+        f"returned point(s); values ranged from {format_number(min(overall_values), 2)} to "
+        f"{format_number(max(overall_values), 2)}{unit_text}."
+    )
+    if aggregation_labels:
+        labels = ", ".join(sorted(aggregation_labels))
+        bucket = str(arguments.get("bucket") or "").lower()
+        bucket_label = {"1h": "hourly", "1d": "daily", "15m": "15-minute", "raw": "raw"}.get(bucket, bucket)
+        if bucket_label:
+            lines.append(f"Sampling: {bucket_label} buckets with {labels} aggregation.")
+        else:
+            lines.append(f"Reading aggregation returned by DaxView: {labels}.")
+    return "\n".join(lines)
+
+
 def summarize_historical_answer(
     message: str,
     operation_id: str,
@@ -3401,6 +3521,8 @@ def summarize_historical_answer(
         return summarize_metric_ranking(data, message, arguments)
     if operation_id == "latest_telemetry_snapshot":
         return summarize_latest_telemetry(data, arguments)
+    if operation_id == "telemetry_timeseries":
+        return summarize_telemetry_timeseries(data, arguments)
     if operation_id == "site_energy_summary":
         return summarize_site_energy(data, message, arguments)
     if operation_id == "alarm_frequency_summary":
@@ -3716,6 +3838,7 @@ def ensure_historical_answer_coverage(
     if not model_answer:
         return deterministic_answer
     generic_failure_patterns = (
+        r"\bmessage did(?: not|n['’]t) come through\b",
         r"\bempty input\b",
         r"\btesting the system\b",
         r"\bseems like you might have intended to ask\b",
@@ -3778,6 +3901,19 @@ def ensure_historical_answer_coverage(
             if expected and not any(name.casefold() in model_answer.casefold() for name in expected):
                 log_event("historical_answer_coverage_fallback", request_id=request_id, missing_items="alarm_rows")
                 return deterministic_answer
+        elif operation_id == "telemetry_timeseries":
+            telemetry = telemetry_series_points(data)
+            device = data.get("device") if isinstance(data.get("device"), dict) else {}
+            expected_device = first_value(device, ("device_name", "name", "label"))
+            if expected_device and str(expected_device).casefold() not in model_answer.casefold():
+                log_event("historical_answer_coverage_fallback", request_id=request_id, missing_items="telemetry_device")
+                return deterministic_answer
+            for series in telemetry:
+                values = [value for _, value in series["points"]]
+                expected_average = format_number(sum(values) / len(values), 2)
+                if expected_average not in model_answer or (series["unit"] and series["unit"] not in model_answer):
+                    log_event("historical_answer_coverage_fallback", request_id=request_id, missing_items="telemetry_summary")
+                    return deterministic_answer
     top_result = next((item for item in results if item.get("operation_id") in {"device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers"}), None)
     if top_result and wants_device_usage_ranking(message):
         top_data = historical_result_data(top_result["result"])
@@ -3889,6 +4025,7 @@ Render timestamps as concise local times in the requested/site timezone (for exa
 Answer each part of the user's question using the matching tool result. Never present energy consumption as an alarm count.
 Include only the requested metric, device, time range, and necessary data-quality caveat. Do not add supported-parameter lists, unrelated status fields, IDs, or other returned fields unless the user asks for them.
 For energy, preserve the source value, unit, time range, and scope exactly. Do not add cumulative register readings as if they were interval consumption. Only describe a value as interval consumption when the returned data establishes that meaning; otherwise say DaxView returned the value and avoid claiming the measurement semantics are verified. Do not silently recompute or "correct" a backend total.
+For telemetry trends, explain what the chart shows in plain language. Keep each phase or metric series separate, retain its returned unit, and preserve the per-series averages and ranges from the deterministic draft. A successful chart with numeric readings is a valid answer; never replace it with a greeting or say the user's message did not come through.
 When valid site-specific data is present, answer from that data; do not claim the user gave no question or ask them to clarify unless the returned data genuinely lacks a required scope or value.
 Do not include standards, protocols, or library background unless the user asks for them.
 For predictions, label every future value as an estimate and retain the method, coverage, and backtest error.
@@ -3900,6 +4037,7 @@ Keep the answer concise but useful:
 - Use short sections and bullets.
 - For a single-metric question, answer with that metric only; do not turn the response into a device inventory or capability report.
 - For a named-device metric question, answer with that device's requested metric/time range. If the data fetch fails, report the failure clearly; do not substitute an inventory response.
+- For telemetry trends, summarize the returned period, aggregation, plotted point count, per-series average and range, and the overall observed range. State the displayed timezone; do not infer whether values are normal or abnormal without a threshold or request.
 - For a follow-up asking for a breakdown of a site-energy total, use the per-device energy result for the same site and period. Explain that it is a device-level breakdown and preserve returned values and units.
 - For energy breakdowns, state building totals and the top five device values by default. If the user asks for the full/complete breakdown, include every returned device and say if DaxView returned fewer rows than the site contains. Show only calculations present in the deterministic draft; explain building totals as the sum of returned device energy rows assigned to that building.
 - Mention the tool/data limitation only if a requested value is missing.
@@ -4138,29 +4276,34 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
                 values.append(value)
         return build_chart_spec("bar", "Highest Frequency by Device", labels, values, data.get("unit") or "Hz", "Frequency")
     if operation_id == "telemetry_timeseries":
-        rows = first_list(data, ("rows", "series", "buckets", "data", "points"))
-        pairs = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            points = row.get("points") if isinstance(row.get("points"), list) else [row]
-            for point in points:
-                if not isinstance(point, dict):
-                    continue
-                label = point.get("timestamp") or point.get("date") or point.get("bucket") or ""
-                value = chart_value(point, ("value", "average", "avg", "reading"))
-                if label and value is not None:
-                    pairs.append((str(label), value))
-                if len(pairs) >= 1000:
-                    break
-            if len(pairs) >= 1000:
-                break
-        pairs = sorted((label, value) for label, value in pairs if label and value is not None)
+        telemetry_series = telemetry_series_points(data)
+        if not telemetry_series:
+            return None
+        timestamps = sorted({stamp for item in telemetry_series for stamp, _ in item["points"]})
+        timezone_name = (arguments or {}).get("timezone") or AI_DISPLAY_TIMEZONE
+        labels = [format_chart_timestamp(stamp, timezone_name) for stamp in timestamps]
+        chart_series = []
+        for item in telemetry_series:
+            values_by_time = dict(item["points"])
+            chart_series.append({
+                "name": item["name"],
+                "unit": item["unit"],
+                "data": [values_by_time.get(stamp) for stamp in timestamps],
+            })
         metric = (arguments or {}).get("metric", "Telemetry")
-        device_name = (arguments or {}).get("_device_name")
-        title = f"{device_name} — {str(metric).title()} History" if device_name else f"{str(metric).title()} History"
-        return build_chart_spec("line", title, [p[0] for p in pairs],
-                                [p[1] for p in pairs], str(data.get("unit") or ""), str(metric))
+        device = data.get("device") if isinstance(data.get("device"), dict) else {}
+        device_name = first_value(device, ("device_name", "name", "label")) or (arguments or {}).get("_device_name")
+        title = f"{device_name} - {str(metric).title()} Trend" if device_name else f"{str(metric).title()} Trend"
+        summary_lines = summarize_telemetry_timeseries(data, arguments).splitlines()
+        chart_summary = next((line for line in summary_lines if line.startswith("Summary:")), summary_lines[0])
+        return {
+            "type": "line",
+            "title": title,
+            "labels": labels,
+            "series": chart_series,
+            "summary": chart_summary,
+            "beginAtZero": False,
+        }
     if operation_id == "energy_forecast":
         rows = first_list(data, ("forecast", "rows", "series", "items"))
         labels = []
@@ -6937,6 +7080,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       .chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
       .chart-item { border: 1px solid #dbe3ef; padding: 10px; min-width: 0; max-width: 100%; }
       .chart-item strong { font-size: 12px; }
+      .chart-summary { margin: 8px 0 0; color: #475569; font-size: 12px; line-height: 1.5; }
       .chart-canvas-wrap { position: relative; height: 260px; max-height: 260px; width: 100%; margin-top: 8px; overflow: hidden; }
       .chart-item canvas { display: block; width: 100% !important; height: 260px !important; max-height: 260px !important; }
       .chart-item details { margin-top: 8px; font-size: 12px; }
@@ -7186,13 +7330,14 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
           (event.operation_ids || []).some(id => ["energy_forecast", "site_energy_summary", "telemetry_timeseries", "alarm_frequency_summary", "demand_peak_summary"].includes(id))
         );
         const chartItems = charts.map(chart => {
-          const series = chart.series?.[0] || {};
+          const chartSeries = Array.isArray(chart.series) ? chart.series : [];
           const valueRows = (chart.labels || []).map((label, index) =>
-            `<tr><td>${escapeHtml(label)}</td><td>${escapeHtml(series.data?.[index] ?? "")}</td></tr>`
+            `<tr><td>${escapeHtml(label)}</td>${chartSeries.map(series => `<td>${escapeHtml(series.data?.[index] ?? "")}</td>`).join("")}</tr>`
           ).join("");
           return `<div class="chart-item"><strong>${escapeHtml(chart.title || "Chart")}</strong>
             <div class="chart-canvas-wrap"><canvas data-spec="${escapeHtml(JSON.stringify(chart))}" aria-label="${escapeHtml(chart.title || "Chart preview")}"></canvas></div>
-            <details><summary>View chart values</summary><table><thead><tr><th>Period</th><th>${escapeHtml(series.unit || "Value")}</th></tr></thead><tbody>${valueRows}</tbody></table></details>
+            ${chart.summary ? `<p class="chart-summary">${escapeHtml(chart.summary).replace(/\n/g, "<br>")}</p>` : ""}
+            <details><summary>View chart values</summary><table><thead><tr><th>Period</th>${chartSeries.map(series => `<th>${escapeHtml(series.name || "Value")}${series.unit ? ` (${escapeHtml(series.unit)})` : ""}</th>`).join("")}</tr></thead><tbody>${valueRows}</tbody></table></details>
           </div>`;
         }).join("");
         const tableItems = tables.map(table => {
