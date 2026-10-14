@@ -1107,7 +1107,11 @@ def select_historical_operations(message: str) -> list[str]:
     if wants_device_capability_discovery(message) and requested_device_id(message) is None:
         operations = [name for name in operations if name != "telemetry_timeseries"]
     if wants_device_usage_ranking(message):
-        operations = [name for name in operations if name != "site_device_list"]
+        # A chart/table request for ranked consumers should visualize the
+        # returned energy_rows. The generic "chart" keyword must not add a
+        # per-device telemetry_timeseries request (which also requires a
+        # specific device ID).
+        operations = [name for name in operations if name not in {"site_device_list", "telemetry_timeseries"}]
         if "device_energy_breakdown" not in operations:
             operations.append("device_energy_breakdown")
         if not re.search(r"\b(?:daily|site energy|site-wide|overall|total site|site total|site usage)\b", lowered):
@@ -1256,6 +1260,19 @@ def choose_historical_operations(message: str, context: dict, turn_id: str, sess
             "planner_intention_debug",
             request_id=request_id,
             planner_enabled=False,
+            regex_tools=regex_operations,
+            selected_tools=regex_operations,
+            context=context,
+        )
+        return regex_operations, context, None
+    if AI_PLANNER_ENABLED and not AI_PLANNER_SHADOW_MODE and wants_device_usage_ranking(message):
+        # This intent has an unambiguous deterministic route. Avoid spending
+        # the planner's full timeout on a simple ranking request.
+        debug_trace_event(
+            "planner_intention_debug",
+            request_id=request_id,
+            planner_skipped=True,
+            reason="deterministic_top_consumer_route",
             regex_tools=regex_operations,
             selected_tools=regex_operations,
             context=context,
@@ -4310,6 +4327,11 @@ def readable_historical_errors(errors: list[dict]) -> str:
             parts.append(f"{label} is not configured for this device or site in DaxView.")
         elif "NO_DATA" in error:
             parts.append(f"{label} returned no data for the requested scope and time range.")
+        elif "BACKEND_UNAVAILABLE" in error:
+            parts.append(
+                f"{label} reached the DaxView MCP, but its EMS data backend returned HTTP 503. "
+                "The MCP operation was accepted; retry after the DaxView data service is available."
+            )
         elif "UNAVAILABLE" in error:
             parts.append(f"{label} is currently unavailable from DaxView.")
         elif "404" in error or "NOT FOUND" in error.upper():
