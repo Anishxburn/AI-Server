@@ -965,8 +965,19 @@ def wants_named_device_metric_query(message: str) -> bool:
         question_metrics(message)
         and not wants_sitewide_energy_total(message)
         and not wants_device_usage_ranking(message)
-        and not wants_device_inventory(message)
+        and not asks_for_device_inventory(message)
         and has_named_device_reference(message)
+    )
+
+
+def asks_for_device_inventory(message: str) -> bool:
+    """Recognize inventory requests without calling other intent predicates."""
+    lowered = message.lower()
+    return bool(
+        re.search(r"\b(?:list|show|get|give)\b.*\b(?:devices?|meters?|device\s*ids?)\b", lowered)
+        or re.search(r"\bwhich\s+(?:devices?|meters?)\b.*\b(?:have data|available|online|offline|status|best|suitable)\b", lowered)
+        or re.search(r"\b(?:devices?|meters?)\b.*\b(?:in|under|for)\s+(?:this|selected|current)\s+site\b", lowered)
+        or re.search(r"\b(?:best|suitable)\b.*\b(?:voltage|current|trend|testing)\b", lowered)
     )
 
 
@@ -1091,16 +1102,11 @@ def wants_device_inventory(message: str) -> bool:
     ):
         return False
     if (wants_device_usage_ranking(message) or wants_highest_demand_device(message)
-            or wants_sitewide_energy_total(message) or wants_named_device_metric_query(message)):
+            or wants_sitewide_energy_total(message)):
         return False
     if re.search(r"\b(?:top|highest|maximum|peak|rank|ranking)\b", lowered) and question_metrics(message):
         return False
-    return bool(
-        re.search(r"\b(?:list|show|get|give)\b.*\b(?:devices?|meters?|device\s*ids?)\b", lowered)
-        or re.search(r"\bwhich\s+(?:devices?|meters?)\b.*\b(?:have data|available|online|offline|status|best|suitable)\b", lowered)
-        or re.search(r"\b(?:devices?|meters?)\b.*\b(?:in|under|for)\s+(?:this|selected|current)\s+site\b", lowered)
-        or re.search(r"\b(?:best|suitable)\b.*\b(?:voltage|current|trend|testing)\b", lowered)
-    )
+    return asks_for_device_inventory(message)
 
 
 def wants_device_capability_discovery(message: str) -> bool:
@@ -3238,7 +3244,7 @@ def summarize_historical_answer(
 
 
 def summarize_result_takeaway(results: list[dict]) -> str:
-    """Add a short, data-grounded overview after a multi-part site answer."""
+    """Add a short, data-grounded overview for a multi-part site answer."""
     by_operation = {
         item.get("operation_id"): item
         for item in results
@@ -3277,10 +3283,16 @@ def summarize_result_takeaway(results: list[dict]) -> str:
 
     alarm_item = by_operation.get("active_alarm_summary")
     alarm_data = historical_result_data(alarm_item.get("result") or {}) if alarm_item else {}
+    has_offline_alarm = False
     if alarm_data:
         active = first_value(alarm_data, ("active_count", "total_active"))
         critical = first_value(alarm_data, ("critical_count", "critical"))
         warning = first_value(alarm_data, ("warning_count", "warning"))
+        alarm_rows = first_list(alarm_data, ("alarms", "rows", "items", "active_alarms"))
+        has_offline_alarm = any(
+            "offline" in str(first_value(row, ("alarm_name", "name", "title", "message", "description", "alarm_type")) or "").lower()
+            for row in alarm_rows if isinstance(row, dict)
+        )
         if active is not None:
             alarm_line = f"- Alarms: {format_number(active, 0)} active"
             if critical is not None:
@@ -3289,6 +3301,44 @@ def summarize_result_takeaway(results: list[dict]) -> str:
                 alarm_line += f" and {format_number(warning, 0)} warning"
             alarm_line += ". Prioritize the listed critical/offline alarms for review." if (critical or 0) > 0 else "."
             lines.append(alarm_line)
+
+    meter_item = by_operation.get("meter_status_summary")
+    meter_data = historical_result_data(meter_item.get("result") or {}) if meter_item else {}
+    meter_offline = first_value(meter_data, ("offline_count", "offline", "devices_offline")) if meter_data else None
+    meter_rows = first_list(meter_data, ("devices", "meters", "rows", "items", "needing_attention")) if meter_data else []
+    has_offline_meter = bool(isinstance(meter_offline, (int, float)) and meter_offline > 0)
+    has_offline_meter = has_offline_meter or any(
+        "offline" in str(first_value(row, ("status", "communication_status", "data_status")) or "").lower()
+        for row in meter_rows if isinstance(row, dict)
+    )
+
+    metadata_item = by_operation.get("site_metadata_summary")
+    metadata_data = historical_result_data(metadata_item.get("result") or {}) if metadata_item else {}
+    site_name = first_value(metadata_data, ("site_name", "name", "label")) if metadata_data else None
+    device_list_item = by_operation.get("site_device_list")
+    device_data = historical_result_data(device_list_item.get("result") or {}) if device_list_item else {}
+    device_count = first_value(device_data, ("total_count", "total", "device_count", "count")) if device_data else None
+    if device_count is None and device_data:
+        device_rows = first_list(device_data, ("devices", "rows", "items", "meters"))
+        if device_rows:
+            device_count = len(device_rows)
+
+    overview_parts = []
+    if site_name:
+        overview_parts.append(f"{site_name}")
+    if device_count is not None:
+        overview_parts.append(f"{format_number(device_count, 0)} devices")
+    if alarm_data and active is not None:
+        alarm_overview = f"{format_number(active, 0)} active alarms"
+        if critical is not None:
+            alarm_overview += f" ({format_number(critical, 0)} critical)"
+        overview_parts.append(alarm_overview)
+    if overview_parts:
+        lines.insert(0, "- " + "; ".join(overview_parts) + ".")
+    if has_offline_alarm or has_offline_meter:
+        lines.append(
+            "- Suggested checks for offline devices: verify device power and indicators, check the network/gateway link and communication settings, then confirm fresh readings resume. These are troubleshooting steps, not a confirmed root cause."
+        )
 
     ranking_item = next((
         item for item in results
@@ -3324,7 +3374,7 @@ def summarize_result_takeaway(results: list[dict]) -> str:
                     f"- Coverage check: the daily energy list reaches {energy_days[-1][0]}, while the detailed telemetry timestamp reaches {latest_telemetry_day}; verify the newest day's completeness."
                 )
 
-    return "Quick read:\n" + "\n".join(lines) if lines else ""
+    return "At a glance:\n" + "\n".join(lines) if lines else ""
 
 
 def summarize_historical_answers(
@@ -3429,7 +3479,7 @@ def summarize_historical_answers(
         sections.append(f"{title}\n{summary}")
     takeaway = summarize_result_takeaway(results)
     if takeaway:
-        sections.append(takeaway)
+        sections.insert(0, takeaway)
     return "\n\n".join(sections)
 
 
