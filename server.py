@@ -943,6 +943,7 @@ DEVICE_REFERENCE_STOPWORDS = {
     "energy", "kwh", "mwh", "consumption", "usage", "demand", "kw", "power", "factor", "frequency",
     "hz", "thd", "parameter", "parameters", "metric", "metrics", "latest", "recent", "now", "value",
     "values", "hour", "hours", "day", "days", "week", "weeks", "month", "months", "for", "past",
+    "readings", "similar", "names", "there", "then", "also", "please", "could", "would",
     "last", "time", "series", "timeseries", "plot", "chart", "table", "available", "data", "please",
     "overall", "all", "site", "total", "sitewide", "highest", "top", "rank", "ranking", "consumer",
     "consumers", "most", "used", "use", "using", "used", "usage",
@@ -1019,6 +1020,7 @@ def resolve_named_device_reference(turn_id: str, message: str, context: dict, re
         }
 
     matches = []
+    exact_matches = []
     normalized_message = f" {normalize_device_name(message)} "
     reference_text = " ".join(
         token for token in normalize_device_name(message).split()
@@ -1036,6 +1038,7 @@ def resolve_named_device_reference(turn_id: str, message: str, context: dict, re
         if not name_tokens:
             continue
         if f" {normalized_name} " in normalized_message:
+            exact_matches.append((1.0, str(name), device_id, device))
             score = 1.0
         else:
             token_score = len(name_tokens & reference_tokens) / len(name_tokens)
@@ -1043,6 +1046,31 @@ def resolve_named_device_reference(turn_id: str, message: str, context: dict, re
             score = max(token_score, fuzzy_score)
         if score >= 0.24:
             matches.append((score, str(name), device_id, device))
+    # An exact full device name is stronger evidence than token overlap. This
+    # matters for names such as 96S2_Freezer_3_1 and 96S2_Freezer_3_3, where
+    # converting tokens to a set loses the distinguishing repeated suffix.
+    if exact_matches:
+        exact_matches.sort(key=lambda item: (item[1].lower(), str(item[2])))
+        exact_ids = {str(item[2]) for item in exact_matches}
+        if len(exact_ids) == 1:
+            score, name, device_id, _device = exact_matches[0]
+            try:
+                numeric_id = int(device_id)
+            except (TypeError, ValueError):
+                numeric_id = None
+            if numeric_id is not None:
+                debug_trace_event(
+                    "device_name_resolved_debug",
+                    request_id=request_id,
+                    device_name=name,
+                    device_id=numeric_id,
+                    match_score=score,
+                    match_type="exact_name",
+                )
+                return {"status": "matched", "device_id": numeric_id, "device_name": name}
+        # Duplicate exact names remain ambiguous, but unrelated fuzzy matches
+        # must not be shown as alternatives.
+        matches = exact_matches
     matches.sort(key=lambda item: (-item[0], item[1].lower()))
     if not matches:
         # Even when token matching fails, offer the closest available names so
@@ -1099,9 +1127,21 @@ def resolve_named_device_reference(turn_id: str, message: str, context: dict, re
             detail = f"{detail} · {device_type}" if detail else str(device_type)
         choices.append({"label": name, "value": str(device_id), "description": detail})
     if len(choices) > 1:
-        prompt = "Which device did you mean? Choose the closest matching name below."
+        candidate_names = [choice["label"] for choice in choices]
+        candidate_list = "\n".join(f"• {name}" for name in candidate_names)
+        prompt = (
+            "I found more than one close device name:\n"
+            + candidate_list
+            + "\nWhich one do you mean? Reply with the device name and I’ll continue with your original metric and time range."
+        )
     else:
-        prompt = "I couldn't match that name exactly. Choose the closest device below, or enter a more specific name."
+        candidate_names = [choice["label"] for choice in choices]
+        prompt = (
+            f"I couldn't match that name exactly. The closest device is {candidate_names[0]}. "
+            "Reply with its name to continue, or enter a more specific name."
+            if candidate_names else
+            "I couldn't match that name exactly. Please enter a more specific device name."
+        )
     debug_trace_event(
         "device_name_match_ambiguous_debug",
         request_id=request_id,
@@ -4828,6 +4868,40 @@ def resolve_follow_up_message(turn_id: str, message: str, context: dict, convers
         previous_device_id = requested_device_id(previous_message) or first_device_id_from_text(previous_answer)
         if previous_device_id is not None:
             merged_context["device_id"] = previous_device_id
+    # A user may answer a name-ambiguity prompt with only the chosen device
+    # name. Treat it as a continuation so the original metric, time range and
+    # site scope are carried into the resolved query.
+    previous_device_choices = []
+    for line in previous_answer.splitlines():
+        candidate = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+        candidate = re.sub(r"\s*\([^)]*\)\s*$", "", candidate).strip()
+        if candidate and not candidate.lower().startswith(("i found", "which one", "reply with", "i couldn't")):
+            previous_device_choices.append(candidate)
+    normalized_message = normalize_device_name(message)
+    is_device_choice_reply = bool(
+        normalized_message
+        and len(normalized_message.split()) <= 8
+        and previous_device_choices
+        and any(normalize_device_name(choice) == normalized_message for choice in previous_device_choices)
+    )
+    if is_device_choice_reply:
+        resolved = f"{message}. Regarding {previous_message}"
+        if not has_time_scope(message):
+            prior_window = re.search(
+                r"\b(?:last|past)\s+\d{1,3}\s+(?:hours?|days?|weeks?|months?)\b|\b(?:today|yesterday|last week|this week|last month|this month)\b",
+                previous_message,
+                re.IGNORECASE,
+            )
+            if prior_window and not re.search(re.escape(prior_window.group(0)), resolved, re.IGNORECASE):
+                resolved += f" for {prior_window.group(0)}"
+        log_event(
+            "daxview_follow_up_resolved",
+            request_id=request_id,
+            turn_id=turn_id,
+            previous_turn_id=str(previous.get("id")),
+            follow_up_intent="device_name_choice",
+        )
+        return resolved, merged_context
     if wants_available_parameters_follow_up(message):
         if not merged_context.get("device_id"):
             inferred_device_id = first_device_id_from_text(previous_answer) or requested_device_id(previous_message)
@@ -5634,14 +5708,14 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     if wants_named_device_metric_query(message):
         device_match = resolve_named_device_reference(turn_id, message, context, request_id)
         if device_match.get("status") != "matched":
-            choices = device_match.get("choices") or []
             return {
-                "provider": "daxview-question-filter",
-                "reply": device_match.get("reply") or "Which device should I use?",
-                "fields": ["device_id"] if choices else ["device_name"],
-                "input_type": "select" if choices else "text",
-                "choices": choices,
-                "submit_template": device_metric_selection_template(message, use_device_id=bool(choices)),
+                # Device selectors are not part of the documented
+                # waiting_for_user fields. Show candidate names as readable
+                # chat text so the UI does not render an empty Continue form.
+                "provider": "daxview-answer",
+                "reply": device_match.get("reply") or "Which device name should I use?",
+                "charts": [],
+                "tables": [],
                 "resolved_plan": resolved_plan_for_result("clarification", operation_ids, context),
             }
         context["device_id"] = device_match["device_id"]
