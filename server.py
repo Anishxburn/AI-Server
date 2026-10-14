@@ -1562,21 +1562,6 @@ def choose_historical_operations(message: str, context: dict, turn_id: str, sess
             context=context,
         )
         return regex_operations, context, None
-    if AI_PLANNER_ENABLED and not AI_PLANNER_SHADOW_MODE and regex_operations:
-        # A recognized deterministic route is sufficient to select the MCP
-        # operation. Calling a second model here adds latency and can stall
-        # otherwise ordinary site summaries, alarm queries, and trends.
-        debug_trace_event(
-            "planner_intention_debug",
-            request_id=request_id,
-            planner_enabled=True,
-            planner_skipped=True,
-            reason="deterministic_operation_available",
-            regex_tools=regex_operations,
-            selected_tools=regex_operations,
-            context=context,
-        )
-        return regex_operations, context, None
     history = load_conversation_history(session_id, turn_id)
     try:
         plan, latency_ms = plan_turn_with_llm(message, history, context, request_id)
@@ -1673,48 +1658,6 @@ def requested_metric(message: str) -> str:
         raise ValueError(metric_clarification(message))
     metrics = question_metrics(message)
     return metrics[0] if metrics else "energy"
-
-
-def is_general_historical_readings_request(message: str) -> bool:
-    """Identify broad readings requests that need metric/period clarification."""
-    lowered = message.lower()
-    return bool(
-        re.search(r"\b(?:historical|history|historic)\b.*\b(?:readings?|telemetry|data)\b|\b(?:readings?|telemetry)\b.*\b(?:site|building|location)\b", lowered)
-        and requested_device_id(message) is None
-        and not wants_sitewide_energy_total(message)
-        and not wants_device_usage_ranking(message)
-        and not asks_for_device_inventory(message)
-    )
-
-
-def historical_readings_clarification(pending: dict) -> str:
-    missing = []
-    if not pending.get("metric"):
-        missing.append("metric")
-    if not pending.get("period_text"):
-        missing.append("period")
-    if pending.get("awaiting_device"):
-        return f"Which device should I use for {pending.get('metric', 'the requested metric')} readings? Reply with its device name."
-    if len(missing) == 2:
-        return (
-            "I can fetch the historical readings. Which metric do you need—energy (kWh), demand (kW), "
-            "voltage, electrical current (A), frequency, power factor, or THD—and what period should I use, "
-            "such as the last 24 hours or the last 7 days?"
-        )
-    if missing == ["metric"]:
-        return "Which metric should I retrieve—energy (kWh), demand (kW), voltage, electrical current (A), frequency, power factor, or THD?"
-    if missing == ["period"]:
-        return "What period should I use for the historical readings, such as the last 24 hours or the last 7 days?"
-    return "Which device should I use? Please reply with its device name."
-
-
-def clean_device_choice_reply(message: str) -> str:
-    """Remove conversational framing from a device-name clarification reply."""
-    value = str(message or "").strip().strip("'\"` .")
-    value = re.sub(r"^(?:please\s+)?(?:use|choose|select)\s+(?:this\s+)?device\s*[:,-]?\s*", "", value, flags=re.IGNORECASE)
-    value = re.sub(r"\s+(?:please\s+)?(?:use|choose|select)\s+(?:this\s+)?device\s*[.!?]*$", "", value, flags=re.IGNORECASE)
-    value = re.sub(r"\s+(?:this\s+)?device\s*[.!?]*$", "", value, flags=re.IGNORECASE)
-    return value.strip().strip("'\"` .")
 
 
 def default_historical_range() -> dict:
@@ -4921,88 +4864,6 @@ def resolve_follow_up_message(turn_id: str, message: str, context: dict, convers
         merged_context.pop("_time_window", None)
     if requested_device_id(message) is not None:
         merged_context["device_id"] = requested_device_id(message)
-    if message.strip().lower().startswith("requested context"):
-        context_period = requested_period_text(message)
-        if context_period:
-            merged_context["_time_window"] = requested_historical_range(context_period)
-        merged_context["_context_update_only"] = True
-        save_resolved_turn_context(turn_id, merged_context)
-        return message, merged_context
-    pending_readings = previous_context.get("_pending_historical_readings")
-    if isinstance(pending_readings, dict) and not site_changed:
-        pending = dict(pending_readings)
-        supplied_metrics = question_metrics(message)
-        if not supplied_metrics and re.fullmatch(r"\s*(?:electrical\s+)?current\s*(?:\(\s*A\s*\))?[?.! ]*", message, re.IGNORECASE):
-            supplied_metrics = ["current"]
-        if not pending.get("metric") and supplied_metrics:
-            pending["metric"] = supplied_metrics[0]
-            merged_context["metric"] = supplied_metrics[0]
-        period_text = requested_period_text(message)
-        if not pending.get("period_text") and period_text:
-            pending["period_text"] = period_text
-            merged_context["_time_window"] = requested_historical_range(period_text)
-        # A complete, new request supersedes an unanswered clarification. This
-        # prevents a stale device prompt from consuming later site-summary,
-        # alarm, or other unrelated questions as if they were device names.
-        new_request_operations = select_historical_operations(message)
-        is_new_request = bool(
-            new_request_operations
-            and (
-                (not supplied_metrics and not period_text)
-                or (pending.get("awaiting_device") and (supplied_metrics or period_text))
-            )
-        )
-        if is_new_request:
-            log_event(
-                "daxview_pending_clarification_superseded",
-                request_id=request_id,
-                turn_id=turn_id,
-                new_operations=new_request_operations,
-            )
-            merged_context.pop("_pending_historical_readings", None)
-            save_resolved_turn_context(turn_id, merged_context)
-            pending_readings = None
-        if pending_readings is not None:
-            if pending.get("awaiting_device"):
-                device_name = clean_device_choice_reply(message)
-                if device_name and not supplied_metrics and not period_text:
-                    metric = str(pending.get("metric") or "energy")
-                    period = str(pending.get("period_text") or "the last 7 days")
-                    merged_context.pop("_pending_historical_readings", None)
-                    metric_phrase = "electrical current" if metric == "current" else metric
-                    resolved = f"Show {metric_phrase} readings for {device_name} for {period}"
-                    merged_context["metric"] = metric
-                    log_event(
-                        "daxview_follow_up_resolved",
-                        request_id=request_id,
-                        turn_id=turn_id,
-                        previous_turn_id=str(previous.get("id")),
-                        follow_up_intent="historical_readings_device",
-                    )
-                    return resolved, merged_context
-                pending["awaiting_device"] = True
-            missing_metric = not pending.get("metric")
-            missing_period = not pending.get("period_text")
-            if not missing_metric and not missing_period and not pending.get("awaiting_device"):
-                metric = str(pending["metric"])
-                period = str(pending["period_text"])
-                if metric == "energy":
-                    merged_context.pop("_pending_historical_readings", None)
-                    merged_context["metric"] = metric
-                    resolved = f"Show overall site energy for {period}"
-                    log_event(
-                        "daxview_follow_up_resolved",
-                        request_id=request_id,
-                        turn_id=turn_id,
-                        previous_turn_id=str(previous.get("id")),
-                        follow_up_intent="historical_readings_site_energy",
-                    )
-                    return resolved, merged_context
-                pending["awaiting_device"] = True
-            merged_context["_pending_historical_readings"] = pending
-            merged_context["_clarification_reply"] = historical_readings_clarification(pending)
-            save_resolved_turn_context(turn_id, merged_context)
-            return message, merged_context
     if not site_changed and not merged_context.get("device_id") and requested_device_id(message) is None:
         previous_device_id = requested_device_id(previous_message) or first_device_id_from_text(previous_answer)
         if previous_device_id is not None:
@@ -5774,25 +5635,6 @@ def try_top_consumers_breakdown_fallback(turn_id: str, arguments: dict, request_
 
 def run_daxview_integration_turn(turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> dict:
     message, context = resolve_follow_up_message(turn_id, message, context, session_id, request_id)
-    if context.pop("_context_update_only", False):
-        save_resolved_turn_context(turn_id, context)
-        return {
-            "provider": "daxview-answer",
-            "reply": "I’ve updated the site and time context. What would you like to look up?",
-            "charts": [],
-            "tables": [],
-            "resolved_plan": resolved_plan_for_result("clarification", [], context),
-        }
-    clarification_reply = context.pop("_clarification_reply", None)
-    if clarification_reply:
-        save_resolved_turn_context(turn_id, context)
-        return {
-            "provider": "daxview-answer",
-            "reply": str(clarification_reply),
-            "charts": [],
-            "tables": [],
-            "resolved_plan": resolved_plan_for_result("clarification", [], context),
-        }
     supplied_demand = supplied_demand_readings_answer(message)
     if supplied_demand:
         debug_trace_event(
@@ -5834,38 +5676,6 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     clarification = metric_clarification(message)
     if clarification:
         return {"provider": "daxview-question-filter", "reply": clarification, "resolved_plan": resolved_plan_for_result("clarification", [], context)}
-    if is_general_historical_readings_request(message):
-        metric_values = question_metrics(message)
-        metric = metric_values[0] if metric_values else None
-        period_text = requested_period_text(message)
-        pending = {
-            "original_message": message,
-            "metric": metric,
-            "period_text": period_text,
-            "awaiting_device": False,
-        }
-        if metric:
-            context["metric"] = metric
-        if period_text:
-            context["_time_window"] = requested_historical_range(period_text)
-        if metric == "energy" and period_text:
-            context.pop("_pending_historical_readings", None)
-            message = f"Show overall site energy for {period_text}"
-        else:
-            if metric and period_text:
-                pending["awaiting_device"] = True
-            context["_pending_historical_readings"] = pending
-            save_resolved_turn_context(turn_id, context)
-            prompt = historical_readings_clarification(pending)
-            if pending.get("awaiting_device"):
-                prompt = f"Which device should I use for {metric} readings at this site? Reply with its device name."
-            return {
-                "provider": "daxview-answer",
-                "reply": prompt,
-                "charts": [],
-                "tables": [],
-                "resolved_plan": resolved_plan_for_result("clarification", [], context),
-            }
     operation_ids, context, planner_plan = choose_historical_operations(message, context, turn_id, session_id, request_id)
     if not operation_ids and context.get("_follow_up_operation_ids"):
         operation_ids = []
@@ -6360,29 +6170,6 @@ def has_time_scope(message: str) -> bool:
         re.search(r"\b\d{1,2}\s+\w+\s+\d{4}\b|\b\d{4}-\d{2}-\d{2}\b", lowered)
         or relative_historical_range(message)
     )
-
-
-def requested_period_text(message: str) -> str | None:
-    match = re.search(
-        r"\b(?:last|past)\s+\d{1,3}\s+(?:hours?|days?|weeks?|months?)\b"
-        r"|\b(?:today|yesterday|this week|last week|this month|last month)\b"
-        r"|\b\d{4}-\d{2}-\d{2}\b"
-        r"|\b\d{1,2}\s+[a-z]+\s+\d{4}\b",
-        message,
-        re.IGNORECASE,
-    )
-    if match:
-        return match.group(0)
-    duration = re.search(r"\b(\d{1,3}|a|one)\s+(hours?|days?|weeks?|months?)\b", message, re.IGNORECASE)
-    if duration:
-        amount = "1" if duration.group(1).lower() in {"a", "one"} else duration.group(1)
-        unit = duration.group(2).lower()
-        if amount == "1" and unit.endswith("s"):
-            unit = unit[:-1]
-        return f"last {amount} {unit}"
-    if has_time_scope(message):
-        return "the requested period"
-    return None
 
 
 def daxview_clarification_needed(message: str, tools: list[str]) -> bool:
