@@ -7082,7 +7082,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
           ).join("");
           return `<div class="chart-item"><strong>${escapeHtml(chart.title || "Chart")}</strong>
             <div class="chart-canvas-wrap"><canvas data-spec="${escapeHtml(JSON.stringify(chart))}" aria-label="${escapeHtml(chart.title || "Chart preview")}"></canvas></div>
-            ${chart.summary ? `<p class="chart-summary">${escapeHtml(chart.summary).replace(/\n/g, "<br>")}</p>` : ""}
+            ${chart.summary ? `<p class="chart-summary">${escapeHtml(chart.summary).replace(/\\n/g, "<br>")}</p>` : ""}
             <details><summary>View chart values</summary><table><thead><tr><th>Period</th>${chartSeries.map(series => `<th>${escapeHtml(series.name || "Value")}${series.unit ? ` (${escapeHtml(series.unit)})` : ""}</th>`).join("")}</tr></thead><tbody>${valueRows}</tbody></table></details>
           </div>`;
         }).join("");
