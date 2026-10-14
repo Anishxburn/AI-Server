@@ -3,6 +3,7 @@
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from concurrent.futures import ThreadPoolExecutor
 import base64
+from difflib import SequenceMatcher
 import hashlib
 import hmac
 import json
@@ -1024,6 +1025,10 @@ def resolve_named_device_reference(turn_id: str, message: str, context: dict, re
 
     matches = []
     normalized_message = f" {normalize_device_name(message)} "
+    reference_text = " ".join(
+        token for token in normalize_device_name(message).split()
+        if token not in DEVICE_REFERENCE_STOPWORDS
+    )
     for device in devices:
         if not isinstance(device, dict):
             continue
@@ -1038,19 +1043,33 @@ def resolve_named_device_reference(turn_id: str, message: str, context: dict, re
         if f" {normalized_name} " in normalized_message:
             score = 1.0
         else:
-            score = len(name_tokens & reference_tokens) / len(name_tokens)
-        if score:
+            token_score = len(name_tokens & reference_tokens) / len(name_tokens)
+            fuzzy_score = SequenceMatcher(None, reference_text, normalized_name).ratio()
+            score = max(token_score, fuzzy_score)
+        if score >= 0.24:
             matches.append((score, str(name), device_id, device))
     matches.sort(key=lambda item: (-item[0], item[1].lower()))
     if not matches:
-        return {
-            "status": "clarification",
-            "reply": "I couldn't match that name to a device at this site. Please use the device name as it appears in the device list.",
-        }
+        # Even when token matching fails, offer the closest available names so
+        # the user can select one instead of restarting with site/time details.
+        for device in devices:
+            if not isinstance(device, dict):
+                continue
+            name = first_value(device, ("device_name", "name", "meter_name", "label"))
+            device_id = first_value(device, ("device_id", "id", "meter_id"))
+            if name and device_id is not None:
+                score = SequenceMatcher(None, reference_text, normalize_device_name(name)).ratio()
+                matches.append((score, str(name), device_id, device))
+        matches.sort(key=lambda item: (-item[0], item[1].lower()))
+        if not matches:
+            return {
+                "status": "clarification",
+                "reply": "I couldn't find that name in the available devices. Please enter a more distinctive part of the device name.",
+            }
 
     top_score = matches[0][0]
-    close_matches = [item for item in matches if item[0] >= max(0.45, top_score - 0.1)]
-    unique_top = len(close_matches) == 1
+    close_matches = [item for item in matches if item[0] >= max(0.4, top_score - 0.12)]
+    unique_top = len({str(item[2]) for item in close_matches}) == 1
     if top_score >= 0.72 and unique_top:
         score, name, device_id, device = matches[0]
         try:
@@ -1067,29 +1086,51 @@ def resolve_named_device_reference(turn_id: str, message: str, context: dict, re
             )
             return {"status": "matched", "device_id": numeric_id, "device_name": name}
 
-    candidates = close_matches if len(close_matches) > 1 else matches[:5]
+    candidates = (close_matches if len(close_matches) > 1 else matches[:5])[:5]
     choices = []
-    seen_names = set()
-    unique_name_count = len({item[1].lower() for item in candidates})
+    seen_device_ids = set()
     for _, name, device_id, device in candidates:
-        if name.lower() in seen_names:
+        if str(device_id) in seen_device_ids:
             continue
-        seen_names.add(name.lower())
+        seen_device_ids.add(str(device_id))
         detail = str(device.get("status") or device.get("data_status") or "")
         device_type = device.get("device_type") or device.get("type") or device.get("model")
+        building_name = device.get("building_name") or device.get("building")
+        if isinstance(building_name, dict):
+            building_name = building_name.get("name")
+        if building_name:
+            detail = f"{detail} · {building_name}" if detail else str(building_name)
         if device_type:
             detail = f"{detail} · {device_type}" if detail else str(device_type)
         choices.append({"label": name, "value": str(device_id), "description": detail})
-    if len(close_matches) > 1 or unique_name_count > 1:
-        prompt = "I found several devices with similar names. Which one do you mean?"
+    if len(choices) > 1:
+        prompt = "Which device did you mean? Choose the closest matching name below."
     else:
-        prompt = "I couldn't confidently match that device name. Choose the closest device name or provide a more specific name."
+        prompt = "I couldn't match that name exactly. Choose the closest device below, or enter a more specific name."
     debug_trace_event(
         "device_name_match_ambiguous_debug",
         request_id=request_id,
-        candidates=[item[1] for item in candidates],
+        candidates=[{"name": item[1], "device_id": str(item[2]), "score": round(item[0], 3)} for item in candidates],
     )
     return {"status": "clarification", "reply": prompt, "choices": choices}
+
+
+def device_metric_selection_template(message: str, use_device_id: bool = True) -> str:
+    metric_labels = {
+        "energy": "energy (kWh)",
+        "power_factor": "power factor",
+    }
+    metrics = question_metrics(message)
+    metric_text = " and ".join(metric_labels.get(metric, metric) for metric in metrics) or "requested metric"
+    period_match = re.search(
+        r"\b(?:last|past)\s+\d{1,3}\s+(?:hours?|days?|weeks?|months?)\b"
+        r"|\b(?:today|yesterday|this week|last week|this month|last month)\b",
+        message,
+        re.IGNORECASE,
+    )
+    period = period_match.group(0) if period_match else "the last 7 days"
+    device_ref = "device ID {value}" if use_device_id else "device {value}"
+    return f"Show {metric_text} readings for {device_ref} for {period}."
 
 
 def wants_lowest_consumer(message: str) -> bool:
@@ -1104,6 +1145,24 @@ def wants_top_lowest_sum(message: str) -> bool:
 
 def wants_all_devices(message: str) -> bool:
     return bool(re.search(r"\b(?:all|every)\s+(?:(?:of\s+)?the\s+)?devices?\b", message, re.IGNORECASE))
+
+
+def wants_energy_breakdown_request(message: str) -> bool:
+    lowered = message.lower()
+    return bool(
+        re.search(r"\b(?:breakdown|break\s+down|split|contribution)\b", lowered)
+        and re.search(r"\b(?:energy|kwh|consumption|usage|device|meter|building|value|total)\b", lowered)
+    )
+
+
+def wants_full_energy_breakdown(message: str) -> bool:
+    lowered = message.lower()
+    return wants_all_devices(message) or bool(re.search(
+        r"\b(?:full|complete|entire|every)\s+(?:energy\s+)?breakdown\b"
+        r"|\b(?:all|every)\s+(?:of\s+)?(?:the\s+)?devices?\b"
+        r"|\ball\s+device\s+details\b",
+        lowered,
+    ))
 
 
 def wants_device_inventory(message: str) -> bool:
@@ -1286,6 +1345,14 @@ def select_historical_operations(message: str) -> list[str]:
         if any(term in lowered for term in ("offline", "online", "status")) or wants_all_devices(message):
             if "site_device_list" not in operations:
                 operations.append("site_device_list")
+    if wants_energy_breakdown_request(message):
+        operations = [name for name in operations if name != "site_energy_summary"]
+        if "device_energy_breakdown" not in operations:
+            operations.append("device_energy_breakdown")
+        # Device inventory supplies a safe device-to-building name map when
+        # the energy_rows payload omits building metadata.
+        if "site_device_list" not in operations:
+            operations.append("site_device_list")
     if "tomorrow" in lowered and any(term in lowered for term in ("energy", "kwh", "consumption", "usage")):
         operations.append("energy_forecast")
     if "alarm_frequency_summary" in operations and not any(
@@ -1738,7 +1805,8 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
         if args["bucket"] == "day":
             args.update(completed_daily_range(message) or {})
     elif operation_id == "site_device_list":
-        args["limit"] = int(context.get("limit") or 100)
+        default_limit = 500 if wants_energy_breakdown_request(message) else 100
+        args["limit"] = int(context.get("limit") or default_limit)
     elif operation_id == "telemetry_metric_catalog":
         if "start" in args:
             args["start_time"] = args.pop("start")
@@ -1835,7 +1903,12 @@ def build_historical_arguments(operation_id: str, context: dict, message: str = 
         args["end_time"] = args.pop("end")
         args["group_by"] = str(context.get("group_by") or "device")
         ranking_limit = requested_top_limit(message) if wants_device_usage_ranking(message) else None
-        args["limit"] = 100 if wants_all_devices(message) else ranking_limit or int(context.get("limit") or 20)
+        if wants_energy_breakdown_request(message):
+            # Fetch enough rows to calculate building totals, even when prose
+            # only displays the top five devices by default.
+            args["limit"] = min(int(context.get("limit") or 500), 500)
+        else:
+            args["limit"] = 100 if wants_all_devices(message) else ranking_limit or int(context.get("limit") or 20)
     elif operation_id == "energy_forecast":
         forecast_days = requested_forecast_days(message) or int(context.get("forecast_days") or 7)
         forecast_days = min(max(forecast_days, 1), 14)
@@ -2442,6 +2515,99 @@ def summarize_top_consumers(data: dict, arguments: dict | None = None, message: 
         lines.append(f"Showing {min(len(measured), limit)} measured device(s). Ranking is based on total consumption over the {time_window}.")
     if unmeasured:
         lines.append(f"{len(unmeasured)} returned device(s) had no numeric usage value and could not be ranked.")
+    return "\n".join(lines)
+
+
+def summarize_energy_breakdown(
+    data: dict,
+    arguments: dict | None = None,
+    message: str = "",
+    inventory_data: dict | None = None,
+) -> str:
+    """Summarize per-device energy as building totals plus a short device ranking."""
+    measured, unmeasured = ranked_consumer_rows(data)
+    raw_rows = first_list(data, ("rankings", "rows", "items", "results", "top_consumers", "consumers", "devices"))
+    if not measured:
+        return "DaxView returned no numeric device energy rows for this site and time range."
+
+    inventory = inventory_data if isinstance(inventory_data, dict) else {}
+    inventory_rows = first_list(inventory, ("devices", "rows", "items", "meters"))
+    inventory_by_id = {
+        str(first_value(row, ("device_id", "id", "meter_id"))): row
+        for row in inventory_rows
+        if isinstance(row, dict) and first_value(row, ("device_id", "id", "meter_id")) is not None
+    }
+
+    located = []
+    building_totals: dict[str, dict] = {}
+    for row, amount_kwh in measured:
+        row = dict(row)
+        device_id = first_value(row, ("device_id", "id", "meter_id"))
+        device = inventory_by_id.get(str(device_id), {}) if device_id is not None else {}
+        building_name = first_value(row, ("building_name", "building", "floor_building_name"))
+        if isinstance(building_name, dict):
+            building_name = first_value(building_name, ("name", "building_name", "label"))
+        if not building_name:
+            building_name = first_value(device, ("building_name", "building", "building_label"))
+            if isinstance(building_name, dict):
+                building_name = first_value(building_name, ("name", "building_name", "label"))
+        building_id = first_value(row, ("building_id",)) or first_value(device, ("building_id",))
+        row["_building_name"] = str(building_name).strip() if building_name else ""
+        row["_device_name"] = first_value(row, ("device_name", "name", "label", "meter_name")) or first_value(device, ("device_name", "name", "meter_name", "label")) or "Unnamed device"
+        located.append((row, amount_kwh))
+        if row["_building_name"]:
+            key = row["_building_name"].casefold()
+            group = building_totals.setdefault(key, {"name": row["_building_name"], "values": [], "total": 0.0})
+            group["values"].append(amount_kwh)
+            group["total"] += amount_kwh
+        elif building_id is not None:
+            # Keep distinct unnamed buildings separate internally without
+            # exposing raw building IDs to the user.
+            key = f"unnamed:{building_id}"
+            group = building_totals.setdefault(key, {"name": "Building name unavailable", "values": [], "total": 0.0})
+            group["values"].append(amount_kwh)
+            group["total"] += amount_kwh
+
+    time_window = format_time_window(data, arguments)
+    full = wants_full_energy_breakdown(message)
+    shown = located if full else located[:5]
+    lines = [f"Energy breakdown for {time_window}:"]
+    if building_totals:
+        lines.append("Building totals (sum of returned device energy rows):")
+        for group in sorted(building_totals.values(), key=lambda item: item["total"], reverse=True):
+            lines.append(f"- {group['name']}: {format_number(group['total'], 2)} kWh across {len(group['values'])} device row(s).")
+    else:
+        lines.append("Building totals are unavailable because DaxView and the device list returned no building names for these energy rows.")
+
+    lines.append("All returned devices:" if full else "Top 5 devices:")
+    for rank, (row, amount) in enumerate(shown, 1):
+        detail = f"{rank}. {row['_device_name']}: {format_number(amount, 2)} kWh"
+        if row.get("_building_name"):
+            detail += f" — {row['_building_name']}"
+        lines.append(detail)
+    if not full and len(located) > len(shown):
+        lines.append(f"Showing the top {len(shown)} of {len(located)} returned device rows. Ask for the full breakdown to see every returned device.")
+
+    returned_total = sum(amount for _, amount in located)
+    lines.append(f"Sum of returned device rows: {format_number(returned_total, 2)} kWh across {len(located)} measured device row(s).")
+    top_five = located[:5]
+    top_five_sum = sum(amount for _, amount in top_five)
+    equation = " + ".join(format_number(amount, 2) for _, amount in top_five)
+    lines.append(f"Calculation: top-device subtotal = {equation} = {format_number(top_five_sum, 2)} kWh.")
+    lines.append("Building total formula: add the kWh values for all returned devices assigned to that building, over the same time range.")
+
+    reported_count = first_value(data, ("total_count", "device_count", "row_count", "count"))
+    if reported_count is not None:
+        try:
+            if int(reported_count) > len(raw_rows):
+                lines.append(f"Data coverage: DaxView returned {len(raw_rows)} of {int(reported_count)} device rows; building totals use only the returned rows.")
+        except (TypeError, ValueError):
+            pass
+    if unmeasured:
+        lines.append(f"{len(unmeasured)} returned device row(s) had no usable numeric energy value and were excluded from totals and ranking.")
+    coverage_note = format_coverage_note(data)
+    if coverage_note:
+        lines.append(coverage_note)
     return "\n".join(lines)
 
 
@@ -3232,6 +3398,8 @@ def summarize_historical_answer(
         calculated = calculate_demand_peak_from_telemetry(mcp_result, arguments or {})
         if calculated and isinstance(calculated.get("data"), dict):
             data = {**data, **calculated["data"]}
+    if operation_id == "device_energy_breakdown" and wants_energy_breakdown_request(message):
+        return summarize_energy_breakdown(data, arguments, message)
     if operation_id in {"device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers"} and wants_device_usage_ranking(message):
         return summarize_top_consumers(data, arguments, message)
     if operation_id == "telemetry_metric_ranking":
@@ -3434,6 +3602,15 @@ def summarize_historical_answers(
 
     top_result = next((item for item in results if item["operation_id"] in {"device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers"}), None)
     device_result = next((item for item in results if item["operation_id"] == "site_device_list"), None)
+    if top_result and top_result.get("operation_id") == "device_energy_breakdown" and wants_energy_breakdown_request(message):
+        top_data = historical_result_data(top_result["result"])
+        device_data = historical_result_data(device_result["result"]) if device_result else {}
+        return summarize_energy_breakdown(
+            top_data,
+            top_result.get("arguments"),
+            message,
+            inventory_data=device_data,
+        )
     if top_result and device_result and wants_device_usage_ranking(message):
         top_data = historical_result_data(top_result["result"])
         device_data = historical_result_data(device_result["result"])
@@ -3729,6 +3906,7 @@ Keep the answer concise but useful:
 - For a single-metric question, answer with that metric only; do not turn the response into a device inventory or capability report.
 - For a named-device metric question, answer with that device's requested metric/time range. If the data fetch fails, report the failure clearly; do not substitute an inventory response.
 - For a follow-up asking for a breakdown of a site-energy total, use the per-device energy result for the same site and period. Explain that it is a device-level breakdown and preserve returned values and units.
+- For energy breakdowns, state building totals and the top five device values by default. If the user asks for the full/complete breakdown, include every returned device and say if DaxView returned fewer rows than the site contains. Show only calculations present in the deterministic draft; explain building totals as the sum of returned device energy rows assigned to that building.
 - Mention the tool/data limitation only if a requested value is missing.
 - Hide backend/internal terms such as MCP, row_count, source_count, aggregation, authorization_id, request_id, and JSON field names.
 - If the user asks for max demand, explain whether the result is site-level, building-level, or device-level based on the data. If device-level detail is missing, say which follow-up question would retrieve it.
@@ -3832,7 +4010,7 @@ def build_chart_spec(chart_type: str, title: str, labels: list[str], values: lis
     }
 
 
-def chart_from_historical_result(operation_id: str, result: dict, arguments: dict | None = None) -> dict | None:
+def chart_from_historical_result(operation_id: str, result: dict, arguments: dict | None = None, message: str = "") -> dict | None:
     data = historical_result_data(result)
     if not data:
         return None
@@ -3855,7 +4033,8 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
         rows = [dict(row, value=value) for row, value in ranked]
         labels = []
         values = []
-        for row in rows[:10]:
+        chart_limit = 100 if wants_full_energy_breakdown(message) else 5 if wants_energy_breakdown_request(message) else 10
+        for row in rows[:chart_limit]:
             if not isinstance(row, dict):
                 continue
             value = chart_value(row, (
@@ -4002,7 +4181,7 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
     return None
 
 
-def build_charts_from_historical_results(results: list[dict], preview: bool = False) -> list[dict]:
+def build_charts_from_historical_results(results: list[dict], preview: bool = False, message: str = "") -> list[dict]:
     if not AI_CHARTS_ENABLED and not preview:
         return []
     charts = []
@@ -4011,6 +4190,7 @@ def build_charts_from_historical_results(results: list[dict], preview: bool = Fa
             str(item.get("operation_id")),
             item.get("result") if isinstance(item.get("result"), dict) else {},
             item.get("arguments") if isinstance(item.get("arguments"), dict) else None,
+            message,
         )
         if chart:
             charts.append(chart)
@@ -4021,13 +4201,27 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
     """Build debug-only tables from verified MCP rows; never ask the model to invent cells."""
     tables = []
     latest_requested = bool(re.search(r"\b(?:latest|most recent)\b", message, re.IGNORECASE))
+    inventory_item = next((item for item in results if item.get("operation_id") == "site_device_list"), None)
+    inventory_data = historical_result_data(inventory_item.get("result") or {}) if inventory_item else {}
+    inventory_by_id = {
+        str(first_value(row, ("device_id", "id", "meter_id"))): row
+        for row in first_list(inventory_data, ("devices", "rows", "items", "meters"))
+        if isinstance(row, dict) and first_value(row, ("device_id", "id", "meter_id")) is not None
+    }
     for item in results:
         operation_id = str(item.get("operation_id") or "")
+        if operation_id == "site_device_list" and wants_energy_breakdown_request(message) and any(
+            result.get("operation_id") == "device_energy_breakdown" for result in results
+        ):
+            # This inventory call only enriches energy rows with building names;
+            # do not expose the helper list as an unrelated second table.
+            continue
         data = historical_result_data(item.get("result") if isinstance(item.get("result"), dict) else {})
         arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
         rows = []
         title = ""
         columns = []
+        extra_tables = []
 
         if operation_id == "alarm_frequency_summary":
             source_rows = [row for row in first_list(data, ("rows", "alarms", "items")) if isinstance(row, dict)]
@@ -4073,17 +4267,70 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
             ]
         elif operation_id in {"device_energy_breakdown", "device_energy_ranking", "telemetry_top_consumers"}:
             measured, _ = ranked_consumer_rows(data)
-            limit = min(max(int(arguments.get("limit") or 20), 1), 100)
+            is_energy_breakdown = operation_id == "device_energy_breakdown" and wants_energy_breakdown_request(message)
+            if is_energy_breakdown:
+                limit = len(measured) if wants_full_energy_breakdown(message) else min(len(measured), 5)
+            else:
+                limit = min(max(int(arguments.get("limit") or 20), 1), 100)
             for rank, (row, amount) in enumerate(measured[:limit], 1):
-                rows.append({
+                device_id = first_value(row, ("device_id", "id", "meter_id"))
+                device = inventory_by_id.get(str(device_id), {}) if device_id is not None else {}
+                building_name = first_value(row, ("building_name", "building", "building_label"))
+                if isinstance(building_name, dict):
+                    building_name = first_value(building_name, ("name", "building_name", "label"))
+                if not building_name:
+                    building_name = first_value(device, ("building_name", "building", "building_label"))
+                    if isinstance(building_name, dict):
+                        building_name = first_value(building_name, ("name", "building_name", "label"))
+                table_row = {
                     "rank": rank,
-                    "device": row.get("device_name") or row.get("name") or row.get("label") or "Unnamed device",
+                    "device": row.get("device_name") or row.get("name") or row.get("label") or first_value(device, ("device_name", "name", "meter_name", "label")) or "Unnamed device",
                     "value": amount,
-                    "unit": row.get("unit") or data.get("unit") or "kWh",
+                    "unit": "kWh" if is_energy_breakdown else row.get("unit") or data.get("unit") or "kWh",
                     "status": row.get("status") or row.get("device_status") or "",
-                })
-            title = "Device Energy Ranking"
-            columns = [("rank", "#"), ("device", "Device"), ("value", "Energy"), ("unit", "Unit"), ("status", "Status")]
+                }
+                if is_energy_breakdown:
+                    table_row["building"] = building_name or ""
+                rows.append(table_row)
+            if is_energy_breakdown:
+                building_totals = {}
+                for row, amount in measured:
+                    device_id = first_value(row, ("device_id", "id", "meter_id"))
+                    device = inventory_by_id.get(str(device_id), {}) if device_id is not None else {}
+                    building_name = first_value(row, ("building_name", "building", "building_label"))
+                    if isinstance(building_name, dict):
+                        building_name = first_value(building_name, ("name", "building_name", "label"))
+                    if not building_name:
+                        building_name = first_value(device, ("building_name", "building", "building_label"))
+                        if isinstance(building_name, dict):
+                            building_name = first_value(building_name, ("name", "building_name", "label"))
+                    if building_name:
+                        group = building_totals.setdefault(str(building_name), {"total": 0.0, "devices": 0})
+                        group["total"] += amount
+                        group["devices"] += 1
+                if building_totals:
+                    building_rows = [
+                        {"building": name, "device_count": values["devices"], "energy_kwh": values["total"]}
+                        for name, values in sorted(building_totals.items(), key=lambda item: item[1]["total"], reverse=True)
+                    ]
+                    extra_tables.append({
+                        "title": "Energy by Building",
+                        "columns": [
+                            {"key": "building", "label": "Building"},
+                            {"key": "device_count", "label": "Devices included"},
+                            {"key": "energy_kwh", "label": "Energy (kWh)"},
+                        ],
+                        "rows": building_rows,
+                        "row_count": len(building_rows),
+                        "truncated": False,
+                        "source_tool": item.get("public_tool") or operation_id,
+                        "operation": item.get("operation") or operation_id,
+                    })
+            title = "Building and Device Energy Breakdown" if is_energy_breakdown else "Device Energy Ranking"
+            columns = [("rank", "#")]
+            if is_energy_breakdown:
+                columns.append(("building", "Building"))
+            columns.extend([("device", "Device"), ("value", "Energy"), ("unit", "Unit"), ("status", "Status")])
         elif operation_id == "demand_peak_summary":
             source_rows = first_list(data, ("ranked_devices", "rankings", "devices", "rows", "peaks"))
             for rank, row in enumerate(source_rows[:100], 1):
@@ -4247,6 +4494,7 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
                     if arguments.get(key) is not None
                 },
             })
+            tables.extend(extra_tables)
     return tables
 
 
@@ -4296,9 +4544,7 @@ FOLLOW_UP_PHRASES = (
 
 def asks_for_energy_breakdown_follow_up(message: str) -> bool:
     lowered = message.lower()
-    asks_breakdown = bool(re.search(r"\b(?:breakdown|break\s+down|split|contribution)\b", lowered))
-    refers_to_prior = bool(re.search(r"\b(?:that|this|the|above|same)\b", lowered))
-    return asks_breakdown and (refers_to_prior or bool(re.search(r"\b(?:energy|kwh|device|meter)\b", lowered)))
+    return bool(re.search(r"\b(?:breakdown|break\s+down|split|contribution)\b", lowered))
 
 
 def is_follow_up_message(message: str) -> bool:
@@ -4472,7 +4718,11 @@ def resolve_follow_up_message(turn_id: str, message: str, context: dict, convers
             for item in previous_plan.get("tools", [])
         )
     ):
-        resolved = "Show the device energy breakdown for the same site and time range."
+        resolved = (
+            "Show the full per-building energy breakdown for all devices for the same site and time range."
+            if wants_full_energy_breakdown(message)
+            else "Show the per-building energy breakdown and top five devices for the same site and time range."
+        )
         log_event(
             "daxview_follow_up_resolved",
             request_id=request_id,
@@ -5246,11 +5496,14 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     if wants_named_device_metric_query(message):
         device_match = resolve_named_device_reference(turn_id, message, context, request_id)
         if device_match.get("status") != "matched":
+            choices = device_match.get("choices") or []
             return {
                 "provider": "daxview-question-filter",
                 "reply": device_match.get("reply") or "Which device should I use?",
-                "input_type": "select" if device_match.get("choices") else "text",
-                "choices": device_match.get("choices") or [],
+                "fields": ["device_id"] if choices else ["device_name"],
+                "input_type": "select" if choices else "text",
+                "choices": choices,
+                "submit_template": device_metric_selection_template(message, use_device_id=bool(choices)),
                 "resolved_plan": resolved_plan_for_result("clarification", operation_ids, context),
             }
         context["device_id"] = device_match["device_id"]
@@ -5275,7 +5528,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
             }
         deterministic_reply = summarize_historical_answers(message, metric_results, request_id)
         refined_reply = refine_historical_answer_with_model(message, metric_results, deterministic_reply, request_id)
-        charts = build_charts_from_historical_results(metric_results)
+        charts = build_charts_from_historical_results(metric_results, message=message)
         tables = build_tables_from_historical_results(metric_results, message)
         presentation = answer_presentation(message, operation_ids, metric_results, charts, tables)
         return {
@@ -5322,7 +5575,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
             }
         deterministic_reply = summarize_historical_answers(message, demand_results, request_id)
         refined_reply = refine_historical_answer_with_model(message, demand_results, deterministic_reply, request_id)
-        charts = build_charts_from_historical_results(demand_results)
+        charts = build_charts_from_historical_results(demand_results, message=message)
         tables = build_tables_from_historical_results(demand_results, message)
         presentation = answer_presentation(message, operation_ids, demand_results, charts, tables)
         return {
@@ -5348,7 +5601,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
             }
         deterministic_reply = summarize_historical_answers(message, ranked_results, request_id)
         refined_reply = refine_historical_answer_with_model(message, ranked_results, deterministic_reply, request_id)
-        charts = build_charts_from_historical_results(ranked_results)
+        charts = build_charts_from_historical_results(ranked_results, message=message)
         tables = build_tables_from_historical_results(ranked_results, message)
         presentation = answer_presentation(message, operation_ids, ranked_results, charts, tables)
         return {
@@ -5365,7 +5618,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         device_results = run_highest_demand_device_ranking(turn_id, message, context, request_id)
         deterministic_reply = summarize_historical_answers(message, device_results, request_id)
         refined_reply = refine_historical_answer_with_model(message, device_results, deterministic_reply, request_id)
-        charts = build_charts_from_historical_results(device_results)
+        charts = build_charts_from_historical_results(device_results, message=message)
         tables = build_tables_from_historical_results(device_results, message)
         presentation = answer_presentation(message, operation_ids, device_results, charts, tables)
         return {
@@ -5478,8 +5731,8 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     refined_reply = refine_historical_answer_with_model(message, results, deterministic_reply, request_id)
     if errors and "Unavailable detail:" not in refined_reply:
         refined_reply += f"\n\nUnavailable detail: {failed_tools}"
-    charts = build_charts_from_historical_results(results)
-    preview_charts = charts if charts else build_charts_from_historical_results(results, preview=True)
+    charts = build_charts_from_historical_results(results, message=message)
+    preview_charts = charts if charts else build_charts_from_historical_results(results, preview=True, message=message)
     tables = build_tables_from_historical_results(results, message)
     presentation = answer_presentation(message, operation_ids, results, charts, tables)
     debug_trace_event(
