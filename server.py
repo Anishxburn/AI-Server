@@ -973,8 +973,19 @@ def wants_named_device_metric_query(message: str) -> bool:
 def asks_for_device_inventory(message: str) -> bool:
     """Recognize inventory requests without calling other intent predicates."""
     lowered = message.lower()
+    # A device-name telemetry question often starts with "get/show me" and
+    # mentions the singular word "device". Do not mistake that for a request
+    # to list the site's inventory.
+    explicit_inventory = bool(re.search(
+        r"\b(?:list|show|give)\b.*\b(?:devices|meters|device\s+ids?|meter\s+ids?|all\s+devices?|every\s+device)\b"
+        r"|\bget\b.*\b(?:all|every|list of)\s+(?:devices?|meters?)\b"
+        r"|\bwhich\s+(?:devices?|meters?)\b",
+        lowered,
+    ))
+    if question_metrics(message) and has_named_device_reference(message) and not explicit_inventory:
+        return False
     return bool(
-        re.search(r"\b(?:list|show|get|give)\b.*\b(?:devices?|meters?|device\s*ids?)\b", lowered)
+        explicit_inventory
         or re.search(r"\bwhich\s+(?:devices?|meters?)\b.*\b(?:have data|available|online|offline|status|best|suitable)\b", lowered)
         or re.search(r"\b(?:devices?|meters?)\b.*\b(?:in|under|for)\s+(?:this|selected|current)\s+site\b", lowered)
         or re.search(r"\b(?:best|suitable)\b.*\b(?:voltage|current|trend|testing)\b", lowered)
@@ -1404,9 +1415,11 @@ def planner_slot_context(message: str, context: dict, plan) -> dict:
         merged["alarm_id"] = slots.alarm_id
     if slots.device_refs:
         for ref in slots.device_refs:
-            match = re.search(r"\d+", str(ref))
-            if match and not wants_named_device_metric_query(message):
-                merged["device_id"] = int(match.group(0))
+            # Device names commonly contain digits (e.g. 96S2_Freezer_3_1).
+            # Only a reference consisting entirely of digits is an ID.
+            normalized_ref = str(ref).strip()
+            if normalized_ref.isdigit() and not wants_named_device_metric_query(message):
+                merged["device_id"] = int(normalized_ref)
                 break
     return merged
 
@@ -1988,6 +2001,10 @@ def request_daxview_data_plan(turn_id: str, operation_id: str, arguments: dict, 
             status=error.code,
             response=safe_body,
         )
+        if isinstance(safe_body, dict) and safe_body.get("error_code") == "TURN_NOT_ACTIVE":
+            raise RuntimeError(
+                "DaxView rejected the data plan because this turn was no longer active (TURN_NOT_ACTIVE)."
+            ) from error
         raise
 
 
@@ -2177,9 +2194,9 @@ def format_number(value, precision: int = 2) -> str:
     if isinstance(value, bool):
         return str(value)
     if isinstance(value, int):
-        return str(value)
+        return f"{value:,}"
     if isinstance(value, float):
-        return f"{value:.{precision}f}"
+        return f"{value:,.{precision}f}"
     if isinstance(value, str):
         return value
     if value is None:
@@ -3695,9 +3712,11 @@ def build_mcp_refine_prompt(message: str, results: list[dict], deterministic_ans
 Use DaxView MCP data for site-specific facts. Use library excerpts only for relevant general EMS explanations.
 Make it human, clean, and practical.
 Do not invent values, devices, alarms, timestamps, causes, or recommendations not supported by the MCP data.
+Conceptual EMS model (logical relationships only; not a verified physical database schema): a site scopes buildings and devices; buildings contain floors; devices may have locations; each device has configured metrics; readings belong to a configured metric and include time, numeric value, and unit; alarms belong to a site and may optionally reference a device. Use device names for people and IDs only to connect returned records internally. Never infer physical joins, missing metric configuration, or a device's supported parameters from this model.
 Render timestamps as concise local times in the requested/site timezone (for example, "30 Sep 2026, 3:53 PM MYT"). Do not repeat raw ISO timestamps or microseconds in user-facing prose.
 Answer each part of the user's question using the matching tool result. Never present energy consumption as an alarm count.
 Include only the requested metric, device, time range, and necessary data-quality caveat. Do not add supported-parameter lists, unrelated status fields, IDs, or other returned fields unless the user asks for them.
+For energy, preserve the source value, unit, time range, and scope exactly. Do not add cumulative register readings as if they were interval consumption. Only describe a value as interval consumption when the returned data establishes that meaning; otherwise say DaxView returned the value and avoid claiming the measurement semantics are verified. Do not silently recompute or "correct" a backend total.
 When valid site-specific data is present, answer from that data; do not claim the user gave no question or ask them to clarify unless the returned data genuinely lacks a required scope or value.
 Do not include standards, protocols, or library background unless the user asks for them.
 For predictions, label every future value as an estimate and retain the method, coverage, and backtest error.
@@ -3708,6 +3727,8 @@ Keep the answer concise but useful:
 - Start with the direct answer.
 - Use short sections and bullets.
 - For a single-metric question, answer with that metric only; do not turn the response into a device inventory or capability report.
+- For a named-device metric question, answer with that device's requested metric/time range. If the data fetch fails, report the failure clearly; do not substitute an inventory response.
+- For a follow-up asking for a breakdown of a site-energy total, use the per-device energy result for the same site and period. Explain that it is a device-level breakdown and preserve returned values and units.
 - Mention the tool/data limitation only if a requested value is missing.
 - Hide backend/internal terms such as MCP, row_count, source_count, aggregation, authorization_id, request_id, and JSON field names.
 - If the user asks for max demand, explain whether the result is site-level, building-level, or device-level based on the data. If device-level detail is missing, say which follow-up question would retrieve it.
@@ -4273,6 +4294,13 @@ FOLLOW_UP_PHRASES = (
 )
 
 
+def asks_for_energy_breakdown_follow_up(message: str) -> bool:
+    lowered = message.lower()
+    asks_breakdown = bool(re.search(r"\b(?:breakdown|break\s+down|split|contribution)\b", lowered))
+    refers_to_prior = bool(re.search(r"\b(?:that|this|the|above|same)\b", lowered))
+    return asks_breakdown and (refers_to_prior or bool(re.search(r"\b(?:energy|kwh|device|meter)\b", lowered)))
+
+
 def is_follow_up_message(message: str) -> bool:
     lowered = message.lower().strip()
     if re.match(r"^device\s*(?:id\s*)?[:#-]?\s*\d+\b", lowered):
@@ -4436,6 +4464,23 @@ def resolve_follow_up_message(turn_id: str, message: str, context: dict, convers
             inferred_device_id=merged_context.get("device_id"),
         )
         return resolved, merged_context
+    if (
+        asks_for_energy_breakdown_follow_up(message)
+        and reusable
+        and any(
+            isinstance(item, dict) and item.get("tool") == "site_energy_summary"
+            for item in previous_plan.get("tools", [])
+        )
+    ):
+        resolved = "Show the device energy breakdown for the same site and time range."
+        log_event(
+            "daxview_follow_up_resolved",
+            request_id=request_id,
+            turn_id=turn_id,
+            previous_turn_id=str(previous.get("id")),
+            follow_up_intent="device_energy_breakdown",
+        )
+        return resolved, merged_context
     if not is_follow_up_message(message) and select_historical_operations(message):
         return message, merged_context
     if select_historical_operations(message):
@@ -4553,6 +4598,11 @@ def readable_historical_errors(errors: list[dict]) -> str:
             parts.append(
                 f"{label} reached the DaxView MCP, but its EMS data backend returned HTTP 503. "
                 "The MCP operation was accepted; retry after the DaxView data service is available."
+            )
+        elif "TURN_NOT_ACTIVE" in error:
+            parts.append(
+                f"{label} was selected, but DaxView rejected its authorization request because the turn was no longer active. "
+                "This is a DaxView turn-lifecycle issue; retry the request and check that the turn remains active through authorization."
             )
         elif "UNAVAILABLE" in error:
             parts.append(f"{label} is currently unavailable from DaxView.")
