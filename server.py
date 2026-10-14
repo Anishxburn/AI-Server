@@ -2573,8 +2573,8 @@ def summarize_site_energy(data: dict, message: str = "", arguments: dict | None 
                     last_day = end_day.astimezone(timezone(timedelta(hours=8))).date().isoformat()
                     if not first_day <= str(label) < last_day:
                         continue
-        if numeric_value is not None:
-            daily_values[str(label)] = numeric_value
+            if numeric_value is not None:
+                daily_values[str(label)] = numeric_value
             if has_specific_months:
                 continue
             if has_specific_dates and not include_range_summary and str(label) not in requested_date_set:
