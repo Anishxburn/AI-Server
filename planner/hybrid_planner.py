@@ -40,11 +40,9 @@ class PlannerClarification(BaseModel):
 class PlannerOutput(BaseModel):
     if ConfigDict is not None:
         model_config = ConfigDict(extra="forbid")
-    intent: Literal["data_query", "knowledge_question", "follow_up", "out_of_scope"]
-    is_follow_up: bool = False
+    intent: Literal["data_query", "knowledge_question", "out_of_scope"]
     tools: list[str] = Field(default_factory=list)
     slots: PlannerSlots = Field(default_factory=PlannerSlots)
-    inherit_from_previous: list[Literal["device", "building", "time", "metric", "tools"]] = Field(default_factory=list)
     clarification: PlannerClarification | None = None
     confidence: float = 0.0
 
@@ -74,28 +72,29 @@ Rules:
 - alarm_data: active alarms, alarm counts/frequency over a period, latest/recent alarm occurrences, or one alarm/event's details. Latest/frequency intent: "list 5 latest alarms" or "which alarms occurred most often". Active intent: "current/open alarms". Detail intent: an alarm/event ID or a question about one identified alarm.
 - site_summary: site/building overview and site-wide energy totals/buckets. Examples: "site energy this week" and "give me this site's overview". Do not use it for per-device readings.
 - For multi-intent questions include every relevant public tool, e.g. device_data and alarm_data for device rankings plus active alarms.
+- Plan each request independently. Never inherit a device, building, metric, time range, or tool choice from an earlier turn.
 - Do not ask for clarification merely because a request is brief. Ask only when a required target cannot be resolved from authorized context or a specific device/alarm is genuinely ambiguous.
 - For ordinary EMS definitions or calculations using values already supplied by the user, choose no DaxView tool.
 
 Examples:
 User: max demand yesterday for device 12
-JSON: {{"intent":"data_query","is_follow_up":false,"tools":["device_data"],"slots":{{"device_refs":["12"],"time_phrase":"yesterday","metric":"demand"}},"inherit_from_previous":[],"clarification":null,"confidence":0.93}}
-User: what about today?
-JSON: {{"intent":"follow_up","is_follow_up":true,"tools":[],"slots":{{"time_phrase":"today"}},"inherit_from_previous":["device","tools","metric"],"clarification":null,"confidence":0.84}}
+JSON: {{"intent":"data_query","tools":["device_data"],"slots":{{"device_refs":["12"],"time_phrase":"yesterday","metric":"demand"}},"clarification":null,"confidence":0.93}}
+User: show site energy today
+JSON: {{"intent":"data_query","tools":["site_summary"],"slots":{{"time_phrase":"today","metric":"energy"}},"clarification":null,"confidence":0.84}}
 User: top consumers last week and active alarms
-JSON: {{"intent":"data_query","is_follow_up":false,"tools":["device_data","alarm_data"],"slots":{{"time_phrase":"last week","metric":"energy","limit":5}},"inherit_from_previous":[],"clarification":null,"confidence":0.9}}
+JSON: {{"intent":"data_query","tools":["device_data","alarm_data"],"slots":{{"time_phrase":"last week","metric":"energy","limit":5}},"clarification":null,"confidence":0.9}}
 User: List out 5 latest alarm
-JSON: {{"intent":"data_query","is_follow_up":false,"tools":["alarm_data"],"slots":{{"limit":5}},"inherit_from_previous":[],"clarification":null,"confidence":0.96}}
+JSON: {{"intent":"data_query","tools":["alarm_data"],"slots":{{"limit":5}},"clarification":null,"confidence":0.96}}
 User: show current alarms and list devices that are offline
-JSON: {{"intent":"data_query","is_follow_up":false,"tools":["alarm_data","device_data"],"slots":{{}},"inherit_from_previous":[],"clarification":null,"confidence":0.94}}
+JSON: {{"intent":"data_query","tools":["alarm_data","device_data"],"slots":{{}},"clarification":null,"confidence":0.94}}
 User: what is voltage
-JSON: {{"intent":"knowledge_question","is_follow_up":false,"tools":[],"slots":{{}},"inherit_from_previous":[],"clarification":null,"confidence":0.9}}
+JSON: {{"intent":"knowledge_question","tools":[],"slots":{{}},"clarification":null,"confidence":0.9}}
 User: berapa max demand hari ini
-JSON: {{"intent":"data_query","is_follow_up":false,"tools":["device_data"],"slots":{{"time_phrase":"today","metric":"demand"}},"inherit_from_previous":[],"clarification":null,"confidence":0.82}}
-User: show building 3
-JSON: {{"intent":"follow_up","is_follow_up":true,"tools":[],"slots":{{"building_ref":"3"}},"inherit_from_previous":["tools","time","metric"],"clarification":null,"confidence":0.76}}
+JSON: {{"intent":"data_query","tools":["device_data"],"slots":{{"time_phrase":"today","metric":"demand"}},"clarification":null,"confidence":0.82}}
+User: show energy for building 3 this week
+JSON: {{"intent":"data_query","tools":["site_summary"],"slots":{{"building_ref":"3","time_phrase":"this week","metric":"energy"}},"clarification":null,"confidence":0.76}}
 User: tell me a joke
-JSON: {{"intent":"out_of_scope","is_follow_up":false,"tools":[],"slots":{{}},"inherit_from_previous":[],"clarification":{{"field":"topic","question":"I can help with EMS and DaxView questions. What site, device, or energy topic should I check?"}},"confidence":0.98}}
+JSON: {{"intent":"out_of_scope","tools":[],"slots":{{}},"clarification":{{"field":"topic","question":"I can help with EMS and DaxView questions. What site, device, or energy topic should I check?"}},"confidence":0.98}}
 """
 
 

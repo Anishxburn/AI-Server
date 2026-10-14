@@ -31,7 +31,6 @@ from ems_sandbox import formula_reference, prepare_sandbox_context, sample_datas
 from ems_contracts import measurement_context, metric_clarification, percentage_difference, question_metrics, result_problem
 from contracts.tool_schemas import TOOL_ARGUMENT_KEYS, TOOL_SCHEMAS, validate_tool_arguments
 from contracts.mcp_manifest import PUBLIC_MCP_TOOLS, build_public_calls, normalize_mcp_arguments, public_tool_for_internal
-from memory.conversation import load_conversation_history as load_conversation_history_from_db
 from planner.hybrid_planner import parse_planner_response, planner_json_schema, planner_system_prompt
 
 
@@ -1357,7 +1356,7 @@ def select_historical_operations(message: str) -> list[str]:
         operations = [name for name in operations if name != "site_energy_summary"]
         if "telemetry_timeseries" not in operations:
             operations.append("telemetry_timeseries")
-    if wants_available_parameters_follow_up(message):
+    if wants_available_parameters_query(message):
         if "data_availability_summary" not in operations:
             operations.append("data_availability_summary")
         operations = [name for name in operations if name != "telemetry_timeseries"]
@@ -1451,15 +1450,10 @@ def select_historical_operations(message: str) -> list[str]:
     return deduped[:6]
 
 
-def plan_turn_with_llm(message: str, history: list[dict], context: dict, request_id: str):
+def plan_turn_with_llm(message: str, context: dict, request_id: str):
     messages = [
         {"role": "system", "content": planner_system_prompt(DAXVIEW_TOOL_DESCRIPTIONS)},
     ]
-    for turn in history[-6:]:
-        if turn.get("user_message"):
-            messages.append({"role": "user", "content": str(turn["user_message"])[:1000]})
-        if turn.get("assistant_reply"):
-            messages.append({"role": "assistant", "content": str(turn["assistant_reply"])[:900]})
     messages.append({
         "role": "user",
         "content": json.dumps(
@@ -1526,7 +1520,7 @@ def planner_slot_context(message: str, context: dict, plan) -> dict:
     return merged
 
 
-def choose_historical_operations(message: str, context: dict, turn_id: str, session_id: str, request_id: str) -> tuple[list[str], dict, dict | None]:
+def choose_historical_operations(message: str, context: dict, request_id: str) -> tuple[list[str], dict, dict | None]:
     regex_operations = select_historical_operations(message)
     if not (AI_PLANNER_ENABLED or AI_PLANNER_SHADOW_MODE):
         debug_trace_event(
@@ -1562,9 +1556,8 @@ def choose_historical_operations(message: str, context: dict, turn_id: str, sess
             context=context,
         )
         return regex_operations, context, None
-    history = load_conversation_history(session_id, turn_id)
     try:
-        plan, latency_ms = plan_turn_with_llm(message, history, context, request_id)
+        plan, latency_ms = plan_turn_with_llm(message, context, request_id)
         planned_context = planner_slot_context(message, context, plan)
         planned_public_tools = [tool for tool in plan.tools if tool in DAXVIEW_ALLOWED_HISTORICAL_TOOLS]
         demand_intent = "demand_peak_summary" in regex_operations
@@ -4078,11 +4071,11 @@ Keep the answer concise but useful:
 - For a single-metric question, answer with that metric only; do not turn the response into a device inventory or capability report.
 - For a named-device metric question, answer with that device's requested metric/time range. If the data fetch fails, report the failure clearly; do not substitute an inventory response.
 - For telemetry trends, summarize the returned period, aggregation, plotted point count, per-series average and range, and the overall observed range. State the displayed timezone; do not infer whether values are normal or abnormal without a threshold or request.
-- For a follow-up asking for a breakdown of a site-energy total, use the per-device energy result for the same site and period. Explain that it is a device-level breakdown and preserve returned values and units.
+- For a request asking for an energy breakdown, use the per-device energy result for the site and period explicitly present in the current request or authorized request context. Explain that it is a device-level breakdown and preserve returned values and units.
 - For energy breakdowns, state building totals and the top five device values by default. If the user asks for the full/complete breakdown, include every returned device and say if DaxView returned fewer rows than the site contains. Show only calculations present in the deterministic draft; explain building totals as the sum of returned device energy rows assigned to that building.
 - Mention the tool/data limitation only if a requested value is missing.
 - Hide backend/internal terms such as MCP, row_count, source_count, aggregation, authorization_id, request_id, and JSON field names.
-- If the user asks for max demand, explain whether the result is site-level, building-level, or device-level based on the data. If device-level detail is missing, say which follow-up question would retrieve it.
+- If the user asks for max demand, explain whether the result is site-level, building-level, or device-level based on the data. If device-level detail is missing, state what additional device-level data is needed.
 - If demand data and device-list data are both present, do not say the device list caused or contributed to the max demand unless the data explicitly links demand to those devices. Present devices as "devices to inspect" or "candidate meters to check".
 - If the actual max-demand value is missing but device counts are present, say the max-demand value was not returned and then list the useful device/status context separately.
 
@@ -4676,324 +4669,12 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
     return tables
 
 
-FOLLOW_UP_PHRASES = (
-    "more detail",
-    "more details",
-    "explain more",
-    "why",
-    "what do you mean",
-    "regarding your explanation",
-    "regarding ur explanation",
-    "continue",
-    "convert",
-    "change the unit",
-    "bigger unit",
-    "larger unit",
-    "breakdown",
-    "this calculation",
-    "breakdown of this calculation",
-    "calculation breakdown",
-    "how did you calculate",
-    "how you calculated",
-    "show calculation",
-    "show me calculation",
-    "more explanation",
-    "follow up",
-    "follow-up",
-    "reply to this",
-    "reply to this answer",
-    "about this answer",
-    "based on this answer",
-    "use previous answer",
-    "use the previous answer",
-    "based on previous",
-    "based on the previous",
-    "from this result",
-    "from that result",
-    "explain this result",
-    "make it cleaner",
-    "summarize this",
-    "summarise this",
-    "turn this into",
-    "what should i check",
-    "what should i do next",
-)
-
-
-def asks_for_energy_breakdown_follow_up(message: str) -> bool:
-    lowered = message.lower()
-    return bool(re.search(r"\b(?:breakdown|break\s+down|split|contribution)\b", lowered))
-
-
-def is_follow_up_message(message: str) -> bool:
-    lowered = message.lower().strip()
-    if re.match(r"^device\s*(?:id\s*)?[:#-]?\s*\d+\b", lowered):
-        return True
-    if re.fullmatch(r"(?:why|how|what about that|and that|same one)[?.! ]*", lowered):
-        return True
-    if re.match(r"^(?:and\s+)?(?:what about|how about|for the same|on the same|can you also|show me more about|which day|which one|which was)\b", lowered):
-        return True
-    if re.match(r"^(?:and\s+)?(?:it|that|this|those|them|they|its|their|there)\b", lowered):
-        return True
-    if len(lowered.split()) <= 8 and re.match(r"^(?:and\s+)?(?:what|how|when|where|why|show|calculate|compare|rank)\b", lowered):
-        return True
-    return any(phrase in lowered for phrase in FOLLOW_UP_PHRASES if phrase != "why")
-
-
-def current_turn_identity(turn_id: str) -> dict | None:
-    if not DATABASE_URL:
-        return None
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT deployment_id, company_id, user_id, conversation_id
-                FROM daxview_turns
-                WHERE id = %s
-                """,
-                (turn_id,),
-            )
-            return cur.fetchone()
-
-
-def load_conversation_history(conversation_id: str, current_turn_id: str, limit: int = 6) -> list[dict]:
-    if not DATABASE_URL:
-        return []
-    identity = current_turn_identity(current_turn_id)
-    if not identity:
-        return []
-    with db() as conn:
-        return load_conversation_history_from_db(conn, conversation_id, current_turn_id, identity, limit)
-
-
-def previous_daxview_turn(conversation_id: str, current_turn_id: str) -> dict | None:
-    identity = current_turn_identity(current_turn_id)
-    if not identity:
-        return None
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT id, user_message, context, assistant_reply, resolved_plan
-                FROM daxview_turns
-                WHERE conversation_id = %s
-                  AND id <> %s
-                  AND deployment_id = %s
-                  AND company_id = %s
-                  AND user_id = %s
-                ORDER BY created_at DESC
-                LIMIT 10
-                """,
-                (
-                    conversation_id,
-                    current_turn_id,
-                    identity["deployment_id"],
-                    identity["company_id"],
-                    identity["user_id"],
-                ),
-            )
-            rows = cur.fetchall()
-    return next(
-        (row for row in rows if row.get("user_message") and not str(row["user_message"]).lower().startswith("requested context")),
-        None,
-    )
-
-
-def first_device_id_from_text(text: str) -> int | None:
-    if not text:
-        return None
-    patterns = (
-        r"^\s*1\.\s+.+?\(ID\s+(\d+)\)",
-        r"Highest energy-consuming device:.+?\(ID\s+(\d+)\)",
-        r"Highest demand devices?.+?\(ID\s+(\d+)\)",
-        r"\b(?:device|meter)\s+ID\s+(\d+)\b",
-        r"\(ID\s+(\d+)\)",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
-        if match:
-            return int(match.group(1))
-    return None
-
-
-def wants_available_parameters_follow_up(message: str) -> bool:
+def wants_available_parameters_query(message: str) -> bool:
     lowered = message.lower()
     return bool(
-        re.search(r"\b(?:continue|based on this|other parameter|other parameters|available parameter|available parameters|what else|anything else)\b", lowered)
-        and re.search(r"\b(?:device|parameter|metric|voltage|current|telemetry|available|continue)\b", lowered)
+        re.search(r"\b(?:other parameter|other parameters|available parameter|available parameters|what else|anything else)\b", lowered)
+        and re.search(r"\b(?:device|parameter|metric|voltage|current|telemetry|available)\b", lowered)
     )
-
-
-def follow_up_metric_from_message(message: str) -> str | None:
-    metrics = question_metrics(message)
-    if metrics:
-        return metrics[0]
-    lowered = message.lower()
-    if re.search(r"\b(?:parameter|parameters|metric|metrics|available|what else)\b", lowered):
-        return "energy"
-    return None
-
-
-def resolve_follow_up_message(turn_id: str, message: str, context: dict, conversation_id: str, request_id: str) -> tuple[str, dict]:
-    previous = previous_daxview_turn(conversation_id, turn_id)
-    if not previous or not previous.get("user_message"):
-        if is_follow_up_message(message):
-            debug_trace_event(
-                "daxview_follow_up_context_missing",
-                request_id=request_id,
-                turn_id=turn_id,
-                conversation_id=conversation_id,
-                reason="no_prior_turn_in_same_conversation",
-            )
-        return message, context
-    previous_message = str(previous["user_message"])
-    previous_answer = str(previous.get("assistant_reply") or "")
-    previous_context = previous.get("context") if isinstance(previous.get("context"), dict) else {}
-    previous_plan = previous.get("resolved_plan") if isinstance(previous.get("resolved_plan"), dict) else {}
-    reusable = previous_plan.get("status") in {"ok", "no_data"} or not previous_plan
-    site_changed = context.get("site_id") and str(context["site_id"]) != str(previous_context.get("site_id"))
-    merged_context = {**previous_context, **context} if not site_changed else dict(context)
-    if site_changed:
-        merged_context = dict(context)
-    elif reusable:
-        slots = previous_plan.get("slots") if isinstance(previous_plan.get("slots"), dict) else {}
-        for key in ("device_id", "building_id", "metric", "_time_window"):
-            if key not in merged_context and slots.get(key) is not None:
-                merged_context[key] = slots[key]
-    if has_time_scope(message):
-        merged_context.pop("_time_window", None)
-    if requested_device_id(message) is not None:
-        merged_context["device_id"] = requested_device_id(message)
-    if not site_changed and not merged_context.get("device_id") and requested_device_id(message) is None:
-        previous_device_id = requested_device_id(previous_message) or first_device_id_from_text(previous_answer)
-        if previous_device_id is not None:
-            merged_context["device_id"] = previous_device_id
-    # A user may answer a name-ambiguity prompt with only the chosen device
-    # name. Treat it as a continuation so the original metric, time range and
-    # site scope are carried into the resolved query.
-    previous_device_choices = []
-    for line in previous_answer.splitlines():
-        candidate = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
-        candidate = re.sub(r"\s*\([^)]*\)\s*$", "", candidate).strip()
-        if candidate and not candidate.lower().startswith(("i found", "which one", "reply with", "i couldn't")):
-            previous_device_choices.append(candidate)
-    normalized_message = normalize_device_name(message)
-    is_device_choice_reply = bool(
-        normalized_message
-        and len(normalized_message.split()) <= 8
-        and previous_device_choices
-        and any(normalize_device_name(choice) == normalized_message for choice in previous_device_choices)
-    )
-    if is_device_choice_reply:
-        resolved = f"{message}. Regarding {previous_message}"
-        if not has_time_scope(message):
-            prior_window = re.search(
-                r"\b(?:last|past)\s+\d{1,3}\s+(?:hours?|days?|weeks?|months?)\b|\b(?:today|yesterday|last week|this week|last month|this month)\b",
-                previous_message,
-                re.IGNORECASE,
-            )
-            if prior_window and not re.search(re.escape(prior_window.group(0)), resolved, re.IGNORECASE):
-                resolved += f" for {prior_window.group(0)}"
-        log_event(
-            "daxview_follow_up_resolved",
-            request_id=request_id,
-            turn_id=turn_id,
-            previous_turn_id=str(previous.get("id")),
-            follow_up_intent="device_name_choice",
-        )
-        return resolved, merged_context
-    if wants_available_parameters_follow_up(message):
-        if not merged_context.get("device_id"):
-            inferred_device_id = first_device_id_from_text(previous_answer) or requested_device_id(previous_message)
-            if inferred_device_id:
-                merged_context["device_id"] = inferred_device_id
-        if follow_up_metric_from_message(message):
-            merged_context["metric"] = follow_up_metric_from_message(message)
-        if not has_time_scope(message):
-            merged_context.setdefault("_time_window", previous_context.get("_time_window") or default_historical_range())
-        resolved = message
-        if not select_historical_operations(resolved):
-            resolved = f"Check data availability and available telemetry parameters for device ID {merged_context.get('device_id', '')}".strip()
-        log_event(
-            "daxview_follow_up_resolved",
-            request_id=request_id,
-            turn_id=turn_id,
-            previous_turn_id=str(previous.get("id")),
-            inferred_device_id=merged_context.get("device_id"),
-        )
-        return resolved, merged_context
-    if (
-        asks_for_energy_breakdown_follow_up(message)
-        and reusable
-        and any(
-            isinstance(item, dict) and item.get("tool") == "site_energy_summary"
-            for item in previous_plan.get("tools", [])
-        )
-    ):
-        resolved = (
-            "Show the full per-building energy breakdown for all devices for the same site and time range."
-            if wants_full_energy_breakdown(message)
-            else "Show the per-building energy breakdown and top five devices for the same site and time range."
-        )
-        log_event(
-            "daxview_follow_up_resolved",
-            request_id=request_id,
-            turn_id=turn_id,
-            previous_turn_id=str(previous.get("id")),
-            follow_up_intent="device_energy_breakdown",
-        )
-        return resolved, merged_context
-    if not is_follow_up_message(message) and select_historical_operations(message):
-        return message, merged_context
-    if select_historical_operations(message):
-        resolved = message
-        if not has_time_scope(message):
-            prior_window = re.search(
-                r"\b(?:last|past)\s+\d{1,3}\s+(?:days?|weeks?|months?)\b|\b(?:today|yesterday|last week|this week)\b",
-                previous_message,
-                re.IGNORECASE,
-            )
-            if prior_window:
-                resolved += f" for {prior_window.group(0)}"
-    else:
-        prior_question = previous_message
-        if has_time_scope(message):
-            prior_question = re.sub(
-                r"\b(?:last|past)\s+\d{1,3}\s+(?:days?|weeks?|months?)\b|\b(?:today|yesterday|last week|this week)\b",
-                "", prior_question, flags=re.IGNORECASE,
-            )
-        resolved = f"{message}. Regarding {prior_question}"
-    if is_follow_up_message(message) and reusable and not select_historical_operations(resolved):
-        prior_operations = []
-        for planned in previous_plan.get("tools", []) if isinstance(previous_plan.get("tools"), list) else []:
-            if not isinstance(planned, dict):
-                continue
-            name = str(planned.get("tool") or "")
-            arguments = planned.get("arguments") if isinstance(planned.get("arguments"), dict) else {}
-            operation = arguments.get("operation")
-            if name in {
-                "site_device_list", "telemetry_metric_catalog", "telemetry_timeseries", "demand_peak_summary",
-                "telemetry_metric_ranking",
-                "site_energy_summary", "device_energy_breakdown", "device_energy_ranking", "telemetry_top_consumers",
-                "active_alarm_summary", "alarm_frequency_summary", "alarm_detail_lookup", "site_metadata_summary",
-                "meter_status_summary", "power_quality_summary", "report_summary",
-            }:
-                intent = name
-            elif name in DAXVIEW_ALLOWED_HISTORICAL_TOOLS:
-                intent = internal_for_public_operation(name, operation)
-            else:
-                intent = ""
-            if intent and intent not in prior_operations:
-                prior_operations.append(intent)
-        if prior_operations:
-            merged_context["_follow_up_operation_ids"] = prior_operations
-    log_event(
-        "daxview_follow_up_resolved",
-        request_id=request_id,
-        turn_id=turn_id,
-        previous_turn_id=str(previous.get("id")),
-    )
-    return resolved, merged_context
 
 
 def answer_presentation(message: str, operation_ids: list[str], results: list[dict], charts: list[dict], tables: list[dict]) -> dict:
@@ -5634,7 +5315,6 @@ def try_top_consumers_breakdown_fallback(turn_id: str, arguments: dict, request_
 
 
 def run_daxview_integration_turn(turn_id: str, message: str, context: dict, request_id: str, session_id: str) -> dict:
-    message, context = resolve_follow_up_message(turn_id, message, context, session_id, request_id)
     supplied_demand = supplied_demand_readings_answer(message)
     if supplied_demand:
         debug_trace_event(
@@ -5676,15 +5356,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     clarification = metric_clarification(message)
     if clarification:
         return {"provider": "daxview-question-filter", "reply": clarification, "resolved_plan": resolved_plan_for_result("clarification", [], context)}
-    operation_ids, context, planner_plan = choose_historical_operations(message, context, turn_id, session_id, request_id)
-    if not operation_ids and context.get("_follow_up_operation_ids"):
-        operation_ids = []
-        for operation in context["_follow_up_operation_ids"]:
-            try:
-                public_tool_for_internal(operation)
-            except ValueError:
-                continue
-            operation_ids.append(operation)
+    operation_ids, context, planner_plan = choose_historical_operations(message, context, request_id)
     debug_trace_event(
         "daxview_tool_selection_debug",
         request_id=request_id,
@@ -6244,7 +5916,7 @@ def decide_sandbox_data_access(message: str, history: list[dict], request_id: st
         "Conceptual questions, general explanations, greetings, and calculations using numbers the user supplied "
         "do not need sample data. Only choose sample data when the user asks about actual readings, the sample/site, "
         "a device ranking, a time trend, alarms, or a report based on the sample. Choose the smallest category set "
-        "that can answer the current question, using conversation history for follow-ups. Never select every category "
+        "that can answer the current question, using only the current question. Never select every category "
         "by default. If the question is ambiguous, do not load sample data. Category guidance: site energy, daily "
         "energy, or sample carbon estimates use energy; top/highest/lowest consuming devices use devices; peak or "
         "maximum demand uses demand; voltage, current, or power factor uses telemetry; alarm counts/types use alarms; "
@@ -6394,7 +6066,7 @@ def run_sandbox_chat(message: str, history: list[dict], request_id: str, progres
             normalized_history.append({"role": role, "content": content[:2500]})
     system = (
         "You are a helpful general chatbot with strong Energy Management System knowledge. Answer naturally, "
-        "understand follow-ups from the conversation, and answer non-EMS questions too. No sample readings were "
+        "answer each request independently, and answer non-EMS questions too. No sample readings were "
         "loaded unless an optional data block is explicitly included below. If no sample data is included, answer "
         "conceptual questions normally and calculate from values the user provided; do not invent site readings. "
         "When synthetic sample facts are included, use only those facts, state that they are synthetic, retain units "
