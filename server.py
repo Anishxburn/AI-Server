@@ -55,6 +55,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 RAG_MATCH_LIMIT = int(os.getenv("RAG_MATCH_LIMIT", "5"))
 RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.2"))
 TRACE_LIMIT = int(os.getenv("CHATBOT_TRACE_LIMIT", "25"))
+TRACE_PAGE_SIZE = int(os.getenv("CHATBOT_TRACE_PAGE_SIZE", "200"))
 AI_DEBUG_DASHBOARD_ENABLED = os.getenv("AI_DEBUG_DASHBOARD_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 AI_REFINE_MCP_WITH_MODEL = os.getenv("AI_REFINE_MCP_WITH_MODEL", "true").lower() in {"1", "true", "yes", "on"}
 AI_MCP_FALLBACKS_ENABLED = os.getenv("AI_MCP_FALLBACKS_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
@@ -560,25 +561,25 @@ def log_event(event: str, **fields: object) -> None:
     }
     record = {"event": event, **safe_fields}
     if AI_DEBUG_DASHBOARD_ENABLED:
-        TRACES.appendleft(
-            {
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                **redact_debug_value(record),
-            }
-        )
+        trace = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            **redact_debug_value(record),
+        }
+        TRACES.appendleft(trace)
+        persist_debug_trace(trace)
     print(json.dumps(record, ensure_ascii=False), flush=True)
 
 
 def debug_trace_event(event: str, **fields: object) -> None:
     if not AI_DEBUG_DASHBOARD_ENABLED:
         return
-    TRACES.appendleft(
-        {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "event": event,
-            **redact_debug_value(fields),
-        }
-    )
+    trace = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        **redact_debug_value(fields),
+    }
+    TRACES.appendleft(trace)
+    persist_debug_trace(trace)
 
 
 def preview(text: object, limit: int = 240) -> str:
@@ -631,10 +632,52 @@ def mcp_result_shape(value: object) -> dict:
     return shape
 
 
+def sanitize_persisted_trace(value):
+    """Retain diagnostic metadata without storing free text or raw tool bodies."""
+    if isinstance(value, dict):
+        safe = {}
+        for key, item in value.items():
+            lowered = str(key).lower()
+            if any(marker in lowered for marker in ("key", "token", "secret", "assertion", "authorization")):
+                safe[key] = "[redacted]"
+            elif lowered in {"message", "prompt", "answer", "reply", "error", "traceback", "raw_response", "response_body", "payload_text"}:
+                safe[key] = ({"redacted": True, "length": len(item)} if isinstance(item, str) else "[redacted]")
+            elif lowered in {"result", "structuredcontent", "backend_response", "mcp_response"}:
+                safe[key] = mcp_result_shape(item)
+            else:
+                safe[key] = sanitize_persisted_trace(item)
+        return safe
+    if isinstance(value, list):
+        return [sanitize_persisted_trace(item) for item in value[:1000]]
+    if isinstance(value, str):
+        return value[:2000]
+    return value
+
+
 def db() -> psycopg.Connection:
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured")
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+
+def persist_debug_trace(trace: dict) -> None:
+    """Persist redacted dashboard events while keeping the in-memory hot buffer."""
+    if not AI_DEBUG_DASHBOARD_ENABLED or not DATABASE_URL:
+        return
+    try:
+        safe_payload = sanitize_persisted_trace(trace)
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ai_debug_traces (request_id, event, payload, created_at) VALUES (%s, %s, %s, %s)",
+                    (str(safe_payload.get("request_id") or safe_payload.get("job_id") or "unknown"),
+                     str(safe_payload.get("event") or "trace"), json.dumps(safe_payload),
+                     trace.get("timestamp") or datetime.now(timezone.utc).isoformat()),
+                )
+            conn.commit()
+    except Exception as error:
+        # Debug persistence must never fail a user request; normal logs still retain the event.
+        print(json.dumps({"event": "debug_trace_persist_failed", "error": str(error)}, ensure_ascii=False), flush=True)
 
 
 def json_error(code: str, message: str, retryable: bool = False, request_id: str | None = None) -> dict:
@@ -709,6 +752,28 @@ def daxview_identity(headers) -> dict:
 def require_database() -> None:
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL is not configured")
+
+
+def ensure_debug_trace_schema() -> None:
+    if not DATABASE_URL:
+        return
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ai_debug_traces (
+                    id BIGSERIAL PRIMARY KEY,
+                    request_id TEXT NOT NULL,
+                    event TEXT NOT NULL,
+                    payload JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS ai_debug_traces_created_idx ON ai_debug_traces (created_at DESC, id DESC)")
+            cur.execute("CREATE INDEX IF NOT EXISTS ai_debug_traces_request_idx ON ai_debug_traces (request_id, id DESC)")
+            cur.execute("ALTER TABLE daxview_turns ADD COLUMN IF NOT EXISTS parent_turn_id UUID REFERENCES daxview_turns(id) ON DELETE SET NULL")
+            cur.execute("ALTER TABLE daxview_turns ADD COLUMN IF NOT EXISTS clarification_state JSONB NOT NULL DEFAULT '{}'::jsonb")
+            cur.execute("CREATE INDEX IF NOT EXISTS daxview_turns_parent_idx ON daxview_turns (parent_turn_id) WHERE parent_turn_id IS NOT NULL")
+        conn.commit()
 
 
 def safe_job_id(turn_id: str) -> str:
@@ -5370,11 +5435,24 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
             "reply": str(context["_planner_clarification"]),
             "resolved_plan": planner_plan or resolved_plan_for_result("clarification", [], context),
         }
+    if context.get("_clarification_result"):
+        return context["_clarification_result"]
+    if operation_ids and daxview_clarification_needed(message, operation_ids):
+        return build_incomplete_request_clarification(message, context, request_id)
     if not operation_ids:
         result = langchain_chat_response(message, request_id, session_id)
         result["resolved_plan"] = resolved_plan_for_result("ok", [], context)
         return result
     context = dict(context)
+    if context.get("_clarification_device_unresolved"):
+        return build_incomplete_request_clarification(message, context, request_id)
+    if context.get("_clarification_device_ref") and not context.get("device_id") and context.get("site_id"):
+        match = resolve_named_device_reference(turn_id, context["_clarification_device_ref"], context, request_id)
+        if match.get("status") == "matched":
+            context["device_id"] = match["device_id"]
+            context["_device_name"] = match["device_name"]
+        else:
+            return build_incomplete_request_clarification(message, context, request_id)
     if requested_device_id(message):
         context["device_id"] = requested_device_id(message)
     if wants_named_device_metric_query(message):
@@ -5664,6 +5742,35 @@ def save_turn_memory(turn_id: str, reply: str, resolved_plan: dict) -> None:
         conn.commit()
 
 
+def save_turn_clarification_state(turn_id: str, state: dict) -> None:
+    if not DATABASE_URL:
+        return
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE daxview_turns SET clarification_state = %s WHERE id = %s", (json.dumps(state), turn_id))
+        conn.commit()
+
+
+def get_latest_pending_clarification(conversation_id: str, identity: dict) -> dict | None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT t.id, t.user_message, t.request_id, t.context, t.clarification_state, t.resolved_plan,
+                       c.title
+                FROM daxview_turns t
+                JOIN daxview_conversations c ON c.id = t.conversation_id
+                JOIN daxview_jobs j ON j.turn_id = t.id
+                WHERE t.conversation_id = %s AND t.deployment_id = %s AND t.company_id = %s AND t.user_id = %s
+                  AND c.status = 'active' AND j.status = 'completed'
+                  AND t.clarification_state->>'status' = 'waiting'
+                ORDER BY t.created_at DESC LIMIT 1
+                """,
+                (conversation_id, identity["deployment_id"], identity["company_id"], identity["user_id"]),
+            )
+            return cur.fetchone()
+
+
 def resolved_plan_for_result(status: str, operation_ids: list[str], context: dict, results: list[dict] | None = None, errors: list[dict] | None = None) -> dict:
     safe_results = results or []
     slots = {
@@ -5698,7 +5805,9 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
         if result.get("provider") == "daxview-question-filter":
             waiting_event = {
                 "prompt": result["reply"],
-                "fields": result.get("fields") or ["site_id", "building_id", "time_range"],
+                "fields": result.get("fields") or result.get("required_fields") or ["site_id", "building_id", "device", "metric", "time_range"],
+                "input_type": "text",
+                "example": result.get("example") or "For example: ‘Show energy readings for Main Meter from 1–7 October 2026.’",
             }
             if result.get("input_type"):
                 waiting_event["input_type"] = result["input_type"]
@@ -5706,6 +5815,7 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
                 waiting_event["choices"] = result["choices"]
             if result.get("submit_template"):
                 waiting_event["submit_template"] = result["submit_template"]
+            waiting_event["example"] = result.get("example") or "For example: ‘Show energy readings for Main Meter from 1–7 October 2026.’"
             add_job_event(
                 job_id,
                 "waiting_for_user",
@@ -5715,6 +5825,13 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
             add_job_event(job_id, "completed", {"status": "completed"})
             debug_trace_event("ai_outcome_debug", request_id=request_id, status="waiting_for_user", answer=result["reply"], charts=[])
             save_turn_memory(turn_id, result["reply"], result.get("resolved_plan") or {})
+            state = result.get("clarification_state") or {
+                "status": "waiting",
+                "original_message": message,
+                "required_fields": result.get("required_fields") or [],
+            }
+            state["status"] = "waiting"
+            save_turn_clarification_state(turn_id, state)
             return
         message_event = {"text": result["reply"]}
         if result.get("charts"):
@@ -5760,6 +5877,7 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
             charts_enabled=AI_CHARTS_ENABLED,
         )
         save_turn_memory(turn_id, result["reply"], result.get("resolved_plan") or {})
+        save_turn_clarification_state(turn_id, {"status": "resolved"})
     except Exception as error:
         log_event(
             "daxview_job_failed",
@@ -5798,6 +5916,119 @@ def needs_device_choice(message: str) -> bool:
     if any(phrase in lowered for phrase in ("all devices", "every device", "top devices")):
         return False
     return requested_device_id(message) is None and not re.search(r"\bumg[\s-]?\d+\b", lowered)
+
+
+def llm_clarification_prompt(original_message: str, missing_fields: list[str], device_names: list[str] | None = None) -> str:
+    fields = ", ".join(missing_fields)
+    devices = device_names or []
+    instruction = (
+        "Write one concise, friendly clarification question for an EMS operator. "
+        "Ask only for missing details from this list. Do not claim data has been fetched. "
+        "Include a typed example sentence with a specific device, metric, and date range when relevant. "
+        "If device names are provided, include them as readable text (up to 15), not a dropdown. "
+        "Return only the text shown to the user."
+    )
+    prompt_data = {"original_question": original_message, "missing_details": missing_fields, "available_devices": devices[:15]}
+    try:
+        result = ollama_json(
+            "/api/chat",
+            {"model": CHAT_MODEL, "messages": [
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": json.dumps(prompt_data, ensure_ascii=False)},
+            ], "stream": False, "options": {"temperature": 0.2}},
+            timeout=min(OLLAMA_GENERATE_TIMEOUT, 30),
+        )
+        content = result.get("message", {}).get("content", "")
+        prompt = str(content).strip()
+        if prompt:
+            return prompt[:1800]
+    except Exception as error:
+        log_event("clarification_prompt_model_fallback", error=str(error))
+    prompt = f"I can help with that. Please provide the {fields}."
+    if devices:
+        prompt += " Available devices: " + "; ".join(devices[:15]) + "."
+    prompt += " For example: ‘Show energy readings for Main Meter from 1–7 October 2026.’"
+    return prompt
+
+
+def extract_clarification_details(original_message: str, reply: str, context: dict, request_id: str) -> tuple[str, dict, dict]:
+    extraction = {"original_question": original_message, "operator_reply": reply,
+                  "known_context": {key: context.get(key) for key in ("site_id", "building_id", "device_id", "metric") if context.get(key) is not None}}
+    try:
+        data = ollama_json("/api/chat", {"model": PLANNER_MODEL, "messages": [
+            {"role": "system", "content": "Extract only details explicitly stated in operator_reply that refine original_question. Never invent IDs. Return JSON keys query (standalone complete question), metric, device_ref, time_phrase, site_ref, building_ref. Use null when absent."},
+            {"role": "user", "content": json.dumps(extraction, ensure_ascii=False)},
+        ], "stream": False, "format": {"type": "json"}, "options": {"temperature": 0}}, timeout=PLANNER_TIMEOUT)
+        content = data.get("message", {}).get("content", "{}")
+        slots = json.loads(content) if isinstance(content, str) else {}
+        if not isinstance(slots, dict): slots = {}
+    except Exception as error:
+        log_event("clarification_extract_fallback", request_id=request_id, error=str(error))
+        slots = {}
+    # Preserve the original operator intent verbatim; extracted slot fields only
+    # enrich server context and never replace the request with model-authored text.
+    query = f"{original_message}\nAdditional details from the operator: {reply}".strip()
+    merged = dict(context)
+    if slots.get("metric") and not merged.get("metric"): merged["metric"] = str(slots["metric"])
+    if not merged.get("metric"):
+        reply_metrics = question_metrics(reply)
+        if reply_metrics:
+            merged["metric"] = reply_metrics[0]
+            slots["metric"] = reply_metrics[0]
+    if slots.get("time_phrase") and not has_time_scope(reply):
+        query = f"{query} {slots['time_phrase']}"
+    if not slots.get("time_phrase") and has_time_scope(reply):
+        query = f"{query} {reply}"
+    if slots.get("device_ref"): merged["_clarification_device_ref"] = str(slots["device_ref"])
+    if not slots.get("device_ref") and has_named_device_reference(reply):
+        slots["device_ref"] = reply.strip()
+        merged["_clarification_device_ref"] = reply.strip()
+    if slots.get("building_ref") and str(slots["building_ref"]).isdigit() and not merged.get("building_id"):
+        merged["building_id"] = int(slots["building_ref"])
+    if slots.get("metric"):
+        query += f" Metric: {slots['metric']}."
+    if slots.get("device_ref"):
+        query += f" Device: {slots['device_ref']}."
+    if slots.get("site_ref"):
+        query += f" Site: {slots['site_ref']}."
+    return query, merged, slots
+
+
+def build_incomplete_request_clarification(message: str, context: dict, request_id: str) -> dict:
+    missing = []
+    if not context.get("site_id"):
+        if not re.search(r"\b(?:at|for|site|building)\b", message.lower()):
+            missing.append("site/site scope")
+        else:
+            missing.append("site/site scope (select this site in DaxView so it can be authorized)")
+    if needs_device_choice(message) or (question_metrics(message) and not has_named_device_reference(message) and not context.get("device_id") and not wants_device_usage_ranking(message)):
+        missing.append("device or meter")
+    if not question_metrics(message) and not any(word in message.lower() for word in ("alarm", "device list", "devices", "meters")):
+        missing.append("metric (such as energy, demand, voltage, or current)")
+    if not has_time_scope(message):
+        missing.append("time period (such as last 7 days or 1–7 October 2026)")
+    devices = []
+    if context.get("site_id") and context.get("company_id") and context.get("deployment_id"):
+        try:
+            arguments = build_historical_arguments("site_device_list", {**context, "limit": 100}, message)
+            result = call_authorized_internal_operation(str(uuid.uuid4()), "site_device_list", arguments, request_id, message)
+            data = historical_result_data(result)
+            devices = [str(first_value(item, ("device_name", "name", "meter_name", "label")))
+                       for item in first_list(data, ("devices", "rows", "items", "meters"))
+                       if isinstance(item, dict) and first_value(item, ("device_name", "name", "meter_name", "label"))]
+        except Exception as error:
+            log_event("clarification_device_list_unavailable", request_id=request_id, error=str(error))
+    prompt = llm_clarification_prompt(message, missing or ["device, metric, and time period"], devices)
+    if not context.get("site_id"):
+        prompt += " Please select the site in DaxView first; I can only read devices from your authorized site."
+    return {
+        "provider": "daxview-question-filter",
+        "reply": prompt,
+        "required_fields": missing,
+        "example": "For example: ‘Show energy readings for Main Meter from 1–7 October 2026.’",
+        "clarification_state": {"status": "waiting", "original_message": message, "required_fields": missing},
+        "resolved_plan": resolved_plan_for_result("clarification", [], context),
+    }
 
 
 def wants_highest_demand_device(message: str) -> bool:
@@ -6872,8 +7103,9 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
     <main id="trace-workspace">
       <section class="panel">
         <h2>Recent Requests</h2>
-        <div class="toolbar"><input id="filter" placeholder="Filter request/tool/error..." /></div>
+        <div class="toolbar"><input id="filter" placeholder="Search saved traces..." /></div>
         <div id="requests" class="request-list"><div class="empty">Loading...</div></div>
+        <button id="load-more" type="button" hidden>Load older traces</button>
       </section>
       <section class="panel">
         <h2>Timeline</h2>
@@ -6886,6 +7118,8 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       let grouped = [];
       let selected = null;
       let activeView = "traces";
+      let nextTraceCursor = null;
+      let currentTraceSearch = "";
 
       function eventClass(name) {
         if (/failed|error|unavailable|rejected|timeout|404|403|409|429|500/i.test(name)) return "fail";
@@ -7138,13 +7372,27 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         return [...map.entries()].map(([id, events]) => ({id, events: events.slice().reverse()}));
       }
       async function load() {
-        const res = await fetch("/debug/traces");
+        const search = document.querySelector("#filter").value.trim();
+        if (search !== currentTraceSearch) {
+          grouped = [];
+          nextTraceCursor = null;
+          currentTraceSearch = search;
+        }
+        const query = new URLSearchParams({limit: "200"});
+        if (nextTraceCursor) query.set("before_id", String(nextTraceCursor));
+        if (search) query.set("q", search);
+        const res = await fetch(`/debug/traces?${query}`);
         if (!res.ok) {
           document.querySelector("#requests").innerHTML = '<div class="empty">Unauthorized or debug dashboard disabled.</div>';
           return;
         }
         const data = await res.json();
-        grouped = groupTraces(data.traces || []);
+        const incoming = groupTraces(data.traces || []);
+        const merged = new Map(grouped.map(group => [group.id, group]));
+        incoming.forEach(group => merged.set(group.id, group));
+        grouped = [...merged.values()];
+        nextTraceCursor = data.next_before_id || null;
+        document.querySelector("#load-more").hidden = !nextTraceCursor;
         renderRequests();
         if (selected) renderTimeline(selected);
       }
@@ -7217,7 +7465,13 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         else if (activeView === "sandbox") window.SandboxChat.refresh();
         else load();
       });
-      document.querySelector("#filter").addEventListener("input", renderRequests);
+      document.querySelector("#load-more").addEventListener("click", load);
+      document.querySelector("#filter").addEventListener("input", () => {
+        grouped = [];
+        nextTraceCursor = null;
+        clearTimeout(window.traceSearchTimer);
+        window.traceSearchTimer = setTimeout(load, 250);
+      });
       document.querySelectorAll(".tabs button").forEach(button => button.addEventListener("click", () => {
         activeView = button.dataset.view;
         document.querySelectorAll(".tabs button").forEach(tab => tab.classList.toggle("active", tab === button));
@@ -7871,6 +8125,61 @@ class ChatHandler(BaseHTTPRequestHandler):
                 if not message:
                     self._send_json(400, json_error("invalid_turn", "message is required.", False, request_id))
                     return True
+                pending = get_latest_pending_clarification(conversation_id, identity)
+                parent_turn_id = None
+                clarification = {}
+                if pending:
+                    clarification = pending.get("clarification_state") or {}
+                    original_message = str(clarification.get("original_message") or pending.get("user_message") or "")
+                    prior_context = pending.get("context") or {}
+                    if isinstance(prior_context, str):
+                        prior_context = json.loads(prior_context)
+                    context = {**prior_context, **context}
+                    context["_original_user_message"] = original_message
+                    context["_clarification_reply"] = message
+                    candidate_message, context, extracted = extract_clarification_details(original_message, message, context, request_id)
+                    if not context.get("site_id") and extracted.get("site_ref"):
+                        site_ref = str(extracted["site_ref"]).strip().lower()
+                        authorized_sites = context.get("authorized_sites") or context.get("sites") or []
+                        site_matches = [item for item in authorized_sites if isinstance(item, dict) and
+                                        site_ref in str(item.get("name") or item.get("site_name") or "").lower()]
+                        if len(site_matches) == 1:
+                            context["site_id"] = site_matches[0].get("site_id") or site_matches[0].get("id")
+                            context["_site_name"] = site_matches[0].get("name") or site_matches[0].get("site_name")
+                    if context.get("site_id") and extracted.get("device_ref") and not context.get("device_id"):
+                        resolution = resolve_named_device_reference(
+                            str(uuid.uuid4()), str(extracted["device_ref"]), context, request_id
+                        )
+                        if resolution.get("status") == "matched":
+                            context["device_id"] = resolution["device_id"]
+                            context["_device_name"] = resolution["device_name"]
+                        else:
+                            context["_clarification_device_unresolved"] = True
+                    operations, _merged_context, _plan = choose_historical_operations(candidate_message, context, request_id)
+                    remaining = []
+                    if not context.get("site_id"):
+                        remaining.append("site/site scope")
+                    if context.get("_clarification_device_unresolved") or ("device or meter" in clarification.get("required_fields", []) and not context.get("device_id") and not wants_highest_demand_device(candidate_message)):
+                        remaining.append("device or meter")
+                    if "metric" in clarification.get("required_fields", []) and not context.get("metric") and not question_metrics(candidate_message):
+                        remaining.append("metric")
+                    if ("time period" in " ".join(clarification.get("required_fields", [])) or "period" in " ".join(clarification.get("required_fields", []))) and not has_time_scope(candidate_message):
+                        remaining.append("time period")
+                    if (operations and daxview_clarification_needed(candidate_message, operations)) or remaining:
+                        clarification_result = build_incomplete_request_clarification(original_message, context, request_id)
+                        if remaining:
+                            clarification_result["required_fields"] = remaining
+                        clarification_result["clarification_state"] = {
+                            **clarification,
+                            "status": "waiting",
+                            "original_message": original_message,
+                            "last_reply": message,
+                            "required_fields": clarification_result.get("required_fields") or [],
+                        }
+                        context["_clarification_result"] = clarification_result
+                        context["_clarification_parent_turn_id"] = str(pending["id"])
+                    parent_turn_id = str(pending["id"])
+                    message = candidate_message
                 job_id = safe_job_id(turn_id)
                 created = False
                 with db() as conn:
@@ -7887,8 +8196,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                             return True
                         cur.execute(
                             """
-                            INSERT INTO daxview_turns (id, conversation_id, deployment_id, company_id, user_id, user_message, request_id, context)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            INSERT INTO daxview_turns (id, conversation_id, deployment_id, company_id, user_id, user_message, request_id, context, parent_turn_id)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                             ON CONFLICT DO NOTHING
                             """,
                             (
@@ -7900,6 +8209,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                                 message,
                                 request_id,
                                 json.dumps(context),
+                                parent_turn_id,
                             ),
                         )
                         created = cur.rowcount > 0
@@ -7914,6 +8224,12 @@ class ChatHandler(BaseHTTPRequestHandler):
                         cur.execute("UPDATE daxview_conversations SET updated_at = now() WHERE id = %s", (conversation_id,))
                     conn.commit()
                 if created:
+                    if parent_turn_id and not context.get("_clarification_result"):
+                        with db() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute("UPDATE daxview_turns SET clarification_state = %s WHERE id = %s",
+                                            (json.dumps({**clarification, "status": "answered", "last_reply": request.get("message")}), parent_turn_id))
+                            conn.commit()
                     add_job_event(job_id, "status", {"text": "Accepted turn"})
                     DAXVIEW_JOB_EXECUTOR.submit(process_daxview_turn, job_id, turn_id, message, context, request_id, conversation_id)
                 self._send_json(202, {"job_id": job_id})
@@ -8131,7 +8447,38 @@ class ChatHandler(BaseHTTPRequestHandler):
             if not self._debug_allowed():
                 self._send_json(404, json_error("disabled", "Debug dashboard is disabled.", False))
                 return
-            self._send_json(200, {"traces": list(TRACES)})
+            query = parse_qs(parsed.query)
+            try:
+                limit = min(max(int((query.get("limit") or [str(TRACE_PAGE_SIZE)])[0]), 1), 500)
+                before_id = max(int((query.get("before_id") or ["0"])[0]), 0)
+                search = str((query.get("q") or [""])[0]).strip()[:200]
+                if DATABASE_URL:
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute(
+                                """
+                                SELECT id, payload FROM ai_debug_traces
+                                WHERE (%s = 0 OR id < %s)
+                                ORDER BY id DESC LIMIT %s
+                                """,
+                                (before_id, before_id, limit * (5 if search else 1) + 1),
+                            )
+                            rows = cur.fetchall()
+                    scanned = rows
+                    if search:
+                        rows = [row for row in scanned if search.lower() in json.dumps(row["payload"], ensure_ascii=False).lower()]
+                    has_more = len(scanned) > limit or (search and len(rows) < limit and bool(scanned))
+                    page = rows[:limit]
+                    self._send_json(200, {
+                        "traces": [{**row["payload"], "trace_id": row["id"]} for row in page],
+                        "next_before_id": (scanned[-1]["id"] if search else page[-1]["id"]) if has_more and scanned else None,
+                        "persistent": True,
+                    })
+                else:
+                    self._send_json(200, {"traces": list(TRACES)[:limit], "next_before_id": None, "persistent": False})
+            except Exception as error:
+                log_event("debug_trace_query_failed", error=str(error))
+                self._send_json(200, {"traces": list(TRACES)[:TRACE_LIMIT], "next_before_id": None, "persistent": False})
             return
         self._send_json(404, {"error": "Not found"})
 
@@ -8289,6 +8636,10 @@ class ChatHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    try:
+        ensure_debug_trace_schema()
+    except Exception as error:
+        print(json.dumps({"event": "debug_trace_schema_unavailable", "error": str(error)}), flush=True)
     server = ThreadingHTTPServer((HOST, PORT), ChatHandler)
     print(f"AI-Server listening on http://{HOST}:{PORT}")
     try:
