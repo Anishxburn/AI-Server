@@ -7358,6 +7358,8 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
       let activeView = "traces";
       let nextTraceCursor = null;
       let currentTraceSearch = "";
+      let traceLoadInFlight = false;
+      let traceLoadGeneration = 0;
 
       function eventClass(name) {
         if (/failed|error|unavailable|rejected|timeout|404|403|409|429|500/i.test(name)) return "fail";
@@ -7491,6 +7493,17 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         });
         return root;
       }
+      function outcomeText(value) {
+        if (typeof value === "string") return value;
+        if (value == null) return "";
+        if (typeof value === "object") {
+          for (const key of ["text", "reply", "content", "answer", "message"]) {
+            if (typeof value[key] === "string" && value[key].trim()) return value[key];
+          }
+          return JSON.stringify(value, null, 2);
+        }
+        return String(value);
+      }
       function tableColumn(column) {
         if (typeof column === "string") return { key: column, label: column };
         if (Array.isArray(column)) return { key: column[0], label: column[1] || column[0] };
@@ -7532,12 +7545,13 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
           <pre>${escapeHtml(JSON.stringify(details, null, 2))}</pre></details>`;
       }
       function renderOutcome(events) {
-        const outcome = events.find(event => event.event === "ai_outcome_debug" || event.event === "sandbox_outcome_debug");
-        const final = events.find(event => event.event === "ai_final_response_debug");
-        const failed = events.find(event => event.event === "daxview_job_failed");
-        const unavailable = events.find(event => event.event === "energy_prediction_unavailable");
-        const fallback = events.find(event => event.event === "mcp_answer_refine_fallback");
-        const answer = outcome?.answer || final?.answer || "";
+        const latest = predicate => events.slice().reverse().find(predicate);
+        const outcome = latest(event => event.event === "ai_outcome_debug" || event.event === "sandbox_outcome_debug");
+        const final = latest(event => event.event === "ai_final_response_debug");
+        const failed = latest(event => event.event === "daxview_job_failed");
+        const unavailable = latest(event => event.event === "energy_prediction_unavailable");
+        const fallback = latest(event => event.event === "mcp_answer_refine_fallback");
+        const answer = outcomeText(outcome?.answer ?? final?.answer ?? "");
         const charts = outcome?.charts || final?.charts || [];
         const tables = outcome?.tables || final?.tables || [];
         const report = outcome?.report || null;
@@ -7607,32 +7621,64 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
           if (!map.has(id)) map.set(id, []);
           map.get(id).push(trace);
         }
-        return [...map.entries()].map(([id, events]) => ({id, events: events.slice().reverse()}));
+        return [...map.entries()].map(([id, events]) => ({id, events}));
       }
-      async function load() {
+      function traceOrder(event) {
+        const id = Number(event?.trace_id);
+        if (Number.isFinite(id) && id > 0) return id;
+        const time = Date.parse(event?.timestamp || "");
+        return Number.isFinite(time) ? time : 0;
+      }
+      function mergeTraceGroups(incoming) {
+        const merged = new Map(grouped.map(group => [group.id, new Map(
+          group.events.map(event => [String(event.trace_id ?? `${event.event}|${event.timestamp}|${JSON.stringify(event)}`), event])
+        )]));
+        incoming.forEach(group => {
+          if (!merged.has(group.id)) merged.set(group.id, new Map());
+          const events = merged.get(group.id);
+          group.events.forEach(event => events.set(String(event.trace_id ?? `${event.event}|${event.timestamp}|${JSON.stringify(event)}`), event));
+        });
+        grouped = [...merged.entries()].map(([id, events]) => ({
+          id,
+          events: [...events.values()].sort((a, b) => traceOrder(a) - traceOrder(b)),
+        })).sort((a, b) => traceOrder(b.events[b.events.length - 1]) - traceOrder(a.events[a.events.length - 1]));
+      }
+      async function load({older = false} = {}) {
+        if (traceLoadInFlight) return;
+        traceLoadInFlight = true;
         const search = document.querySelector("#filter").value.trim();
         if (search !== currentTraceSearch) {
           grouped = [];
           nextTraceCursor = null;
           currentTraceSearch = search;
+          selected = null;
+          traceLoadGeneration++;
         }
+        if (older && !nextTraceCursor) { traceLoadInFlight = false; return; }
+        const generation = traceLoadGeneration;
         const query = new URLSearchParams({limit: "200"});
-        if (nextTraceCursor) query.set("before_id", String(nextTraceCursor));
+        if (older && nextTraceCursor) query.set("before_id", String(nextTraceCursor));
         if (search) query.set("q", search);
-        const res = await fetch(`/debug/traces?${query}`);
-        if (!res.ok) {
-          document.querySelector("#requests").innerHTML = '<div class="empty">Unauthorized or debug dashboard disabled.</div>';
-          return;
+        try {
+          const res = await fetch(`/debug/traces?${query}`);
+          if (generation !== traceLoadGeneration) return;
+          if (!res.ok) {
+            document.querySelector("#requests").innerHTML = '<div class="empty">Unauthorized or debug dashboard disabled.</div>';
+            return;
+          }
+          const data = await res.json();
+          if (generation !== traceLoadGeneration) return;
+          mergeTraceGroups(groupTraces(data.traces || []));
+          if (older || !nextTraceCursor) nextTraceCursor = data.next_before_id || null;
+          document.querySelector("#load-more").hidden = !nextTraceCursor;
+          renderRequests();
+          if (selected) renderTimeline(selected);
+        } catch (error) {
+          console.error("Trace refresh failed", error);
+        } finally {
+          traceLoadInFlight = false;
+          if (generation !== traceLoadGeneration) setTimeout(() => load(), 0);
         }
-        const data = await res.json();
-        const incoming = groupTraces(data.traces || []);
-        const merged = new Map(grouped.map(group => [group.id, group]));
-        incoming.forEach(group => merged.set(group.id, group));
-        grouped = [...merged.values()];
-        nextTraceCursor = data.next_before_id || null;
-        document.querySelector("#load-more").hidden = !nextTraceCursor;
-        renderRequests();
-        if (selected) renderTimeline(selected);
       }
       function renderRequests() {
         const filter = document.querySelector("#filter").value.toLowerCase();
@@ -7703,10 +7749,12 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         else if (activeView === "sandbox") window.SandboxChat.refresh();
         else load();
       });
-      document.querySelector("#load-more").addEventListener("click", load);
+      document.querySelector("#load-more").addEventListener("click", () => load({older: true}));
       document.querySelector("#filter").addEventListener("input", () => {
         grouped = [];
         nextTraceCursor = null;
+        selected = null;
+        traceLoadGeneration++;
         clearTimeout(window.traceSearchTimer);
         window.traceSearchTimer = setTimeout(load, 250);
       });
@@ -7730,7 +7778,7 @@ DEBUG_DASHBOARD_HTML = """<!doctype html>
         else document.querySelector("#timeline").innerHTML = '<div class="empty">Select a request.</div>';
       }));
       load();
-      setInterval(load, 10000);
+      setInterval(() => load(), 10000);
     </script>
     <script src="/debug/assets/prediction_lab.js"></script>
   </body>
