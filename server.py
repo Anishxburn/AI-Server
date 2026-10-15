@@ -8337,8 +8337,43 @@ class ChatHandler(BaseHTTPRequestHandler):
                         prior_context = json.loads(prior_context)
                     clarification["original_message"] = original_message
                     clarification["slots"] = clarification.get("slots") or {}
-                    known_slots = clarification.get("known_slots") or {}
+                    known_slots = dict(clarification.get("known_slots") or {})
+                    saved_devices = clarification.get("available_devices") or []
+                    saved_device_ref = known_slots.get("device_ref") or known_slots.get("device_name")
+                    if saved_device_ref:
+                        normalized_saved_ref = normalize_device_name(saved_device_ref)
+                        exact_saved_device = next(
+                            (name for name in saved_devices if normalize_device_name(name) == normalized_saved_ref),
+                            None,
+                        )
+                        if exact_saved_device:
+                            known_slots["device_ref"] = exact_saved_device
+                        elif (
+                            len(str(saved_device_ref)) > 80
+                            or re.search(r"\b(?:show|readings?|historical|please|metric|period)\b", str(saved_device_ref), re.IGNORECASE)
+                        ):
+                            known_slots.pop("device_ref", None)
+                            known_slots.pop("device_name", None)
+                    saved_time_phrase = known_slots.get("time_phrase")
+                    if saved_time_phrase and re.search(r"\b(?:show|readings?|historical)\b", str(saved_time_phrase), re.IGNORECASE):
+                        saved_time_match = re.search(
+                            r"\b(?:for\s+)?(?:the\s+)?(?:last|past)\s+\d{1,3}\s+(?:days?|weeks?|months?)\b",
+                            str(saved_time_phrase),
+                            re.IGNORECASE,
+                        )
+                        if saved_time_match:
+                            known_slots["time_phrase"] = saved_time_match.group(0).strip()
+                        else:
+                            known_slots.pop("time_phrase", None)
                     context = {**prior_context, **context, **clarification.get("slots", {}), **known_slots}
+                    if not known_slots.get("device_ref") and not known_slots.get("device_name"):
+                        stale_device_ref = context.get("_clarification_device_ref")
+                        if stale_device_ref and (
+                            len(str(stale_device_ref)) > 80
+                            or re.search(r"\b(?:show|readings?|historical|please|metric|period)\b", str(stale_device_ref), re.IGNORECASE)
+                        ):
+                            context.pop("_clarification_device_ref", None)
+                            context.pop("_device_name", None)
                     if known_slots.get("metric"):
                         context["metric"] = known_slots["metric"]
                     if known_slots.get("time_phrase"):
@@ -8356,7 +8391,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                         available_devices=clarification.get("available_devices") or [],
                     )
                     slot_updates = {}
-                    known_slots = dict(clarification.get("known_slots") or clarification.get("slots") or {})
+                    known_slots = dict(known_slots)
                     list_devices = bool(extracted.get("list_devices"))
                     if extracted.get("metric"):
                         slot_updates["metric"] = str(extracted["metric"])
