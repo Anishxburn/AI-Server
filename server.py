@@ -985,6 +985,15 @@ def wants_device_usage_ranking(message: str) -> bool:
     return has_device and has_usage and has_rank
 
 
+def wants_sitewide_energy_ranking(message: str) -> bool:
+    lowered = message.lower()
+    asks_energy = bool(re.search(r"\b(?:energy|kwh|kilowatt[- ]?hours?)\b", lowered))
+    asks_for_extreme = bool(re.search(r"\b(?:highest|max(?:imum)?|peak|top|most|largest|biggest)\b", lowered))
+    if not asks_energy or not asks_for_extreme or wants_sitewide_energy_total(message):
+        return False
+    return not has_named_device_reference(message)
+
+
 def wants_sitewide_energy_total(message: str) -> bool:
     lowered = message.lower()
     asks_kwh = bool(re.search(r"\b(?:kwh|kilowatt[- ]?hours?|energy|consumption|usage)\b", lowered))
@@ -1011,6 +1020,7 @@ DEVICE_REFERENCE_STOPWORDS = {
     "last", "time", "series", "timeseries", "plot", "chart", "table", "available", "data", "please",
     "overall", "all", "site", "total", "sitewide", "highest", "top", "rank", "ranking", "consumer",
     "max", "maximum", "peak",
+    "list", "out", "what", "which", "the", "of", "is",
     "consumers", "most", "used", "use", "using", "used", "usage",
 }
 
@@ -1386,6 +1396,8 @@ def select_historical_operations(message: str) -> list[str]:
     lowered = message.lower()
     if wants_sitewide_energy_total(message):
         return ["site_energy_summary"]
+    if wants_sitewide_energy_ranking(message):
+        return ["device_energy_ranking"]
     if wants_named_device_metric_query(message):
         return ["telemetry_timeseries"]
     if re.search(r"\b(?:maximum demand|max demand|peak demand|highest demand|maximum kw|max kw|peak kw|highest kw)\b", lowered):
@@ -1616,6 +1628,17 @@ def choose_historical_operations(message: str, context: dict, request_id: str) -
             request_id=request_id,
             planner_skipped=True,
             reason="deterministic_top_consumer_route",
+            regex_tools=regex_operations,
+            selected_tools=regex_operations,
+            context=context,
+        )
+        return regex_operations, context, None
+    if AI_PLANNER_ENABLED and not AI_PLANNER_SHADOW_MODE and wants_sitewide_energy_ranking(message):
+        debug_trace_event(
+            "planner_intention_debug",
+            request_id=request_id,
+            planner_skipped=True,
+            reason="deterministic_sitewide_energy_ranking_route",
             regex_tools=regex_operations,
             selected_tools=regex_operations,
             context=context,
