@@ -6037,7 +6037,7 @@ def llm_clarification_prompt(original_message: str, missing_fields: list[str], d
     return prompt
 
 
-def extract_clarification_details(original_message: str, reply: str, context: dict, request_id: str) -> tuple[str, dict, dict]:
+def extract_clarification_details(original_message: str, reply: str, context: dict, request_id: str, available_devices: list[str] | None = None) -> tuple[str, dict, dict]:
     extraction = {"original_question": original_message, "operator_reply": reply,
                   "known_context": {key: context.get(key) for key in ("site_id", "building_id", "device_id", "metric") if context.get(key) is not None}}
     try:
@@ -6055,20 +6055,49 @@ def extract_clarification_details(original_message: str, reply: str, context: di
         slots["list_devices"] = True
     # Deterministic fallbacks keep short replies useful when the planner model
     # is unavailable or returns malformed JSON.
-    if not slots.get("metric"):
-        metrics = question_metrics(reply)
-        if metrics:
-            slots["metric"] = metrics[0]
-    if not slots.get("time_phrase") and has_time_scope(reply):
+    metrics = question_metrics(reply)
+    if metrics:
+        slots["metric"] = metrics[0]
+    # Prefer an exact authorized inventory name over an LLM extraction. This
+    # prevents the whole sentence (including the old prompt) becoming a device.
+    normalized_reply = normalize_device_name(reply)
+    inventory_match = next((name for name in sorted(available_devices or [], key=len, reverse=True)
+                            if normalize_device_name(name) and normalize_device_name(name) in normalized_reply), None)
+    if inventory_match:
+        slots["device_ref"] = inventory_match
+    elif slots.get("device_ref"):
+        candidate_ref = str(slots["device_ref"]).strip(" \t\r\n.,;:'\"“”‘’")
+        if (len(candidate_ref) > 80 or re.search(r"\b(?:show|readings?|historical|metric|period|last|past)\b", candidate_ref, re.IGNORECASE)):
+            slots.pop("device_ref", None)
+    if not slots.get("device_ref"):
+        # Handle a complete sentence when the selected device is not in the
+        # cached list, while excluding the surrounding metric and time text.
+        named = re.search(
+            r"\b(?:readings?|data)\s+for\s+(.+?)(?=\s+(?:for|from|over|during|between)\s+(?:the\s+)?(?:last|past|\d)|[,;.]|$)",
+            reply,
+            re.IGNORECASE,
+        )
+        if named:
+            slots["device_ref"] = named.group(1).strip(" \t\r\n.,;:'\"“”‘’")
+    time_match = re.search(
+        r"\b(?:for\s+)?(?:the\s+)?(?:last|past)\s+\d{1,3}\s+(?:days?|weeks?|months?)\b",
+        reply,
+        re.IGNORECASE,
+    )
+    if time_match:
+        slots["time_phrase"] = time_match.group(0).strip()
+    elif not slots.get("time_phrase") and has_time_scope(reply):
         slots["time_phrase"] = reply.strip()
     if not slots.get("device_ref") and not slots.get("list_devices"):
         device_text = reply.strip()
         device_text = re.sub(r"\b(?:metric|parameter|period|time range|energy|kwh|mwh|demand|voltage|current|amps?|power factor|frequency|thd|from|between|last|past|today|yesterday)\b.*$", "", device_text, flags=re.IGNORECASE).strip(" ,.;")
         if device_text and not question_metrics(device_text) and len(device_text.split()) <= 8:
             slots["device_ref"] = device_text
-    # Preserve the original operator intent verbatim; extracted slot fields only
-    # enrich server context and never replace the request with model-authored text.
-    query = original_message.strip()
+    # Keep the original intent and site, but remove the meta-instruction and
+    # its examples. Add only the slots the operator supplied in this reply.
+    query = re.split(r"\b(?:please ask|for example)\b", original_message, maxsplit=1, flags=re.IGNORECASE)[0].strip(" \t\r\n.,;:")
+    if not query:
+        query = "Show historical device readings"
     merged = dict(context)
     if slots.get("metric") and not merged.get("metric"): merged["metric"] = str(slots["metric"])
     if not merged.get("metric"):
@@ -6088,7 +6117,7 @@ def extract_clarification_details(original_message: str, reply: str, context: di
         merged["building_id"] = int(slots["building_ref"])
     if slots.get("metric") and not question_metrics(query):
         query += f" Metric: {slots['metric']}."
-    if slots.get("device_ref") and not has_named_device_reference(query):
+    if slots.get("device_ref") and normalize_device_name(str(slots["device_ref"])) not in normalize_device_name(query):
         query += f" Device: {slots['device_ref']}."
     if slots.get("site_ref"):
         query += f" Site: {slots['site_ref']}."
@@ -8286,7 +8315,13 @@ class ChatHandler(BaseHTTPRequestHandler):
                         context["_clarification_device_ref"] = known_slots["device_ref"]
                     context["_original_user_message"] = original_message
                     context["_clarification_reply"] = message
-                    candidate_message, context, extracted = extract_clarification_details(original_message, message, context, request_id)
+                    candidate_message, context, extracted = extract_clarification_details(
+                        original_message,
+                        message,
+                        context,
+                        request_id,
+                        available_devices=clarification.get("available_devices") or [],
+                    )
                     slot_updates = {}
                     known_slots = dict(clarification.get("known_slots") or clarification.get("slots") or {})
                     list_devices = bool(extracted.get("list_devices"))
@@ -8300,6 +8335,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                     if extracted.get("device_ref"):
                         slot_updates["_clarification_device_ref"] = str(extracted["device_ref"])
                         known_slots["device_ref"] = str(extracted["device_ref"])
+                    if extracted.get("device_ref") or extracted.get("list_devices"):
+                        context.pop("_clarification_device_unresolved", None)
                     if slot_updates:
                         clarification["slots"].update(slot_updates)
                         context.update(slot_updates)
