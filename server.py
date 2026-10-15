@@ -6129,11 +6129,8 @@ def build_incomplete_request_clarification(message: str, context: dict, request_
     clarification_requested = is_historical_readings_clarification_request(message)
     if required_fields is not None:
         missing = list(required_fields)
-    elif not context.get("site_id") and not clarification_requested:
-        if not re.search(r"\b(?:at|for|site|building)\b", message.lower()):
-            missing.append("site/site scope")
-        else:
-            missing.append("site/site scope (select this site in DaxView so it can be authorized)")
+    elif not context.get("site_id"):
+        missing.append("site/site scope (select this site in DaxView so it can be authorized)")
     if required_fields is None and (clarification_requested or needs_device_choice(message) or (question_metrics(message) and not has_named_device_reference(message) and not context.get("device_id") and not wants_device_usage_ranking(message))):
         missing.append("device or meter")
     if required_fields is None and (clarification_requested or not question_metrics(message)) and not any(word in message.lower() for word in ("alarm", "device list", "devices", "meters")):
@@ -6160,22 +6157,58 @@ def build_incomplete_request_clarification(message: str, context: dict, request_
         known["metric"] = context["metric"]
     if context.get("_clarification_time_phrase"):
         known["time_phrase"] = context["_clarification_time_phrase"]
-    prompt = llm_clarification_prompt(message, missing or ["device, metric, and time period"], devices, known, turn_number)
+    missing_lower = [str(field).lower() for field in (missing or ["device or meter", "metric", "time period"])]
+    needs_device = any("device" in field or "meter" in field for field in missing_lower)
+    needs_metric = any("metric" in field or "parameter" in field for field in missing_lower)
+    needs_period = any("period" in field or "time" in field for field in missing_lower)
+    known_device = known.get("device_name") or known.get("device_ref")
+    known_metric = known.get("metric")
+    known_period = known.get("time_phrase")
+    site_name = context.get("_site_name")
+
     if list_devices and devices:
-        prompt = "Available devices for the selected site: " + "; ".join(devices[:50]) + ". Which device should I use?"
-        if known.get("metric"):
-            prompt += f" I have noted the requested metric is {known['metric']}."
-        prompt += " You can reply with the device name and a period, for example: ‘Main Meter, last 7 days.’"
+        prompt = "Available devices for the selected site: " + "; ".join(devices[:50]) + "."
+        prompt += " Reply with the device name"
+        if needs_metric:
+            prompt += ", metric"
+        if needs_period:
+            prompt += " and time period"
+        prompt += "."
     elif turn_number <= 1 and devices:
-        sample_device = devices[0]
-        prompt = (
-            "I understand you want historical device readings. Here are the available devices: "
-            + "; ".join(devices[:50])
-            + ". Which device should I use? Please include the metric and time period too. "
-            + f"For example: ‘Show energy (kWh) readings for {sample_device} for the last 7 days.’"
-        )
-    if not context.get("site_id") and not clarification_requested:
-        prompt += " Please select the site in DaxView first; I can only read devices from your authorized site."
+        prompt = "I understand you want historical device readings"
+        if site_name:
+            prompt += f" for {site_name}"
+        prompt += ". Available devices: " + "; ".join(devices[:50]) + "."
+        prompt += " Choose a device and specify the metric and time period. Metrics can include energy (kWh), demand (kW), voltage (V), or current (A)."
+        prompt += f" For example: ‘Show energy (kWh) readings for {devices[0]} for the last 7 days.’"
+    else:
+        known_parts = []
+        if known_device:
+            known_parts.append(f"device {known_device}")
+        if known_metric:
+            known_parts.append(f"metric {known_metric}")
+        if known_period:
+            known_parts.append(f"period {known_period}")
+        prompt = "I understand you want historical device readings."
+        if known_parts:
+            prompt += " I have " + ", ".join(known_parts) + "."
+        if needs_device:
+            if devices:
+                prompt += " Available devices: " + "; ".join(devices[:50]) + "."
+            prompt += " Which device or meter should I use?"
+        if needs_metric and needs_period:
+            prompt += " Which metric (such as energy, demand, voltage, or current) and time period should I use?"
+        elif needs_metric:
+            prompt += " Which metric should I use (such as energy, demand, voltage, or current)?"
+        elif needs_period:
+            prompt += " What time period should I use (such as the last 7 days or 1–7 October 2026)?"
+        if needs_device or needs_metric or needs_period:
+            example_device = known_device or (devices[0] if devices else "<device>")
+            example_metric = known_metric or "energy (kWh)"
+            example_period = known_period or "the last 7 days"
+            prompt += f" Example: ‘Show {example_metric} readings for {example_device} for {example_period}.’"
+    if not context.get("site_id"):
+        prompt += " Select the requested site in DaxView first; I need its authorized site context to list devices or fetch readings."
     return {
         "provider": "daxview-question-filter",
         "reply": prompt,
@@ -8357,7 +8390,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                             context["_clarification_device_unresolved"] = True
                     operations, _merged_context, _plan = choose_historical_operations(candidate_message, context, request_id)
                     remaining = []
-                    if not context.get("site_id") and "site/site scope" in clarification.get("required_fields", []):
+                    if not context.get("site_id") and any("site/site scope" in str(field) for field in clarification.get("required_fields", [])):
                         remaining.append("site/site scope")
                     if context.get("_clarification_device_unresolved") or ("device or meter" in clarification.get("required_fields", []) and not context.get("device_id") and not wants_all_devices(candidate_message) and not wants_highest_demand_device(candidate_message)):
                         remaining.append("device or meter")
