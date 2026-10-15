@@ -4109,7 +4109,7 @@ def build_mcp_refine_prompt(message: str, results: list[dict], deterministic_ans
         "errors": [],
     }
     raw_context = format_daxview_context(mcp_context)
-    if wants_named_device_metric_query(message):
+    if wants_named_device_metric_query(message) and not context.get("device_id"):
         raw_context = re.sub(r"\b(?:device_id|meter_id)\s*[:=]\s*\d+", "", raw_context, flags=re.IGNORECASE)
     question_parts = requested_question_parts(message)
     question_plan = "\n".join(f"{index}. {part}" for index, part in enumerate(question_parts, 1))
@@ -5474,17 +5474,23 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
             return build_incomplete_request_clarification(message, context, request_id, turn_id=turn_id)
     if requested_device_id(message):
         context["device_id"] = requested_device_id(message)
-    if wants_named_device_metric_query(message):
+    if wants_named_device_metric_query(message) and not context.get("device_id"):
         device_match = resolve_named_device_reference(turn_id, message, context, request_id)
         if device_match.get("status") != "matched":
             return {
-                # Device selectors are not part of the documented
-                # waiting_for_user fields. Show candidate names as readable
-                # chat text so the UI does not render an empty Continue form.
-                "provider": "daxview-answer",
+                "provider": "daxview-question-filter",
                 "reply": device_match.get("reply") or "Which device name should I use?",
-                "charts": [],
-                "tables": [],
+                "required_fields": ["device or meter"],
+                "clarification_state": {
+                    "status": "waiting",
+                    "intent": "historical_device_readings",
+                    "original_message": message,
+                    "required_fields": ["device or meter"],
+                    "known_slots": {
+                        **({"metric": question_metrics(message)[0]} if question_metrics(message) else {}),
+                    },
+                    "turn_number": 2,
+                },
                 "resolved_plan": resolved_plan_for_result("clarification", operation_ids, context),
             }
         context["device_id"] = device_match["device_id"]
@@ -5790,6 +5796,43 @@ def get_pending_clarification(conversation_id: str, identity: dict, turn_id: str
             return cur.fetchone()
 
 
+def get_latest_pending_clarification(conversation_id: str, identity: dict) -> dict | None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT t.id, t.user_message, t.request_id, t.context, t.clarification_state, t.resolved_plan
+                FROM daxview_turns t
+                JOIN daxview_conversations c ON c.id = t.conversation_id
+                JOIN daxview_jobs j ON j.turn_id = t.id
+                WHERE t.conversation_id = %s AND t.deployment_id = %s AND t.company_id = %s AND t.user_id = %s
+                  AND c.status = 'active' AND j.status = 'completed'
+                  AND t.clarification_state->>'status' = 'waiting'
+                ORDER BY t.created_at DESC LIMIT 1
+                """,
+                (conversation_id, identity["deployment_id"], identity["company_id"], identity["user_id"]),
+            )
+            return cur.fetchone()
+
+
+def looks_like_clarification_reply(message: str, state: dict) -> bool:
+    lowered = message.strip().lower()
+    if not lowered:
+        return False
+    if re.search(r"\b(?:show|list|give)\b.*\b(?:available\s+)?(?:devices?|meters?)\b", lowered):
+        return True
+    if len(message.strip()) <= 100 and (
+        question_metrics(message) or has_time_scope(message) or requested_device_id(message) is not None
+        or has_named_device_reference(message)
+    ):
+        return True
+    # Accept a complete restatement that fills the pending request's device/metric/period slots.
+    return bool(
+        any(term in lowered for term in ("reading", "readings", "historical", "trend"))
+        and (question_metrics(message) or has_time_scope(message) or has_named_device_reference(message))
+    )
+
+
 def resolved_plan_for_result(status: str, operation_ids: list[str], context: dict, results: list[dict] | None = None, errors: list[dict] | None = None) -> dict:
     safe_results = results or []
     slots = {
@@ -5970,7 +6013,7 @@ def llm_clarification_prompt(original_message: str, missing_fields: list[str], d
         content = result.get("message", {}).get("content", "")
         prompt = str(content).strip()
         if prompt:
-            if turn_number == 1 and devices and not re.search(r"available devices|available meters", prompt, re.IGNORECASE):
+            if turn_number == 1 and devices and devices[0].lower() not in prompt.lower():
                 prompt += "\n\nAvailable devices: " + "; ".join(devices[:30]) + "."
             return prompt[:1800]
     except Exception as error:
@@ -5981,7 +6024,7 @@ def llm_clarification_prompt(original_message: str, missing_fields: list[str], d
         prompt = "I can retrieve historical readings for this site. Would you like the available device list, or do you already know the meter? Reply ‘show available devices’ or enter its name."
     else:
         prompt = f"I understand you want historical readings. Please provide only the {fields}."
-    if devices:
+    if devices and devices[0].lower() not in prompt.lower():
         prompt += " Available devices: " + "; ".join(devices[:15]) + "."
     prompt += " For example: ‘Show energy readings for Main Meter from 1–7 October 2026.’"
     device = known.get("device_name") or known.get("device_ref")
@@ -8208,6 +8251,12 @@ class ChatHandler(BaseHTTPRequestHandler):
                     return True
                 clarification_turn_id = str(request.get("clarification_for_turn_id") or "").strip()
                 pending = get_pending_clarification(conversation_id, identity, clarification_turn_id) if clarification_turn_id else None
+                if not clarification_turn_id:
+                    candidate_pending = get_latest_pending_clarification(conversation_id, identity)
+                    candidate_state = (candidate_pending or {}).get("clarification_state") or {}
+                    if candidate_pending and looks_like_clarification_reply(message, candidate_state):
+                        pending = candidate_pending
+                        clarification_turn_id = str(candidate_pending["id"])
                 parent_turn_id = None
                 clarification = {}
                 if pending:
@@ -8255,9 +8304,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                             context["site_id"] = site_matches[0].get("site_id") or site_matches[0].get("id")
                             context["_site_name"] = site_matches[0].get("name") or site_matches[0].get("site_name")
                     if context.get("site_id") and extracted.get("device_ref") and not extracted.get("list_devices") and not context.get("device_id"):
-                        resolution = resolve_named_device_reference(
-                            str(uuid.uuid4()), str(extracted["device_ref"]), context, request_id
-                        )
+                        resolution = resolve_named_device_reference(turn_id, str(extracted["device_ref"]), context, request_id)
                         if resolution.get("status") == "matched":
                             context["device_id"] = resolution["device_id"]
                             context["_device_name"] = resolution["device_name"]
