@@ -5803,53 +5803,6 @@ def get_pending_clarification(conversation_id: str, identity: dict, turn_id: str
             return cur.fetchone()
 
 
-def get_latest_pending_clarification(conversation_id: str, identity: dict) -> dict | None:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT t.id, t.user_message, t.request_id, t.context, t.clarification_state, t.resolved_plan
-                FROM daxview_turns t
-                JOIN daxview_conversations c ON c.id = t.conversation_id
-                JOIN daxview_jobs j ON j.turn_id = t.id
-                WHERE t.conversation_id = %s AND t.deployment_id = %s AND t.company_id = %s AND t.user_id = %s
-                  AND c.status = 'active' AND j.status = 'completed'
-                  AND t.clarification_state->>'status' = 'waiting'
-                ORDER BY t.created_at DESC LIMIT 1
-                """,
-                (conversation_id, identity["deployment_id"], identity["company_id"], identity["user_id"]),
-            )
-            return cur.fetchone()
-
-
-def looks_like_clarification_reply(message: str, state: dict) -> bool:
-    lowered = message.strip().lower()
-    if not lowered:
-        return False
-    # A complete, command-like telemetry question stands on its own. Do not
-    # attach it to an unrelated stale clarification when the client omitted
-    # clarification_for_turn_id.
-    if (
-        question_metrics(message)
-        and has_time_scope(message)
-        and has_named_device_reference(message)
-        and re.search(r"\b(?:show|fetch|retrieve|get|graph|plot|trend)\b", lowered)
-    ):
-        return False
-    if re.search(r"\b(?:show|list|give)\b.*\b(?:available\s+)?(?:devices?|meters?)\b", lowered):
-        return True
-    if len(message.strip()) <= 100 and (
-        question_metrics(message) or has_time_scope(message) or requested_device_id(message) is not None
-        or has_named_device_reference(message)
-    ):
-        return True
-    # Accept a complete restatement that fills the pending request's device/metric/period slots.
-    return bool(
-        any(term in lowered for term in ("reading", "readings", "historical", "trend"))
-        and (question_metrics(message) or has_time_scope(message) or has_named_device_reference(message))
-    )
-
-
 def merge_historical_clarification_request(original_message: str, reply: str, state: dict) -> str:
     """Turn a natural-language slot reply into one clean, complete data request."""
     source = str(original_message or "").strip()
@@ -8456,12 +8409,6 @@ class ChatHandler(BaseHTTPRequestHandler):
                     return True
                 clarification_turn_id = str(request.get("clarification_for_turn_id") or "").strip()
                 pending = get_pending_clarification(conversation_id, identity, clarification_turn_id) if clarification_turn_id else None
-                if not clarification_turn_id:
-                    candidate_pending = get_latest_pending_clarification(conversation_id, identity)
-                    candidate_state = (candidate_pending or {}).get("clarification_state") or {}
-                    if candidate_pending and looks_like_clarification_reply(message, candidate_state):
-                        pending = candidate_pending
-                        clarification_turn_id = str(candidate_pending["id"])
                 if pending:
                     incoming_message = message
                 parent_turn_id = None
