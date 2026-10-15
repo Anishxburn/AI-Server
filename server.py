@@ -4243,8 +4243,15 @@ def chart_value(row: dict, keys: tuple[str, ...]) -> float | None:
 def build_chart_spec(chart_type: str, title: str, labels: list[str], values: list[float], unit: str = "", series_name: str = "value") -> dict | None:
     if not labels or not values or len(labels) != len(values):
         return None
+    selected_type = chart_type
+    if chart_type == "bar" and len(labels) == 1:
+        selected_type = "bar"
+    elif chart_type == "bar" and len(labels) > 1 and title in {"Daily Site Energy", "Peak Demand"}:
+        selected_type = "line"
+    elif chart_type == "bar" and len(labels) > 12:
+        selected_type = "bar"
     return {
-        "type": chart_type,
+        "type": selected_type,
         "title": title,
         "labels": labels,
         "series": [{"name": series_name, "unit": unit, "data": values}],
@@ -4268,7 +4275,7 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
                 labels.append(label)
                 values.append(value)
         unit = data.get("unit") or (data.get("display") or {}).get("unit") if isinstance(data.get("display"), dict) else data.get("unit") or "kWh"
-        return build_chart_spec("bar", "Daily Site Energy", labels, values, unit or "kWh", "Energy")
+        return build_chart_spec("line", "Daily Site Energy", labels, values, unit or "kWh", "Energy")
     if operation_id in {"device_energy_ranking", "device_energy_breakdown", "telemetry_top_consumers"}:
         ranked, _ = ranked_consumer_rows(data)
         rows = [dict(row, value=value) for row, value in ranked]
@@ -4287,7 +4294,7 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
             if value is not None:
                 labels.append(chart_label(row, "device"))
                 values.append(value)
-        return build_chart_spec("bar", "Top Energy Consumers", labels, values, "kWh", "Consumption")
+        return build_chart_spec("horizontalBar", "Top Energy Consumers", labels, values, "kWh", "Consumption")
     if operation_id == "alarm_frequency_summary":
         rows = first_list(data, ("rows", "alarms", "items"))
         labels = []
@@ -4299,7 +4306,7 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
             if value is not None:
                 labels.append(chart_label(row, "alarm"))
                 values.append(value)
-        return build_chart_spec("bar", "Alarm Frequency", labels, values, "occurrence(s)", "Alarms")
+        return build_chart_spec("horizontalBar", "Alarm Frequency", labels, values, "occurrence(s)", "Alarms")
     if operation_id == "active_alarm_summary":
         labels = []
         values = []
@@ -4341,7 +4348,7 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
                     labels.append(chart_label(row, "device"))
                     values.append(value)
             if labels:
-                return build_chart_spec("bar", "Peak Demand by Device", labels, values, "kW", "Maximum demand")
+                return build_chart_spec("horizontalBar", "Peak Demand by Device", labels, values, "kW", "Maximum demand")
         rows = first_list(data, ("rows", "items", "peaks", "series"))
         labels = []
         values = []
@@ -4382,7 +4389,7 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
             if value is not None:
                 labels.append(chart_label(row, "device"))
                 values.append(value)
-        return build_chart_spec("bar", "Highest Frequency by Device", labels, values, data.get("unit") or "Hz", "Frequency")
+        return build_chart_spec("horizontalBar", "Highest Frequency by Device", labels, values, data.get("unit") or "Hz", "Frequency")
     if operation_id == "telemetry_timeseries":
         telemetry_series = telemetry_series_points(data)
         if not telemetry_series:
@@ -5819,6 +5826,16 @@ def looks_like_clarification_reply(message: str, state: dict) -> bool:
     lowered = message.strip().lower()
     if not lowered:
         return False
+    # A complete, command-like telemetry question stands on its own. Do not
+    # attach it to an unrelated stale clarification when the client omitted
+    # clarification_for_turn_id.
+    if (
+        question_metrics(message)
+        and has_time_scope(message)
+        and has_named_device_reference(message)
+        and re.search(r"\b(?:show|fetch|retrieve|get|graph|plot|trend)\b", lowered)
+    ):
+        return False
     if re.search(r"\b(?:show|list|give)\b.*\b(?:available\s+)?(?:devices?|meters?)\b", lowered):
         return True
     if len(message.strip()) <= 100 and (
@@ -5831,6 +5848,63 @@ def looks_like_clarification_reply(message: str, state: dict) -> bool:
         any(term in lowered for term in ("reading", "readings", "historical", "trend"))
         and (question_metrics(message) or has_time_scope(message) or has_named_device_reference(message))
     )
+
+
+def merge_historical_clarification_request(original_message: str, reply: str, state: dict) -> str:
+    """Turn a natural-language slot reply into one clean, complete data request."""
+    source = str(original_message or "").strip()
+    response = str(reply or "").strip()
+    lowered = response.lower()
+    complete_operator_request = (
+        re.search(r"\b(?:show|fetch|retrieve|get|plot|graph|trend)\b", lowered)
+        and question_metrics(response)
+        and has_time_scope(response)
+        and has_named_device_reference(response)
+    )
+    if complete_operator_request and not is_prompt_like_clarification_slot(response):
+        return response
+
+    known = state.get("known_slots") if isinstance(state.get("known_slots"), dict) else {}
+    slots = state.get("slots") if isinstance(state.get("slots"), dict) else {}
+    metrics = question_metrics(response)
+    metric = metrics[0] if metrics else known.get("metric") or slots.get("metric")
+    time_phrase = extract_clarification_time_phrase(response)
+    if not time_phrase:
+        time_phrase = known.get("time_phrase") or slots.get("_clarification_time_phrase") or slots.get("time_phrase")
+
+    devices = state.get("available_devices") if isinstance(state.get("available_devices"), list) else []
+    device_ref = None
+    normalized_reply = normalize_device_name(response)
+    if normalized_reply:
+        device_ref = next((name for name in devices if normalize_device_name(name) == normalized_reply), None)
+    if not device_ref and not complete_operator_request:
+        candidate = known.get("device_ref") or known.get("device_name") or slots.get("_clarification_device_ref")
+        if candidate and (not devices or any(normalize_device_name(name) == normalize_device_name(candidate) for name in devices)):
+            device_ref = candidate
+    if not device_ref:
+        # Keep only user-supplied text, never echo the original assistant prompt as a slot.
+        candidate = re.sub(r"^(?:device|meter)\s*[:=]\s*", "", response, flags=re.IGNORECASE).strip(" .,:;'\"`")
+        if candidate and len(candidate) <= 100 and not is_prompt_like_clarification_slot(candidate):
+            device_ref = candidate
+
+    metric_label = {
+        "energy": "energy (kWh)", "demand": "demand (kW)",
+        "voltage": "voltage (V)", "current": "current (A)",
+    }.get(str(metric or "").lower(), str(metric or ""))
+    parts = ["Show"]
+    if metric_label:
+        parts.append(metric_label)
+    else:
+        # Ask for the missing metric once; don't add more assistant prompt text to the query.
+        parts.append("historical readings")
+    if device_ref:
+        parts.extend(["for", str(device_ref)])
+    if time_phrase:
+        parts.extend(["for", str(time_phrase)])
+    request = " ".join(parts).strip()
+    if source and not is_historical_readings_clarification_request(source):
+        request += f". Context: {source}"
+    return request
 
 
 def resolved_plan_for_result(status: str, operation_ids: list[str], context: dict, results: list[dict] | None = None, errors: list[dict] | None = None) -> dict:
@@ -5897,6 +5971,15 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
             state.setdefault("original_message", context.get("_original_user_message") or message)
             state.setdefault("required_fields", result.get("required_fields") or [])
             save_turn_clarification_state(turn_id, state)
+            clarification_parent = context.get("_clarification_parent_turn_id")
+            if clarification_parent:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE daxview_turns SET clarification_state = jsonb_set(clarification_state, '{status}', '\"resolved\"'::jsonb) WHERE id = %s",
+                            (clarification_parent,),
+                        )
+                    conn.commit()
             return
         message_event = {"text": result["reply"]}
         if result.get("charts"):
@@ -6037,6 +6120,51 @@ def llm_clarification_prompt(original_message: str, missing_fields: list[str], d
     return prompt
 
 
+def is_prompt_like_clarification_slot(value: object) -> bool:
+    text = str(value or "").strip()
+    return bool(
+        not text
+        or len(text) > 80
+        or re.search(
+            r"\b(?:show|readings?|historical|metric|period|last|past|i\s+need|i\s+have|please\s+provide|which\s+device|available\s+devices|example)\b",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def extract_clarification_time_phrase(value: object) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    relative = re.search(
+        r"\b(?:today|yesterday|this week|last week|previous week|this month|last month|previous month|"
+        r"(?:for\s+)?(?:the\s+)?(?:last|past|previous)\s+\d{1,3}\s+(?:days?|weeks?|months?))\b",
+        text,
+        re.IGNORECASE,
+    )
+    if relative:
+        return relative.group(0).strip()
+    month = r"january|february|march|april|may|june|july|august|september|october|november|december"
+    date_range = re.search(
+        rf"\b(?:from\s+)?\d{{1,2}}(?:st|nd|rd|th)?\s*(?:-|\u2013|\u2014|to|through|until)\s*"
+        rf"\d{{1,2}}(?:st|nd|rd|th)?\s+{month}(?:\s+\d{{4}})?\b|"
+        rf"\b(?:from\s+)?\d{{1,2}}(?:st|nd|rd|th)?\s+{month}(?:\s+\d{{4}})?\s+"
+        rf"(?:-|\u2013|\u2014|to|through|until)\s*\d{{1,2}}(?:st|nd|rd|th)?\s+{month}(?:\s+\d{{4}})?\b",
+        text,
+        re.IGNORECASE,
+    )
+    if date_range:
+        return date_range.group(0).strip()
+    single_date = re.search(rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+{month}\s+\d{{4}}\b|\b\d{{4}}-\d{{2}}-\d{{2}}\b", text, re.IGNORECASE)
+    if single_date:
+        return single_date.group(0).strip()
+    month_period = re.search(rf"\b{month}(?:\s+\d{{4}})?\b", text, re.IGNORECASE)
+    if month_period:
+        return month_period.group(0).strip()
+    return None
+
+
 def extract_clarification_details(original_message: str, reply: str, context: dict, request_id: str, available_devices: list[str] | None = None) -> tuple[str, dict, dict]:
     extraction = {"original_question": original_message, "operator_reply": reply,
                   "known_context": {key: context.get(key) for key in ("site_id", "building_id", "device_id", "metric") if context.get(key) is not None}}
@@ -6067,7 +6195,7 @@ def extract_clarification_details(original_message: str, reply: str, context: di
         slots["device_ref"] = inventory_match
     elif slots.get("device_ref"):
         candidate_ref = str(slots["device_ref"]).strip(" \t\r\n.,;:'\"“”‘’")
-        if (len(candidate_ref) > 80 or re.search(r"\b(?:show|readings?|historical|metric|period|last|past)\b", candidate_ref, re.IGNORECASE)):
+        if is_prompt_like_clarification_slot(candidate_ref):
             slots.pop("device_ref", None)
     if not slots.get("device_ref"):
         # Handle a complete sentence when the selected device is not in the
@@ -6078,20 +6206,27 @@ def extract_clarification_details(original_message: str, reply: str, context: di
             re.IGNORECASE,
         )
         if named:
-            slots["device_ref"] = named.group(1).strip(" \t\r\n.,;:'\"“”‘’")
-    time_match = re.search(
-        r"\b(?:for\s+)?(?:the\s+)?(?:last|past)\s+\d{1,3}\s+(?:days?|weeks?|months?)\b",
-        reply,
-        re.IGNORECASE,
-    )
-    if time_match:
-        slots["time_phrase"] = time_match.group(0).strip()
-    elif not slots.get("time_phrase") and has_time_scope(reply):
-        slots["time_phrase"] = reply.strip()
+            named_ref = named.group(1).strip(" \t\r\n.,;:'\"“”‘’")
+            if not is_prompt_like_clarification_slot(named_ref):
+                slots["device_ref"] = named_ref
+    extracted_time_phrase = extract_clarification_time_phrase(reply)
+    if extracted_time_phrase:
+        slots["time_phrase"] = extracted_time_phrase
+    elif slots.get("time_phrase"):
+        extracted_time_phrase = extract_clarification_time_phrase(slots["time_phrase"])
+        if extracted_time_phrase:
+            slots["time_phrase"] = extracted_time_phrase
+        else:
+            slots.pop("time_phrase", None)
     if not slots.get("device_ref") and not slots.get("list_devices"):
         device_text = reply.strip()
         device_text = re.sub(r"\b(?:metric|parameter|period|time range|energy|kwh|mwh|demand|voltage|current|amps?|power factor|frequency|thd|from|between|last|past|today|yesterday)\b.*$", "", device_text, flags=re.IGNORECASE).strip(" ,.;")
-        if device_text and not question_metrics(device_text) and len(device_text.split()) <= 8:
+        if (
+            device_text
+            and not question_metrics(device_text)
+            and len(device_text.split()) <= 8
+            and not re.search(r"\b(?:show|readings?|historical|please|i\s+need|i\s+have|metric|period|last|past)\b", device_text, re.IGNORECASE)
+        ):
             slots["device_ref"] = device_text
     # Keep the original intent and site, but remove the meta-instruction and
     # its examples. Add only the slots the operator supplied in this reply.
@@ -8327,6 +8462,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                     if candidate_pending and looks_like_clarification_reply(message, candidate_state):
                         pending = candidate_pending
                         clarification_turn_id = str(candidate_pending["id"])
+                if pending:
+                    incoming_message = message
                 parent_turn_id = None
                 clarification = {}
                 if pending:
@@ -8339,6 +8476,14 @@ class ChatHandler(BaseHTTPRequestHandler):
                     clarification["slots"] = clarification.get("slots") or {}
                     known_slots = dict(clarification.get("known_slots") or {})
                     saved_devices = clarification.get("available_devices") or []
+                    saved_slots = dict(clarification.get("slots") or {})
+                    saved_metric = known_slots.get("metric")
+                    if saved_metric:
+                        parsed_saved_metric = question_metrics(str(saved_metric))
+                        if parsed_saved_metric:
+                            known_slots["metric"] = parsed_saved_metric[0]
+                        else:
+                            known_slots.pop("metric", None)
                     saved_device_ref = known_slots.get("device_ref") or known_slots.get("device_name")
                     if saved_device_ref:
                         normalized_saved_ref = normalize_device_name(saved_device_ref)
@@ -8348,32 +8493,65 @@ class ChatHandler(BaseHTTPRequestHandler):
                         )
                         if exact_saved_device:
                             known_slots["device_ref"] = exact_saved_device
-                        elif (
-                            len(str(saved_device_ref)) > 80
-                            or re.search(r"\b(?:show|readings?|historical|please|metric|period)\b", str(saved_device_ref), re.IGNORECASE)
-                        ):
+                        elif is_prompt_like_clarification_slot(saved_device_ref):
                             known_slots.pop("device_ref", None)
                             known_slots.pop("device_name", None)
-                    saved_time_phrase = known_slots.get("time_phrase")
-                    if saved_time_phrase and re.search(r"\b(?:show|readings?|historical)\b", str(saved_time_phrase), re.IGNORECASE):
-                        saved_time_match = re.search(
-                            r"\b(?:for\s+)?(?:the\s+)?(?:last|past)\s+\d{1,3}\s+(?:days?|weeks?|months?)\b",
-                            str(saved_time_phrase),
-                            re.IGNORECASE,
+                    saved_slot_device = saved_slots.get("_clarification_device_ref") or saved_slots.get("device_ref")
+                    if saved_slot_device:
+                        exact_slot_device = next(
+                            (name for name in saved_devices if normalize_device_name(name) == normalize_device_name(saved_slot_device)),
+                            None,
                         )
-                        if saved_time_match:
-                            known_slots["time_phrase"] = saved_time_match.group(0).strip()
+                        if exact_slot_device:
+                            saved_slots["_clarification_device_ref"] = exact_slot_device
+                        elif is_prompt_like_clarification_slot(saved_slot_device):
+                            saved_slots.pop("_clarification_device_ref", None)
+                            saved_slots.pop("device_ref", None)
+                    saved_slot_metric = saved_slots.get("metric")
+                    if saved_slot_metric:
+                        parsed_slot_metric = question_metrics(str(saved_slot_metric))
+                        if parsed_slot_metric:
+                            saved_slots["metric"] = parsed_slot_metric[0]
                         else:
+                            saved_slots.pop("metric", None)
+                    saved_slot_time = saved_slots.get("_clarification_time_phrase") or saved_slots.get("time_phrase")
+                    if saved_slot_time:
+                        clean_slot_time = extract_clarification_time_phrase(saved_slot_time)
+                        if clean_slot_time:
+                            saved_slots["_clarification_time_phrase"] = clean_slot_time
+                            saved_slots.pop("time_phrase", None)
+                        elif is_prompt_like_clarification_slot(saved_slot_time) or not has_time_scope(str(saved_slot_time)):
+                            saved_slots.pop("_clarification_time_phrase", None)
+                            saved_slots.pop("time_phrase", None)
+                            saved_slots.pop("_time_window", None)
+                    clarification["slots"] = saved_slots
+                    saved_time_phrase = known_slots.get("time_phrase")
+                    if saved_time_phrase:
+                        clean_time_phrase = extract_clarification_time_phrase(saved_time_phrase)
+                        if clean_time_phrase:
+                            known_slots["time_phrase"] = clean_time_phrase
+                        elif is_prompt_like_clarification_slot(saved_time_phrase) or not has_time_scope(str(saved_time_phrase)):
                             known_slots.pop("time_phrase", None)
                     context = {**prior_context, **context, **clarification.get("slots", {}), **known_slots}
-                    if not known_slots.get("device_ref") and not known_slots.get("device_name"):
-                        stale_device_ref = context.get("_clarification_device_ref")
-                        if stale_device_ref and (
-                            len(str(stale_device_ref)) > 80
-                            or re.search(r"\b(?:show|readings?|historical|please|metric|period)\b", str(stale_device_ref), re.IGNORECASE)
-                        ):
-                            context.pop("_clarification_device_ref", None)
-                            context.pop("_device_name", None)
+                    if context.get("metric"):
+                        parsed_context_metric = question_metrics(str(context["metric"]))
+                        if parsed_context_metric:
+                            context["metric"] = parsed_context_metric[0]
+                        else:
+                            context.pop("metric", None)
+                    for device_key in ("_clarification_device_ref", "_device_name"):
+                        stale_device_hint = context.get(device_key)
+                        if stale_device_hint and is_prompt_like_clarification_slot(stale_device_hint):
+                            context.pop(device_key, None)
+                    stale_time_phrase = context.get("_clarification_time_phrase")
+                    if stale_time_phrase:
+                        clean_time_phrase = extract_clarification_time_phrase(stale_time_phrase)
+                        if clean_time_phrase:
+                            context["_clarification_time_phrase"] = clean_time_phrase
+                            context["_time_window"] = requested_historical_range(clean_time_phrase)
+                        elif is_prompt_like_clarification_slot(stale_time_phrase) or not has_time_scope(str(stale_time_phrase)):
+                            context.pop("_clarification_time_phrase", None)
+                            context.pop("_time_window", None)
                     if known_slots.get("metric"):
                         context["metric"] = known_slots["metric"]
                     if known_slots.get("time_phrase"):
@@ -8382,10 +8560,11 @@ class ChatHandler(BaseHTTPRequestHandler):
                     if known_slots.get("device_ref"):
                         context["_clarification_device_ref"] = known_slots["device_ref"]
                     context["_original_user_message"] = original_message
-                    context["_clarification_reply"] = message
+                    context["_clarification_reply"] = incoming_message
+                    message = merge_historical_clarification_request(original_message, incoming_message, clarification)
                     candidate_message, context, extracted = extract_clarification_details(
                         original_message,
-                        message,
+                        incoming_message,
                         context,
                         request_id,
                         available_devices=clarification.get("available_devices") or [],
@@ -8416,13 +8595,19 @@ class ChatHandler(BaseHTTPRequestHandler):
                         if len(site_matches) == 1:
                             context["site_id"] = site_matches[0].get("site_id") or site_matches[0].get("id")
                             context["_site_name"] = site_matches[0].get("name") or site_matches[0].get("site_name")
-                    if context.get("site_id") and extracted.get("device_ref") and not extracted.get("list_devices") and not context.get("device_id"):
-                        resolution = resolve_named_device_reference(turn_id, str(extracted["device_ref"]), context, request_id)
+                    device_ref_to_resolve = extracted.get("device_ref") or context.get("_clarification_device_ref")
+                    if device_ref_to_resolve:
+                        context.pop("_clarification_device_unresolved", None)
+                    if context.get("site_id") and device_ref_to_resolve and not extracted.get("list_devices") and not context.get("device_id"):
+                        resolution = resolve_named_device_reference(turn_id, str(device_ref_to_resolve), context, request_id)
                         if resolution.get("status") == "matched":
                             context["device_id"] = resolution["device_id"]
                             context["_device_name"] = resolution["device_name"]
                         else:
                             context["_clarification_device_unresolved"] = True
+                    extracted_query = str(extracted.get("query") or "")
+                    if extracted_query and not is_historical_readings_clarification_request(extracted_query):
+                        candidate_message = extracted_query
                     operations, _merged_context, _plan = choose_historical_operations(candidate_message, context, request_id)
                     remaining = []
                     if not context.get("site_id") and any("site/site scope" in str(field) for field in clarification.get("required_fields", [])):
@@ -8431,7 +8616,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                         remaining.append("device or meter")
                     if any("metric" in field for field in clarification.get("required_fields", [])) and not context.get("metric"):
                         remaining.append("metric")
-                    if any("period" in field or "time" in field for field in clarification.get("required_fields", [])) and not context.get("_clarification_time_phrase") and not has_time_scope(message):
+                    if any("period" in field or "time" in field for field in clarification.get("required_fields", [])) and not context.get("_clarification_time_phrase") and not has_time_scope(incoming_message):
                         remaining.append("time period")
                     if list_devices and "device or meter" not in remaining:
                         remaining.append("device or meter")
@@ -8446,7 +8631,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                             **clarification,
                             "status": "waiting",
                             "original_message": original_message,
-                            "last_reply": message,
+                            "last_reply": incoming_message,
                             "required_fields": clarification_result.get("required_fields") or [],
                             "known_slots": known_slots,
                             "turn_number": int(clarification.get("turn_number") or 1) + 1,
@@ -8457,7 +8642,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                         context["_clarification_pending_state"] = clarification_result["clarification_state"]
                     parent_turn_id = str(pending["id"])
                     message = candidate_message
-                    stored_user_message = str(request.get("message") or "").strip()
+                    stored_user_message = incoming_message
                 elif clarification_turn_id:
                     self._send_json(409, json_error("clarification_not_pending", "That clarification is no longer waiting for a reply.", False, request_id))
                     return True
