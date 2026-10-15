@@ -6137,6 +6137,14 @@ def build_incomplete_request_clarification(message: str, context: dict, request_
         if known.get("metric"):
             prompt += f" I have noted the requested metric is {known['metric']}."
         prompt += " You can reply with the device name and a period, for example: ‘Main Meter, last 7 days.’"
+    elif turn_number <= 1 and devices:
+        sample_device = devices[0]
+        prompt = (
+            "I understand you want historical device readings. Here are the available devices: "
+            + "; ".join(devices[:50])
+            + ". Which device should I use? Please include the metric and time period too. "
+            + f"For example: ‘Show energy (kWh) readings for {sample_device} for the last 7 days.’"
+        )
     if not context.get("site_id") and not clarification_requested:
         prompt += " Please select the site in DaxView first; I can only read devices from your authorized site."
     return {
