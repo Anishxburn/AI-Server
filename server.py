@@ -5431,7 +5431,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     clarification = metric_clarification(message)
     if clarification:
         return {"provider": "daxview-question-filter", "reply": clarification, "resolved_plan": resolved_plan_for_result("clarification", [], context)}
-    if is_historical_readings_clarification_request(message):
+    if is_historical_readings_clarification_request(message) and not context.get("_clarification_reply"):
         debug_trace_event(
             "daxview_clarification_intent_debug",
             request_id=request_id,
@@ -5439,7 +5439,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
             planner_skipped=True,
             mcp_skipped=True,
         )
-        return build_incomplete_request_clarification(message, context, request_id)
+        return build_incomplete_request_clarification(message, context, request_id, turn_id=turn_id)
     operation_ids, context, planner_plan = choose_historical_operations(message, context, request_id)
     debug_trace_event(
         "daxview_tool_selection_debug",
@@ -5456,22 +5456,22 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         }
     if context.get("_clarification_result"):
         return context["_clarification_result"]
-    if operation_ids and daxview_clarification_needed(message, operation_ids):
-        return build_incomplete_request_clarification(message, context, request_id)
+    if operation_ids and daxview_clarification_needed(message, operation_ids) and not context.get("_clarification_reply"):
+        return build_incomplete_request_clarification(message, context, request_id, turn_id=turn_id)
     if not operation_ids:
         result = langchain_chat_response(message, request_id, session_id)
         result["resolved_plan"] = resolved_plan_for_result("ok", [], context)
         return result
     context = dict(context)
     if context.get("_clarification_device_unresolved"):
-        return build_incomplete_request_clarification(message, context, request_id)
+        return build_incomplete_request_clarification(message, context, request_id, turn_id=turn_id)
     if context.get("_clarification_device_ref") and not context.get("device_id") and context.get("site_id"):
         match = resolve_named_device_reference(turn_id, context["_clarification_device_ref"], context, request_id)
         if match.get("status") == "matched":
             context["device_id"] = match["device_id"]
             context["_device_name"] = match["device_name"]
         else:
-            return build_incomplete_request_clarification(message, context, request_id)
+            return build_incomplete_request_clarification(message, context, request_id, turn_id=turn_id)
     if requested_device_id(message):
         context["device_id"] = requested_device_id(message)
     if wants_named_device_metric_query(message):
@@ -5946,17 +5946,18 @@ def needs_device_choice(message: str) -> bool:
     return requested_device_id(message) is None and not re.search(r"\bumg[\s-]?\d+\b", lowered)
 
 
-def llm_clarification_prompt(original_message: str, missing_fields: list[str], device_names: list[str] | None = None) -> str:
+def llm_clarification_prompt(original_message: str, missing_fields: list[str], device_names: list[str] | None = None, known_slots: dict | None = None, turn_number: int = 1) -> str:
     fields = ", ".join(missing_fields)
     devices = device_names or []
+    known = known_slots or {}
     instruction = (
-        "Write one concise, friendly clarification question for an EMS operator. "
-        "Ask only for missing details from this list. Do not claim data has been fetched. "
-        "Include a typed example sentence with a specific device, metric, and date range when relevant. "
-        "If device names are provided, include them as readable text (up to 15), not a dropdown. "
-        "Return only the text shown to the user."
+        "Continue one EMS historical telemetry request across chat turns. Understand its intent and known slots. "
+        "Ask only for missing details and never ask again for a supplied detail. Do not claim readings were fetched. "
+        "On the first clarification, ask whether the operator wants the available device list or already knows the meter. "
+        "Show authorized device names as readable text. Later, ask only unresolved fields. Never invent device names or IDs. "
+        "Return concise user-facing text, with a precise example when useful."
     )
-    prompt_data = {"original_question": original_message, "missing_details": missing_fields, "available_devices": devices[:15]}
+    prompt_data = {"original_question": original_message, "intent": "retrieve historical device readings after required details are clear", "missing_details": missing_fields, "known_slots": known, "available_devices": devices[:30], "clarification_turn_number": turn_number}
     try:
         result = ollama_json(
             "/api/chat",
@@ -5969,13 +5970,27 @@ def llm_clarification_prompt(original_message: str, missing_fields: list[str], d
         content = result.get("message", {}).get("content", "")
         prompt = str(content).strip()
         if prompt:
+            if turn_number == 1 and devices and not re.search(r"available devices|available meters", prompt, re.IGNORECASE):
+                prompt += "\n\nAvailable devices: " + "; ".join(devices[:30]) + "."
             return prompt[:1800]
     except Exception as error:
         log_event("clarification_prompt_model_fallback", error=str(error))
-    prompt = f"I can help with that. Please provide the {fields}."
+    if turn_number == 1 and devices:
+        prompt = "I can retrieve historical readings for this site. Would you like the available device list, or do you already know the meter? Reply ‘show available devices’ or enter its name. Available devices: " + "; ".join(devices[:30]) + "."
+    elif turn_number == 1 and any("device" in field or "meter" in field for field in missing_fields):
+        prompt = "I can retrieve historical readings for this site. Would you like the available device list, or do you already know the meter? Reply ‘show available devices’ or enter its name."
+    else:
+        prompt = f"I understand you want historical readings. Please provide only the {fields}."
     if devices:
         prompt += " Available devices: " + "; ".join(devices[:15]) + "."
     prompt += " For example: ‘Show energy readings for Main Meter from 1–7 October 2026.’"
+    device = known.get("device_name") or known.get("device_ref")
+    metric = known.get("metric")
+    period = known.get("time_phrase") or "the last 7 days (example)"
+    if device and metric:
+        prompt += f" Example: ‘Show {metric} readings for {device} for {period}.’"
+    elif turn_number > 1:
+        prompt += " Example: ‘Show energy (kWh) readings for 96S2_Freezer_3_1 for the last 7 days.’"
     return prompt
 
 
@@ -5993,6 +6008,8 @@ def extract_clarification_details(original_message: str, reply: str, context: di
     except Exception as error:
         log_event("clarification_extract_fallback", request_id=request_id, error=str(error))
         slots = {}
+    if re.search(r"\b(?:show|list|give)\b.*\b(?:available\s+)?(?:devices?|meters?)\b", reply, re.IGNORECASE):
+        slots["list_devices"] = True
     # Deterministic fallbacks keep short replies useful when the planner model
     # is unavailable or returns malformed JSON.
     if not slots.get("metric"):
@@ -6001,9 +6018,9 @@ def extract_clarification_details(original_message: str, reply: str, context: di
             slots["metric"] = metrics[0]
     if not slots.get("time_phrase") and has_time_scope(reply):
         slots["time_phrase"] = reply.strip()
-    if not slots.get("device_ref"):
+    if not slots.get("device_ref") and not slots.get("list_devices"):
         device_text = reply.strip()
-        device_text = re.sub(r"\b(?:metric|parameter|period|time range|from|between|last|past|today|yesterday)\b.*$", "", device_text, flags=re.IGNORECASE).strip(" ,.;")
+        device_text = re.sub(r"\b(?:metric|parameter|period|time range|energy|kwh|mwh|demand|voltage|current|amps?|power factor|frequency|thd|from|between|last|past|today|yesterday)\b.*$", "", device_text, flags=re.IGNORECASE).strip(" ,.;")
         if device_text and not question_metrics(device_text) and len(device_text.split()) <= 8:
             slots["device_ref"] = device_text
     # Preserve the original operator intent verbatim; extracted slot fields only
@@ -6035,7 +6052,7 @@ def extract_clarification_details(original_message: str, reply: str, context: di
     return query, merged, slots
 
 
-def build_incomplete_request_clarification(message: str, context: dict, request_id: str, required_fields: list[str] | None = None) -> dict:
+def build_incomplete_request_clarification(message: str, context: dict, request_id: str, required_fields: list[str] | None = None, known_slots: dict | None = None, turn_number: int = 1, list_devices: bool = False, turn_id: str | None = None) -> dict:
     missing = []
     clarification_requested = is_historical_readings_clarification_request(message)
     if required_fields is not None:
@@ -6055,14 +6072,28 @@ def build_incomplete_request_clarification(message: str, context: dict, request_
     if context.get("site_id") and context.get("company_id") and context.get("deployment_id"):
         try:
             arguments = build_historical_arguments("site_device_list", {**context, "limit": 100}, message)
-            result = call_authorized_internal_operation(str(uuid.uuid4()), "site_device_list", arguments, request_id, message)
+            result = call_authorized_internal_operation(turn_id or str(uuid.uuid4()), "site_device_list", arguments, request_id, message)
             data = historical_result_data(result)
             devices = [str(first_value(item, ("device_name", "name", "meter_name", "label")))
                        for item in first_list(data, ("devices", "rows", "items", "meters"))
                        if isinstance(item, dict) and first_value(item, ("device_name", "name", "meter_name", "label"))]
         except Exception as error:
             log_event("clarification_device_list_unavailable", request_id=request_id, error=str(error))
-    prompt = llm_clarification_prompt(message, missing or ["device, metric, and time period"], devices)
+    known = dict(known_slots or {})
+    if context.get("_device_name"):
+        known["device_name"] = context["_device_name"]
+    elif context.get("_clarification_device_ref"):
+        known["device_ref"] = context["_clarification_device_ref"]
+    if context.get("metric"):
+        known["metric"] = context["metric"]
+    if context.get("_clarification_time_phrase"):
+        known["time_phrase"] = context["_clarification_time_phrase"]
+    prompt = llm_clarification_prompt(message, missing or ["device, metric, and time period"], devices, known, turn_number)
+    if list_devices and devices:
+        prompt = "Available devices for the selected site: " + "; ".join(devices[:50]) + ". Which device should I use?"
+        if known.get("metric"):
+            prompt += f" I have noted the requested metric is {known['metric']}."
+        prompt += " You can reply with the device name and a period, for example: ‘Main Meter, last 7 days.’"
     if not context.get("site_id") and not clarification_requested:
         prompt += " Please select the site in DaxView first; I can only read devices from your authorized site."
     return {
@@ -6070,7 +6101,7 @@ def build_incomplete_request_clarification(message: str, context: dict, request_
         "reply": prompt,
         "required_fields": missing,
         "example": "For example: ‘Show energy readings for Main Meter from 1–7 October 2026.’",
-        "clarification_state": {"status": "waiting", "original_message": message, "required_fields": missing},
+        "clarification_state": {"status": "waiting", "intent": "historical_device_readings", "original_message": message, "required_fields": missing, "known_slots": known, "turn_number": turn_number, "available_devices": devices[:50]},
         "resolved_plan": resolved_plan_for_result("clarification", [], context),
     }
 
@@ -8163,6 +8194,12 @@ class ChatHandler(BaseHTTPRequestHandler):
                 message = str(request.get("message") or "").strip()
                 request_id = str(request.get("request_id") or uuid.uuid4())
                 context = request.get("context") if isinstance(request.get("context"), dict) else {}
+                context = {
+                    **context,
+                    "deployment_id": identity["deployment_id"],
+                    "company_id": identity["company_id"],
+                    "user_id": identity["user_id"],
+                }
                 if not turn_id:
                     self._send_json(400, json_error("invalid_turn", "turn_id is required.", False, request_id))
                     return True
@@ -8181,18 +8218,31 @@ class ChatHandler(BaseHTTPRequestHandler):
                         prior_context = json.loads(prior_context)
                     clarification["original_message"] = original_message
                     clarification["slots"] = clarification.get("slots") or {}
-                    context = {**prior_context, **context, **clarification.get("slots", {})}
+                    known_slots = clarification.get("known_slots") or {}
+                    context = {**prior_context, **context, **clarification.get("slots", {}), **known_slots}
+                    if known_slots.get("metric"):
+                        context["metric"] = known_slots["metric"]
+                    if known_slots.get("time_phrase"):
+                        context["_clarification_time_phrase"] = known_slots["time_phrase"]
+                        context["_time_window"] = requested_historical_range(str(known_slots["time_phrase"]))
+                    if known_slots.get("device_ref"):
+                        context["_clarification_device_ref"] = known_slots["device_ref"]
                     context["_original_user_message"] = original_message
                     context["_clarification_reply"] = message
                     candidate_message, context, extracted = extract_clarification_details(original_message, message, context, request_id)
                     slot_updates = {}
+                    known_slots = dict(clarification.get("known_slots") or clarification.get("slots") or {})
+                    list_devices = bool(extracted.get("list_devices"))
                     if extracted.get("metric"):
                         slot_updates["metric"] = str(extracted["metric"])
+                        known_slots["metric"] = str(extracted["metric"])
                     if extracted.get("time_phrase"):
                         slot_updates["_time_window"] = requested_historical_range(str(extracted["time_phrase"]))
                         slot_updates["_clarification_time_phrase"] = str(extracted["time_phrase"])
+                        known_slots["time_phrase"] = str(extracted["time_phrase"])
                     if extracted.get("device_ref"):
                         slot_updates["_clarification_device_ref"] = str(extracted["device_ref"])
+                        known_slots["device_ref"] = str(extracted["device_ref"])
                     if slot_updates:
                         clarification["slots"].update(slot_updates)
                         context.update(slot_updates)
@@ -8204,7 +8254,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                         if len(site_matches) == 1:
                             context["site_id"] = site_matches[0].get("site_id") or site_matches[0].get("id")
                             context["_site_name"] = site_matches[0].get("name") or site_matches[0].get("site_name")
-                    if context.get("site_id") and extracted.get("device_ref") and not context.get("device_id"):
+                    if context.get("site_id") and extracted.get("device_ref") and not extracted.get("list_devices") and not context.get("device_id"):
                         resolution = resolve_named_device_reference(
                             str(uuid.uuid4()), str(extracted["device_ref"]), context, request_id
                         )
@@ -8223,16 +8273,24 @@ class ChatHandler(BaseHTTPRequestHandler):
                         remaining.append("metric")
                     if any("period" in field or "time" in field for field in clarification.get("required_fields", [])) and not context.get("_clarification_time_phrase") and not has_time_scope(message):
                         remaining.append("time period")
+                    if list_devices and "device or meter" not in remaining:
+                        remaining.append("device or meter")
                     if not context.get("site_id"):
                         remaining.append("site/site scope (select the authorized site in DaxView)")
                     if remaining:
-                        clarification_result = build_incomplete_request_clarification(original_message, context, request_id, remaining)
+                        clarification_result = build_incomplete_request_clarification(
+                            original_message, context, request_id, remaining, known_slots,
+                            int(clarification.get("turn_number") or 1) + 1, list_devices, turn_id,
+                        )
                         clarification_result["clarification_state"] = {
                             **clarification,
                             "status": "waiting",
                             "original_message": original_message,
                             "last_reply": message,
                             "required_fields": clarification_result.get("required_fields") or [],
+                            "known_slots": known_slots,
+                            "turn_number": int(clarification.get("turn_number") or 1) + 1,
+                            "available_devices": clarification_result.get("clarification_state", {}).get("available_devices", []),
                         }
                         context["_clarification_result"] = clarification_result
                         context["_clarification_parent_turn_id"] = str(pending["id"])
