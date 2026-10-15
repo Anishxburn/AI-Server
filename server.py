@@ -1010,6 +1010,7 @@ DEVICE_REFERENCE_STOPWORDS = {
     "readings", "similar", "names", "there", "then", "also", "please", "could", "would",
     "last", "time", "series", "timeseries", "plot", "chart", "table", "available", "data", "please",
     "overall", "all", "site", "total", "sitewide", "highest", "top", "rank", "ranking", "consumer",
+    "max", "maximum", "peak",
     "consumers", "most", "used", "use", "using", "used", "usage",
 }
 
@@ -3401,7 +3402,7 @@ def summarize_demand_peak(data: dict, message: str, arguments: dict | None = Non
         top_peak = ranked_devices[0].get("peak_kw") if ranked_devices else None
         if not ranked_devices:
             lines.append("No devices returned a comparable, unit-qualified demand or active-power reading for this period.")
-        for index, row in enumerate(ranked_devices[:requested_top_limit(message) or 5], 1):
+        for index, row in enumerate(ranked_devices[:requested_top_limit(message) or 3], 1):
             diff = ""
             if index > 1 and top_peak not in (None, 0):
                 pct = percentage_difference(top_peak, row.get("peak_kw"))
@@ -4340,7 +4341,7 @@ def chart_from_historical_result(operation_id: str, result: dict, arguments: dic
         if ranked_devices:
             labels = []
             values = []
-            for row in ranked_devices[:10]:
+            for row in ranked_devices[:(requested_top_limit(message) or 3)]:
                 if not isinstance(row, dict):
                     continue
                 value = chart_value(row, ("peak_kw", "max_demand_kw", "maximum_demand_kw", "max_kw"))
@@ -4586,7 +4587,9 @@ def build_tables_from_historical_results(results: list[dict], message: str = "")
             columns.extend([("device", "Device"), ("value", "Energy"), ("unit", "Unit"), ("status", "Status")])
         elif operation_id == "demand_peak_summary":
             source_rows = first_list(data, ("ranked_devices", "rankings", "devices", "rows", "peaks"))
-            for rank, row in enumerate(source_rows[:100], 1):
+            is_site_ranking = isinstance(data.get("ranked_devices"), list)
+            row_limit = (requested_top_limit(message) or 3) if is_site_ranking else 100
+            for rank, row in enumerate(source_rows[:row_limit], 1):
                 if not isinstance(row, dict):
                     continue
                 peak = first_value(row, ("peak_kw", "max_demand_kw", "maximum_demand_kw", "peak_demand_kw", "max_kw", "value"))
@@ -5554,8 +5557,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
                 "reply": str(demand_results[0]["clarification"]) + " Follow-up is temporarily disabled; submit a new complete request.",
                 "resolved_plan": resolved_plan_for_result("incomplete", operation_ids, context, demand_results),
             }
-        deterministic_reply = summarize_historical_answers(message, demand_results, request_id)
-        refined_reply = refine_historical_answer_with_model(message, demand_results, deterministic_reply, request_id)
+        refined_reply = summarize_historical_answers(message, demand_results, request_id)
         charts = build_charts_from_historical_results(demand_results, message=message)
         tables = build_tables_from_historical_results(demand_results, message)
         presentation = answer_presentation(message, operation_ids, demand_results, charts, tables)
@@ -5580,8 +5582,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
                 "submit_template": "max demand for {value} for the same period",
                 "resolved_plan": resolved_plan_for_result("clarification", operation_ids, context, ranked_results),
             }
-        deterministic_reply = summarize_historical_answers(message, ranked_results, request_id)
-        refined_reply = refine_historical_answer_with_model(message, ranked_results, deterministic_reply, request_id)
+        refined_reply = summarize_historical_answers(message, ranked_results, request_id)
         charts = build_charts_from_historical_results(ranked_results, message=message)
         tables = build_tables_from_historical_results(ranked_results, message)
         presentation = answer_presentation(message, operation_ids, ranked_results, charts, tables)
@@ -5597,8 +5598,7 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         }
     if "demand_peak_summary" in operation_ids and context.get("device_id"):
         device_results = run_highest_demand_device_ranking(turn_id, message, context, request_id)
-        deterministic_reply = summarize_historical_answers(message, device_results, request_id)
-        refined_reply = refine_historical_answer_with_model(message, device_results, deterministic_reply, request_id)
+        refined_reply = summarize_historical_answers(message, device_results, request_id)
         charts = build_charts_from_historical_results(device_results, message=message)
         tables = build_tables_from_historical_results(device_results, message)
         presentation = answer_presentation(message, operation_ids, device_results, charts, tables)
