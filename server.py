@@ -5770,7 +5770,7 @@ def save_turn_clarification_state(turn_id: str, state: dict) -> None:
         conn.commit()
 
 
-def get_latest_pending_clarification(conversation_id: str, identity: dict) -> dict | None:
+def get_pending_clarification(conversation_id: str, identity: dict, turn_id: str) -> dict | None:
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -5780,12 +5780,12 @@ def get_latest_pending_clarification(conversation_id: str, identity: dict) -> di
                 FROM daxview_turns t
                 JOIN daxview_conversations c ON c.id = t.conversation_id
                 JOIN daxview_jobs j ON j.turn_id = t.id
-                WHERE t.conversation_id = %s AND t.deployment_id = %s AND t.company_id = %s AND t.user_id = %s
+                WHERE t.id = %s AND t.conversation_id = %s AND t.deployment_id = %s AND t.company_id = %s AND t.user_id = %s
                   AND c.status = 'active' AND j.status = 'completed'
                   AND t.clarification_state->>'status' = 'waiting'
-                ORDER BY t.created_at DESC LIMIT 1
+                LIMIT 1
                 """,
-                (conversation_id, identity["deployment_id"], identity["company_id"], identity["user_id"]),
+                (turn_id, conversation_id, identity["deployment_id"], identity["company_id"], identity["user_id"]),
             )
             return cur.fetchone()
 
@@ -5824,6 +5824,7 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
         if result.get("provider") == "daxview-question-filter":
             waiting_event = {
                 "prompt": result["reply"],
+                "clarification_turn_id": turn_id,
                 "fields": result.get("fields") or result.get("required_fields") or ["site_id", "building_id", "device", "metric", "time_range"],
                 "input_type": "text",
                 "example": result.get("example") or "For example: ‘Show energy readings for Main Meter from 1–7 October 2026.’",
@@ -5844,12 +5845,14 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
             add_job_event(job_id, "completed", {"status": "completed"})
             debug_trace_event("ai_outcome_debug", request_id=request_id, status="waiting_for_user", answer=result["reply"], charts=[])
             save_turn_memory(turn_id, result["reply"], result.get("resolved_plan") or {})
-            state = result.get("clarification_state") or {
+            state = result.get("clarification_state") or context.get("_clarification_pending_state") or {
                 "status": "waiting",
-                "original_message": message,
+                "original_message": context.get("_original_user_message") or message,
                 "required_fields": result.get("required_fields") or [],
             }
             state["status"] = "waiting"
+            state.setdefault("original_message", context.get("_original_user_message") or message)
+            state.setdefault("required_fields", result.get("required_fields") or [])
             save_turn_clarification_state(turn_id, state)
             return
         message_event = {"text": result["reply"]}
@@ -5896,6 +5899,12 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
             charts_enabled=AI_CHARTS_ENABLED,
         )
         save_turn_memory(turn_id, result["reply"], result.get("resolved_plan") or {})
+        clarification_parent = context.get("_clarification_parent_turn_id")
+        if clarification_parent:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("UPDATE daxview_turns SET clarification_state = jsonb_set(clarification_state, '{status}', '\"resolved\"'::jsonb) WHERE id = %s", (clarification_parent,))
+                conn.commit()
         save_turn_clarification_state(turn_id, {"status": "resolved"})
     except Exception as error:
         log_event(
@@ -5984,9 +5993,22 @@ def extract_clarification_details(original_message: str, reply: str, context: di
     except Exception as error:
         log_event("clarification_extract_fallback", request_id=request_id, error=str(error))
         slots = {}
+    # Deterministic fallbacks keep short replies useful when the planner model
+    # is unavailable or returns malformed JSON.
+    if not slots.get("metric"):
+        metrics = question_metrics(reply)
+        if metrics:
+            slots["metric"] = metrics[0]
+    if not slots.get("time_phrase") and has_time_scope(reply):
+        slots["time_phrase"] = reply.strip()
+    if not slots.get("device_ref"):
+        device_text = reply.strip()
+        device_text = re.sub(r"\b(?:metric|parameter|period|time range|from|between|last|past|today|yesterday)\b.*$", "", device_text, flags=re.IGNORECASE).strip(" ,.;")
+        if device_text and not question_metrics(device_text) and len(device_text.split()) <= 8:
+            slots["device_ref"] = device_text
     # Preserve the original operator intent verbatim; extracted slot fields only
     # enrich server context and never replace the request with model-authored text.
-    query = f"{original_message}\nAdditional details from the operator: {reply}".strip()
+    query = original_message.strip()
     merged = dict(context)
     if slots.get("metric") and not merged.get("metric"): merged["metric"] = str(slots["metric"])
     if not merged.get("metric"):
@@ -5994,7 +6016,7 @@ def extract_clarification_details(original_message: str, reply: str, context: di
         if reply_metrics:
             merged["metric"] = reply_metrics[0]
             slots["metric"] = reply_metrics[0]
-    if slots.get("time_phrase") and not has_time_scope(reply):
+    if slots.get("time_phrase") and not has_time_scope(query):
         query = f"{query} {slots['time_phrase']}"
     if not slots.get("time_phrase") and has_time_scope(reply):
         query = f"{query} {reply}"
@@ -6004,28 +6026,30 @@ def extract_clarification_details(original_message: str, reply: str, context: di
         merged["_clarification_device_ref"] = reply.strip()
     if slots.get("building_ref") and str(slots["building_ref"]).isdigit() and not merged.get("building_id"):
         merged["building_id"] = int(slots["building_ref"])
-    if slots.get("metric"):
+    if slots.get("metric") and not question_metrics(query):
         query += f" Metric: {slots['metric']}."
-    if slots.get("device_ref"):
+    if slots.get("device_ref") and not has_named_device_reference(query):
         query += f" Device: {slots['device_ref']}."
     if slots.get("site_ref"):
         query += f" Site: {slots['site_ref']}."
     return query, merged, slots
 
 
-def build_incomplete_request_clarification(message: str, context: dict, request_id: str) -> dict:
+def build_incomplete_request_clarification(message: str, context: dict, request_id: str, required_fields: list[str] | None = None) -> dict:
     missing = []
     clarification_requested = is_historical_readings_clarification_request(message)
-    if not context.get("site_id") and not clarification_requested:
+    if required_fields is not None:
+        missing = list(required_fields)
+    elif not context.get("site_id") and not clarification_requested:
         if not re.search(r"\b(?:at|for|site|building)\b", message.lower()):
             missing.append("site/site scope")
         else:
             missing.append("site/site scope (select this site in DaxView so it can be authorized)")
-    if clarification_requested or needs_device_choice(message) or (question_metrics(message) and not has_named_device_reference(message) and not context.get("device_id") and not wants_device_usage_ranking(message)):
+    if required_fields is None and (clarification_requested or needs_device_choice(message) or (question_metrics(message) and not has_named_device_reference(message) and not context.get("device_id") and not wants_device_usage_ranking(message))):
         missing.append("device or meter")
-    if (clarification_requested or not question_metrics(message)) and not any(word in message.lower() for word in ("alarm", "device list", "devices", "meters")):
+    if required_fields is None and (clarification_requested or not question_metrics(message)) and not any(word in message.lower() for word in ("alarm", "device list", "devices", "meters")):
         missing.append("metric (such as energy, demand, voltage, or current)")
-    if clarification_requested or not has_time_scope(message):
+    if required_fields is None and (clarification_requested or not has_time_scope(message)):
         missing.append("time period (such as last 7 days or 1–7 October 2026)")
     devices = []
     if context.get("site_id") and context.get("company_id") and context.get("deployment_id"):
@@ -8145,7 +8169,8 @@ class ChatHandler(BaseHTTPRequestHandler):
                 if not message:
                     self._send_json(400, json_error("invalid_turn", "message is required.", False, request_id))
                     return True
-                pending = get_latest_pending_clarification(conversation_id, identity)
+                clarification_turn_id = str(request.get("clarification_for_turn_id") or "").strip()
+                pending = get_pending_clarification(conversation_id, identity, clarification_turn_id) if clarification_turn_id else None
                 parent_turn_id = None
                 clarification = {}
                 if pending:
@@ -8154,10 +8179,23 @@ class ChatHandler(BaseHTTPRequestHandler):
                     prior_context = pending.get("context") or {}
                     if isinstance(prior_context, str):
                         prior_context = json.loads(prior_context)
-                    context = {**prior_context, **context}
+                    clarification["original_message"] = original_message
+                    clarification["slots"] = clarification.get("slots") or {}
+                    context = {**prior_context, **context, **clarification.get("slots", {})}
                     context["_original_user_message"] = original_message
                     context["_clarification_reply"] = message
                     candidate_message, context, extracted = extract_clarification_details(original_message, message, context, request_id)
+                    slot_updates = {}
+                    if extracted.get("metric"):
+                        slot_updates["metric"] = str(extracted["metric"])
+                    if extracted.get("time_phrase"):
+                        slot_updates["_time_window"] = requested_historical_range(str(extracted["time_phrase"]))
+                        slot_updates["_clarification_time_phrase"] = str(extracted["time_phrase"])
+                    if extracted.get("device_ref"):
+                        slot_updates["_clarification_device_ref"] = str(extracted["device_ref"])
+                    if slot_updates:
+                        clarification["slots"].update(slot_updates)
+                        context.update(slot_updates)
                     if not context.get("site_id") and extracted.get("site_ref"):
                         site_ref = str(extracted["site_ref"]).strip().lower()
                         authorized_sites = context.get("authorized_sites") or context.get("sites") or []
@@ -8177,18 +8215,18 @@ class ChatHandler(BaseHTTPRequestHandler):
                             context["_clarification_device_unresolved"] = True
                     operations, _merged_context, _plan = choose_historical_operations(candidate_message, context, request_id)
                     remaining = []
-                    if not context.get("site_id"):
+                    if not context.get("site_id") and "site/site scope" in clarification.get("required_fields", []):
                         remaining.append("site/site scope")
-                    if context.get("_clarification_device_unresolved") or ("device or meter" in clarification.get("required_fields", []) and not context.get("device_id") and not wants_highest_demand_device(candidate_message)):
+                    if context.get("_clarification_device_unresolved") or ("device or meter" in clarification.get("required_fields", []) and not context.get("device_id") and not wants_all_devices(candidate_message) and not wants_highest_demand_device(candidate_message)):
                         remaining.append("device or meter")
-                    if "metric" in clarification.get("required_fields", []) and not context.get("metric") and not question_metrics(candidate_message):
+                    if any("metric" in field for field in clarification.get("required_fields", [])) and not context.get("metric"):
                         remaining.append("metric")
-                    if ("time period" in " ".join(clarification.get("required_fields", [])) or "period" in " ".join(clarification.get("required_fields", []))) and not has_time_scope(candidate_message):
+                    if any("period" in field or "time" in field for field in clarification.get("required_fields", [])) and not context.get("_clarification_time_phrase") and not has_time_scope(message):
                         remaining.append("time period")
-                    if (operations and daxview_clarification_needed(candidate_message, operations)) or remaining:
-                        clarification_result = build_incomplete_request_clarification(original_message, context, request_id)
-                        if remaining:
-                            clarification_result["required_fields"] = remaining
+                    if not context.get("site_id"):
+                        remaining.append("site/site scope (select the authorized site in DaxView)")
+                    if remaining:
+                        clarification_result = build_incomplete_request_clarification(original_message, context, request_id, remaining)
                         clarification_result["clarification_state"] = {
                             **clarification,
                             "status": "waiting",
@@ -8198,8 +8236,15 @@ class ChatHandler(BaseHTTPRequestHandler):
                         }
                         context["_clarification_result"] = clarification_result
                         context["_clarification_parent_turn_id"] = str(pending["id"])
+                        context["_clarification_pending_state"] = clarification_result["clarification_state"]
                     parent_turn_id = str(pending["id"])
                     message = candidate_message
+                    stored_user_message = str(request.get("message") or "").strip()
+                elif clarification_turn_id:
+                    self._send_json(409, json_error("clarification_not_pending", "That clarification is no longer waiting for a reply.", False, request_id))
+                    return True
+                else:
+                    stored_user_message = message
                 job_id = safe_job_id(turn_id)
                 created = False
                 with db() as conn:
@@ -8226,7 +8271,7 @@ class ChatHandler(BaseHTTPRequestHandler):
                                 identity["deployment_id"],
                                 identity["company_id"],
                                 identity["user_id"],
-                                message,
+                                stored_user_message,
                                 request_id,
                                 json.dumps(context),
                                 parent_turn_id,

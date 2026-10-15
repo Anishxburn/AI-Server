@@ -48,6 +48,7 @@ class ClarificationHelperTests(unittest.TestCase):
             "ollama_json": Mock(return_value={"message": {"content": '{"query":"rewritten","metric":"energy","time_phrase":"last 7 days"}'}}),
             "PLANNER_MODEL": "planner", "PLANNER_TIMEOUT": 1,
             "log_event": Mock(), "question_metrics": lambda _text: [],
+            "re": __import__("re"),
             "has_named_device_reference": lambda _text: False,
             "has_time_scope": lambda text: "last 7 days" in text,
         }
@@ -59,6 +60,25 @@ class ClarificationHelperTests(unittest.TestCase):
         self.assertNotEqual(query, "rewritten")
         self.assertEqual(context["metric"], "energy")
         self.assertIn("last 7 days", query)
+
+    def test_partial_clarification_keeps_original_question_stable(self):
+        module = ast.Module(body=[NODES["extract_clarification_details"]], type_ignores=[])
+        env = {
+            "__builtins__": __builtins__, "json": __import__("json"),
+            "ollama_json": Mock(return_value={"message": {"content": '{"metric":"energy","time_phrase":"last 7 days","device_ref":"Main Meter"}'}}),
+            "PLANNER_MODEL": "planner", "PLANNER_TIMEOUT": 1, "log_event": Mock(),
+            "re": __import__("re"),
+            "question_metrics": lambda _text: [], "has_named_device_reference": lambda _text: False,
+            "has_time_scope": lambda text: "last 7 days" in text,
+        }
+        exec(compile(module, str(SOURCE), "exec"), env)
+        original = "I need historical device readings at Mun Hean Singapore HQ."
+        query, context, slots = env["extract_clarification_details"](original, "Main Meter, energy, last 7 days", {}, "request-2")
+        self.assertEqual(query.count("Additional details"), 0)
+        self.assertIn(original, query)
+        self.assertEqual(context["metric"], "energy")
+        self.assertEqual(context["_clarification_device_ref"], "Main Meter")
+        self.assertEqual(slots["time_phrase"], "last 7 days")
 
 
 if __name__ == "__main__":
