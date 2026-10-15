@@ -1194,24 +1194,24 @@ def resolve_named_device_reference(turn_id: str, message: str, context: dict, re
         candidate_names = [choice["label"] for choice in choices]
         candidate_list = "\n".join(f"• {name}" for name in candidate_names)
         prompt = (
-            "I found more than one close device name:\n"
+            "I couldn't identify one exact device, so I haven't fetched readings. These names are close matches:\n"
             + candidate_list
             + "\nWhich one do you mean? Reply with the device name and I’ll continue with your original metric and time range."
         )
     else:
         candidate_names = [choice["label"] for choice in choices]
         prompt = (
-            f"I couldn't match that name exactly. The closest device is {candidate_names[0]}. "
-            "Reply with its name to continue, or enter a more specific name."
+            f"I couldn't identify that device exactly, so I haven't fetched readings. The closest available name is {candidate_names[0]}. "
+            "Include an exact device name, metric, and time range in a new request."
             if candidate_names else
-            "I couldn't match that name exactly. Please enter a more specific device name."
+            "I couldn't identify that device, so I haven't fetched readings. Include an exact device name, metric, and time range in a new request."
         )
     debug_trace_event(
         "device_name_match_ambiguous_debug",
         request_id=request_id,
         candidates=[{"name": item[1], "device_id": str(item[2]), "score": round(item[0], 3)} for item in candidates],
     )
-    return {"status": "clarification", "reply": prompt, "choices": choices}
+    return {"status": "ambiguous", "reply": prompt, "choices": choices}
 
 
 def device_metric_selection_template(message: str, use_device_id: bool = True) -> str:
@@ -4876,29 +4876,11 @@ def device_selection_prompt_from_result(mcp_result: dict) -> tuple[str, list[dic
 
 
 def build_device_choice_response(turn_id: str, message: str, context: dict, request_id: str) -> dict:
-    try:
-        arguments = build_historical_arguments("site_device_list", context, message)
-        result = call_authorized_internal_operation(turn_id, "site_device_list", arguments, request_id, message)
-        prompt, choices = device_selection_prompt_from_result(result)
-    except Exception as error:
-        log_event("daxview_device_choice_failed", request_id=request_id, turn_id=turn_id, error=str(error))
-        prompt = (
-            "Which device should I use for the max-demand check? "
-            "Reply with the device name, or a distinctive part of it."
-        )
-        choices = []
-    window = re.search(
-        r"\b(?:last|past)\s+\d{1,3}\s+days?\b|\b(?:today|yesterday|this week|last week|this month|last month)\b",
-        message, re.IGNORECASE,
-    )
-    time_scope = window.group(0) if window else "the last 7 days"
+    prompt = "For a max-demand report across the site, include 'highest demand device' or name one exact meter. Follow-up is temporarily disabled, so submit a new complete request with the requested time range."
     return {
         "provider": "daxview-question-filter",
         "reply": prompt,
-        "fields": ["device_id"],
-        "input_type": "select",
-        "choices": choices,
-        "submit_template": f"max demand for {{value}} for {time_scope}",
+        "resolved_plan": resolved_plan_for_result("incomplete", ["demand_peak_summary"], context),
     }
 
 
@@ -5437,16 +5419,27 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         }
     clarification = metric_clarification(message)
     if clarification:
-        return {"provider": "daxview-question-filter", "reply": clarification, "resolved_plan": resolved_plan_for_result("clarification", [], context)}
-    if is_historical_readings_clarification_request(message) and not context.get("_clarification_reply"):
+        return {
+            "provider": "daxview-question-filter",
+            "reply": f"{clarification} Follow-up is temporarily disabled; include the requested detail in a new complete question.",
+            "resolved_plan": resolved_plan_for_result("incomplete", [], context),
+        }
+    if is_historical_readings_clarification_request(message):
         debug_trace_event(
             "daxview_clarification_intent_debug",
             request_id=request_id,
             intent="historical_telemetry_clarification",
-            planner_skipped=True,
-            mcp_skipped=True,
+            clarification_disabled=True,
         )
-        return build_incomplete_request_clarification(message, context, request_id, turn_id=turn_id)
+        return {
+            "provider": "daxview-question-filter",
+            "reply": (
+                "I understand you want historical device readings. I haven't fetched data because the request asks me to clarify first. "
+                "For a direct result, submit one complete request with the metric, exact device, and time range, for example: "
+                "Show energy (kWh) readings for 96S2_Freezer_3_1 for the last 7 days."
+            ),
+            "resolved_plan": resolved_plan_for_result("incomplete", [], context),
+        }
     operation_ids, context, planner_plan = choose_historical_operations(message, context, request_id)
     debug_trace_event(
         "daxview_tool_selection_debug",
@@ -5456,29 +5449,42 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         message=message,
     )
     if context.get("_planner_clarification"):
+        # Ignore model-generated clarification prompts while follow-up is disabled.
+        # Continue only if deterministic routing found a concrete supported tool.
+        if not operation_ids:
+            return {
+                "provider": "daxview-question-filter",
+                "reply": "I couldn't determine a safe data operation for that request. Please submit a new, more specific EMS question.",
+                "resolved_plan": planner_plan or resolved_plan_for_result("incomplete", [], context),
+            }
+    if context.get("_clarification_result"):
         return {
             "provider": "daxview-question-filter",
-            "reply": str(context["_planner_clarification"]),
-            "resolved_plan": planner_plan or resolved_plan_for_result("clarification", [], context),
+            "reply": context["_clarification_result"].get("reply") or "I couldn't complete that request. Please submit a new complete request.",
+            "resolved_plan": context["_clarification_result"].get("resolved_plan") or resolved_plan_for_result("incomplete", operation_ids, context),
         }
-    if context.get("_clarification_result"):
-        return context["_clarification_result"]
-    if operation_ids and daxview_clarification_needed(message, operation_ids) and not context.get("_clarification_reply"):
-        return build_incomplete_request_clarification(message, context, request_id, turn_id=turn_id)
+    if operation_ids and daxview_clarification_needed(message, operation_ids):
+        return {
+            "provider": "daxview-question-filter",
+            "reply": "I couldn't safely choose the device or time scope for that request. Submit a new question with the device or scope, metric, and time range together.",
+            "resolved_plan": resolved_plan_for_result("incomplete", operation_ids, context),
+        }
     if not operation_ids:
         result = langchain_chat_response(message, request_id, session_id)
         result["resolved_plan"] = resolved_plan_for_result("ok", [], context)
         return result
     context = dict(context)
     if context.get("_clarification_device_unresolved"):
-        return build_incomplete_request_clarification(message, context, request_id, turn_id=turn_id)
-    if context.get("_clarification_device_ref") and not context.get("device_id") and context.get("site_id"):
-        match = resolve_named_device_reference(turn_id, context["_clarification_device_ref"], context, request_id)
-        if match.get("status") == "matched":
-            context["device_id"] = match["device_id"]
-            context["_device_name"] = match["device_name"]
-        else:
-            return build_incomplete_request_clarification(message, context, request_id, turn_id=turn_id)
+        return {
+            "provider": "daxview-question-filter",
+            "reply": "I couldn't identify that device, so I haven't fetched readings. Submit a new request with its exact name, metric, and time range.",
+            "resolved_plan": resolved_plan_for_result("incomplete", operation_ids, context),
+        }
+    if context.get("_clarification_device_ref") or context.get("_clarification_time_phrase"):
+        # Old saved slots no longer resume anything. Ignore them for new turns.
+        context.pop("_clarification_device_ref", None)
+        context.pop("_clarification_time_phrase", None)
+        context.pop("_clarification_reply", None)
     if requested_device_id(message):
         context["device_id"] = requested_device_id(message)
     if wants_named_device_metric_query(message) and not context.get("device_id"):
@@ -5486,27 +5492,14 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         if device_match.get("status") != "matched":
             return {
                 "provider": "daxview-question-filter",
-                "reply": device_match.get("reply") or "Which device name should I use?",
-                "required_fields": ["device or meter"],
-                "clarification_state": {
-                    "status": "waiting",
-                    "intent": "historical_device_readings",
-                    "original_message": message,
-                    "required_fields": ["device or meter"],
-                    "known_slots": {
-                        **({"metric": question_metrics(message)[0]} if question_metrics(message) else {}),
-                    },
-                    "turn_number": 2,
-                },
-                "resolved_plan": resolved_plan_for_result("clarification", operation_ids, context),
+                "reply": device_match.get("reply") or "I couldn't identify an exact device, so I haven't fetched readings. Submit a new request with the exact device name, metric, and time range.",
+                "resolved_plan": resolved_plan_for_result("incomplete", operation_ids, context),
             }
         context["device_id"] = device_match["device_id"]
         context["_device_name"] = device_match["device_name"]
         save_resolved_turn_context(turn_id, context)
     if "demand_peak_summary" in operation_ids and not context.get("device_id") and not wants_highest_demand_device(message):
-        result = build_device_choice_response(turn_id, message, context, request_id)
-        result["resolved_plan"] = resolved_plan_for_result("clarification", operation_ids, context)
-        return result
+        context["_device_name"] = "All devices"
     context.setdefault("_time_window", completed_daily_range(message) or requested_historical_range(message))
     save_resolved_turn_context(turn_id, context)
     if "telemetry_metric_ranking" in operation_ids:
@@ -5514,11 +5507,8 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         if metric_results and metric_results[0].get("clarification"):
             return {
                 "provider": "daxview-question-filter",
-                "reply": metric_results[0]["clarification"],
-                "input_type": "select",
-                "choices": metric_results[0].get("choices") or [],
-                "submit_template": "rank frequency across the selected scope for the same period",
-                "resolved_plan": resolved_plan_for_result("clarification", operation_ids, context, metric_results),
+                "reply": str(metric_results[0]["clarification"]) + " Follow-up is temporarily disabled; submit a new complete request.",
+                "resolved_plan": resolved_plan_for_result("incomplete", operation_ids, context, metric_results),
             }
         deterministic_reply = summarize_historical_answers(message, metric_results, request_id)
         refined_reply = refine_historical_answer_with_model(message, metric_results, deterministic_reply, request_id)
@@ -5555,17 +5545,14 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     if "demand_peak_summary" in operation_ids:
         if not context.get("device_id") and not wants_highest_demand_device(message):
             result = build_device_choice_response(turn_id, message, context, request_id)
-            result["resolved_plan"] = resolved_plan_for_result("clarification", operation_ids, context)
+            result["resolved_plan"] = resolved_plan_for_result("incomplete", operation_ids, context)
             return result
         demand_results = run_highest_demand_device_ranking(turn_id, message, context, request_id)
         if demand_results and demand_results[0].get("clarification"):
             return {
                 "provider": "daxview-question-filter",
-                "reply": demand_results[0]["clarification"],
-                "input_type": "select",
-                "choices": demand_results[0].get("choices") or [],
-                "submit_template": "max demand for {value} for the same period",
-                "resolved_plan": resolved_plan_for_result("clarification", operation_ids, context, demand_results),
+                "reply": str(demand_results[0]["clarification"]) + " Follow-up is temporarily disabled; submit a new complete request.",
+                "resolved_plan": resolved_plan_for_result("incomplete", operation_ids, context, demand_results),
             }
         deterministic_reply = summarize_historical_answers(message, demand_results, request_id)
         refined_reply = refine_historical_answer_with_model(message, demand_results, deterministic_reply, request_id)
@@ -5648,8 +5635,8 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
         except ValueError as error:
             return {
                 "provider": "daxview-question-filter",
-                "reply": historical_argument_clarification(error, operation_id),
-                "resolved_plan": resolved_plan_for_result("clarification", operation_ids, context),
+                "reply": str(error) + " Follow-up is temporarily disabled; submit a new complete request.",
+                "resolved_plan": resolved_plan_for_result("incomplete", operation_ids, context),
             }
         if operation_id == "energy_forecast":
             try:
@@ -5892,47 +5879,28 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
         if is_job_cancelled(job_id):
             return
         if result.get("provider") == "daxview-question-filter":
-            waiting_event = {
-                "prompt": result["reply"],
-                "clarification_turn_id": turn_id,
-                "fields": result.get("fields") or result.get("required_fields") or ["site_id", "building_id", "device", "metric", "time_range"],
-                "input_type": "text",
-                "example": result.get("example") or "For example: ‘Show energy readings for Main Meter from 1–7 October 2026.’",
-            }
-            if result.get("input_type"):
-                waiting_event["input_type"] = result["input_type"]
-            if result.get("choices"):
-                waiting_event["choices"] = result["choices"]
-            if result.get("submit_template"):
-                waiting_event["submit_template"] = result["submit_template"]
-            waiting_event["example"] = result.get("example") or "For example: ‘Show energy readings for Main Meter from 1–7 October 2026.’"
-            add_job_event(
-                job_id,
-                "waiting_for_user",
-                waiting_event,
-            )
+            # Temporary no-follow-up behavior: finish incomplete requests with
+            # one useful message instead of leaving a resumable waiting turn.
+            answer = result.get("reply") or "I couldn't complete that request."
+            add_job_event(job_id, "message", {"text": answer})
             update_job_status(job_id, "completed")
             add_job_event(job_id, "completed", {"status": "completed"})
-            debug_trace_event("ai_outcome_debug", request_id=request_id, status="waiting_for_user", answer=result["reply"], charts=[])
-            save_turn_memory(turn_id, result["reply"], result.get("resolved_plan") or {})
-            state = result.get("clarification_state") or context.get("_clarification_pending_state") or {
-                "status": "waiting",
-                "original_message": context.get("_original_user_message") or message,
-                "required_fields": result.get("required_fields") or [],
-            }
-            state["status"] = "waiting"
-            state.setdefault("original_message", context.get("_original_user_message") or message)
-            state.setdefault("required_fields", result.get("required_fields") or [])
-            save_turn_clarification_state(turn_id, state)
-            clarification_parent = context.get("_clarification_parent_turn_id")
-            if clarification_parent:
-                with db() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            "UPDATE daxview_turns SET clarification_state = jsonb_set(clarification_state, '{status}', '\"resolved\"'::jsonb) WHERE id = %s",
-                            (clarification_parent,),
-                        )
-                    conn.commit()
+            debug_trace_event(
+                "ai_outcome_debug",
+                request_id=request_id,
+                status="completed",
+                answer=answer,
+                charts=[],
+            )
+            save_turn_memory(turn_id, answer, result.get("resolved_plan") or {})
+            if DATABASE_URL:
+                try:
+                    with db() as conn:
+                        with conn.cursor() as cur:
+                            cur.execute("UPDATE daxview_turns SET clarification_state = '{\"status\":\"resolved\"}'::jsonb WHERE id = %s", (turn_id,))
+                        conn.commit()
+                except Exception as error:
+                    log_event("clarification_disabled_state_cleanup_failed", request_id=request_id, error=str(error))
             return
         message_event = {"text": result["reply"]}
         if result.get("charts"):
@@ -5978,12 +5946,6 @@ def process_daxview_turn(job_id: str, turn_id: str, message: str, context: dict,
             charts_enabled=AI_CHARTS_ENABLED,
         )
         save_turn_memory(turn_id, result["reply"], result.get("resolved_plan") or {})
-        clarification_parent = context.get("_clarification_parent_turn_id")
-        if clarification_parent:
-            with db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute("UPDATE daxview_turns SET clarification_state = jsonb_set(clarification_state, '{status}', '\"resolved\"'::jsonb) WHERE id = %s", (clarification_parent,))
-                conn.commit()
         save_turn_clarification_state(turn_id, {"status": "resolved"})
     except Exception as error:
         log_event(
@@ -8408,193 +8370,11 @@ class ChatHandler(BaseHTTPRequestHandler):
                     self._send_json(400, json_error("invalid_turn", "message is required.", False, request_id))
                     return True
                 clarification_turn_id = str(request.get("clarification_for_turn_id") or "").strip()
-                pending = get_pending_clarification(conversation_id, identity, clarification_turn_id) if clarification_turn_id else None
-                if pending:
-                    incoming_message = message
-                parent_turn_id = None
-                clarification = {}
-                if pending:
-                    clarification = pending.get("clarification_state") or {}
-                    original_message = str(clarification.get("original_message") or pending.get("user_message") or "")
-                    prior_context = pending.get("context") or {}
-                    if isinstance(prior_context, str):
-                        prior_context = json.loads(prior_context)
-                    clarification["original_message"] = original_message
-                    clarification["slots"] = clarification.get("slots") or {}
-                    known_slots = dict(clarification.get("known_slots") or {})
-                    saved_devices = clarification.get("available_devices") or []
-                    saved_slots = dict(clarification.get("slots") or {})
-                    saved_metric = known_slots.get("metric")
-                    if saved_metric:
-                        parsed_saved_metric = question_metrics(str(saved_metric))
-                        if parsed_saved_metric:
-                            known_slots["metric"] = parsed_saved_metric[0]
-                        else:
-                            known_slots.pop("metric", None)
-                    saved_device_ref = known_slots.get("device_ref") or known_slots.get("device_name")
-                    if saved_device_ref:
-                        normalized_saved_ref = normalize_device_name(saved_device_ref)
-                        exact_saved_device = next(
-                            (name for name in saved_devices if normalize_device_name(name) == normalized_saved_ref),
-                            None,
-                        )
-                        if exact_saved_device:
-                            known_slots["device_ref"] = exact_saved_device
-                        elif is_prompt_like_clarification_slot(saved_device_ref):
-                            known_slots.pop("device_ref", None)
-                            known_slots.pop("device_name", None)
-                    saved_slot_device = saved_slots.get("_clarification_device_ref") or saved_slots.get("device_ref")
-                    if saved_slot_device:
-                        exact_slot_device = next(
-                            (name for name in saved_devices if normalize_device_name(name) == normalize_device_name(saved_slot_device)),
-                            None,
-                        )
-                        if exact_slot_device:
-                            saved_slots["_clarification_device_ref"] = exact_slot_device
-                        elif is_prompt_like_clarification_slot(saved_slot_device):
-                            saved_slots.pop("_clarification_device_ref", None)
-                            saved_slots.pop("device_ref", None)
-                    saved_slot_metric = saved_slots.get("metric")
-                    if saved_slot_metric:
-                        parsed_slot_metric = question_metrics(str(saved_slot_metric))
-                        if parsed_slot_metric:
-                            saved_slots["metric"] = parsed_slot_metric[0]
-                        else:
-                            saved_slots.pop("metric", None)
-                    saved_slot_time = saved_slots.get("_clarification_time_phrase") or saved_slots.get("time_phrase")
-                    if saved_slot_time:
-                        clean_slot_time = extract_clarification_time_phrase(saved_slot_time)
-                        if clean_slot_time:
-                            saved_slots["_clarification_time_phrase"] = clean_slot_time
-                            saved_slots.pop("time_phrase", None)
-                        elif is_prompt_like_clarification_slot(saved_slot_time) or not has_time_scope(str(saved_slot_time)):
-                            saved_slots.pop("_clarification_time_phrase", None)
-                            saved_slots.pop("time_phrase", None)
-                            saved_slots.pop("_time_window", None)
-                    clarification["slots"] = saved_slots
-                    saved_time_phrase = known_slots.get("time_phrase")
-                    if saved_time_phrase:
-                        clean_time_phrase = extract_clarification_time_phrase(saved_time_phrase)
-                        if clean_time_phrase:
-                            known_slots["time_phrase"] = clean_time_phrase
-                        elif is_prompt_like_clarification_slot(saved_time_phrase) or not has_time_scope(str(saved_time_phrase)):
-                            known_slots.pop("time_phrase", None)
-                    context = {**prior_context, **context, **clarification.get("slots", {}), **known_slots}
-                    if context.get("metric"):
-                        parsed_context_metric = question_metrics(str(context["metric"]))
-                        if parsed_context_metric:
-                            context["metric"] = parsed_context_metric[0]
-                        else:
-                            context.pop("metric", None)
-                    for device_key in ("_clarification_device_ref", "_device_name"):
-                        stale_device_hint = context.get(device_key)
-                        if stale_device_hint and is_prompt_like_clarification_slot(stale_device_hint):
-                            context.pop(device_key, None)
-                    stale_time_phrase = context.get("_clarification_time_phrase")
-                    if stale_time_phrase:
-                        clean_time_phrase = extract_clarification_time_phrase(stale_time_phrase)
-                        if clean_time_phrase:
-                            context["_clarification_time_phrase"] = clean_time_phrase
-                            context["_time_window"] = requested_historical_range(clean_time_phrase)
-                        elif is_prompt_like_clarification_slot(stale_time_phrase) or not has_time_scope(str(stale_time_phrase)):
-                            context.pop("_clarification_time_phrase", None)
-                            context.pop("_time_window", None)
-                    if known_slots.get("metric"):
-                        context["metric"] = known_slots["metric"]
-                    if known_slots.get("time_phrase"):
-                        context["_clarification_time_phrase"] = known_slots["time_phrase"]
-                        context["_time_window"] = requested_historical_range(str(known_slots["time_phrase"]))
-                    if known_slots.get("device_ref"):
-                        context["_clarification_device_ref"] = known_slots["device_ref"]
-                    context["_original_user_message"] = original_message
-                    context["_clarification_reply"] = incoming_message
-                    message = merge_historical_clarification_request(original_message, incoming_message, clarification)
-                    candidate_message, context, extracted = extract_clarification_details(
-                        original_message,
-                        incoming_message,
-                        context,
-                        request_id,
-                        available_devices=clarification.get("available_devices") or [],
-                    )
-                    slot_updates = {}
-                    known_slots = dict(known_slots)
-                    list_devices = bool(extracted.get("list_devices"))
-                    if extracted.get("metric"):
-                        slot_updates["metric"] = str(extracted["metric"])
-                        known_slots["metric"] = str(extracted["metric"])
-                    if extracted.get("time_phrase"):
-                        slot_updates["_time_window"] = requested_historical_range(str(extracted["time_phrase"]))
-                        slot_updates["_clarification_time_phrase"] = str(extracted["time_phrase"])
-                        known_slots["time_phrase"] = str(extracted["time_phrase"])
-                    if extracted.get("device_ref"):
-                        slot_updates["_clarification_device_ref"] = str(extracted["device_ref"])
-                        known_slots["device_ref"] = str(extracted["device_ref"])
-                    if extracted.get("device_ref") or extracted.get("list_devices"):
-                        context.pop("_clarification_device_unresolved", None)
-                    if slot_updates:
-                        clarification["slots"].update(slot_updates)
-                        context.update(slot_updates)
-                    if not context.get("site_id") and extracted.get("site_ref"):
-                        site_ref = str(extracted["site_ref"]).strip().lower()
-                        authorized_sites = context.get("authorized_sites") or context.get("sites") or []
-                        site_matches = [item for item in authorized_sites if isinstance(item, dict) and
-                                        site_ref in str(item.get("name") or item.get("site_name") or "").lower()]
-                        if len(site_matches) == 1:
-                            context["site_id"] = site_matches[0].get("site_id") or site_matches[0].get("id")
-                            context["_site_name"] = site_matches[0].get("name") or site_matches[0].get("site_name")
-                    device_ref_to_resolve = extracted.get("device_ref") or context.get("_clarification_device_ref")
-                    if device_ref_to_resolve:
-                        context.pop("_clarification_device_unresolved", None)
-                    if context.get("site_id") and device_ref_to_resolve and not extracted.get("list_devices") and not context.get("device_id"):
-                        resolution = resolve_named_device_reference(turn_id, str(device_ref_to_resolve), context, request_id)
-                        if resolution.get("status") == "matched":
-                            context["device_id"] = resolution["device_id"]
-                            context["_device_name"] = resolution["device_name"]
-                        else:
-                            context["_clarification_device_unresolved"] = True
-                    extracted_query = str(extracted.get("query") or "")
-                    if extracted_query and not is_historical_readings_clarification_request(extracted_query):
-                        candidate_message = extracted_query
-                    operations, _merged_context, _plan = choose_historical_operations(candidate_message, context, request_id)
-                    remaining = []
-                    if not context.get("site_id") and any("site/site scope" in str(field) for field in clarification.get("required_fields", [])):
-                        remaining.append("site/site scope")
-                    if context.get("_clarification_device_unresolved") or ("device or meter" in clarification.get("required_fields", []) and not context.get("device_id") and not wants_all_devices(candidate_message) and not wants_highest_demand_device(candidate_message)):
-                        remaining.append("device or meter")
-                    if any("metric" in field for field in clarification.get("required_fields", [])) and not context.get("metric"):
-                        remaining.append("metric")
-                    if any("period" in field or "time" in field for field in clarification.get("required_fields", [])) and not context.get("_clarification_time_phrase") and not has_time_scope(incoming_message):
-                        remaining.append("time period")
-                    if list_devices and "device or meter" not in remaining:
-                        remaining.append("device or meter")
-                    if not context.get("site_id"):
-                        remaining.append("site/site scope (select the authorized site in DaxView)")
-                    if remaining:
-                        clarification_result = build_incomplete_request_clarification(
-                            original_message, context, request_id, remaining, known_slots,
-                            int(clarification.get("turn_number") or 1) + 1, list_devices, turn_id,
-                        )
-                        clarification_result["clarification_state"] = {
-                            **clarification,
-                            "status": "waiting",
-                            "original_message": original_message,
-                            "last_reply": incoming_message,
-                            "required_fields": clarification_result.get("required_fields") or [],
-                            "known_slots": known_slots,
-                            "turn_number": int(clarification.get("turn_number") or 1) + 1,
-                            "available_devices": clarification_result.get("clarification_state", {}).get("available_devices", []),
-                        }
-                        context["_clarification_result"] = clarification_result
-                        context["_clarification_parent_turn_id"] = str(pending["id"])
-                        context["_clarification_pending_state"] = clarification_result["clarification_state"]
-                    parent_turn_id = str(pending["id"])
-                    message = candidate_message
-                    stored_user_message = incoming_message
-                elif clarification_turn_id:
-                    self._send_json(409, json_error("clarification_not_pending", "That clarification is no longer waiting for a reply.", False, request_id))
+                if clarification_turn_id:
+                    self._send_json(409, json_error("clarification_disabled", "Follow-up clarification is temporarily disabled. Please submit a complete new question.", False, request_id))
                     return True
-                else:
-                    stored_user_message = message
+                stored_user_message = message
+                parent_turn_id = None
                 job_id = safe_job_id(turn_id)
                 created = False
                 with db() as conn:
@@ -8639,12 +8419,6 @@ class ChatHandler(BaseHTTPRequestHandler):
                         cur.execute("UPDATE daxview_conversations SET updated_at = now() WHERE id = %s", (conversation_id,))
                     conn.commit()
                 if created:
-                    if parent_turn_id and not context.get("_clarification_result"):
-                        with db() as conn:
-                            with conn.cursor() as cur:
-                                cur.execute("UPDATE daxview_turns SET clarification_state = %s WHERE id = %s",
-                                            (json.dumps({**clarification, "status": "answered", "last_reply": request.get("message")}), parent_turn_id))
-                            conn.commit()
                     add_job_event(job_id, "status", {"text": "Accepted turn"})
                     DAXVIEW_JOB_EXECUTOR.submit(process_daxview_turn, job_id, turn_id, message, context, request_id, conversation_id)
                 self._send_json(202, {"job_id": job_id})
