@@ -10,6 +10,25 @@ NODES = {node.name: node for node in TREE.body if isinstance(node, ast.FunctionD
 
 
 class ClarificationHelperTests(unittest.TestCase):
+    def test_explicit_historical_reading_clarification_request_is_detected(self):
+        module = ast.Module(body=[NODES["is_historical_readings_clarification_request"]], type_ignores=[])
+        env = {"__builtins__": __builtins__, "re": __import__("re")}
+        exec(compile(module, str(SOURCE), "exec"), env)
+        question = (
+            "I need historical device readings at Mun Hean Singapore HQ. "
+            "Please ask which metric and period I want before fetching readings."
+        )
+        self.assertTrue(env["is_historical_readings_clarification_request"](question))
+
+    def test_explicit_clarification_routes_to_telemetry_without_planner(self):
+        module = ast.Module(body=[NODES["select_historical_operations"]], type_ignores=[])
+        env = {
+            "__builtins__": __builtins__,
+            "is_historical_readings_clarification_request": lambda _message: True,
+        }
+        exec(compile(module, str(SOURCE), "exec"), env)
+        self.assertEqual(env["select_historical_operations"]("ignored"), ["telemetry_timeseries"])
+
     def test_persisted_trace_redacts_free_text_and_secret_fields(self):
         module = ast.Module(body=[NODES["mcp_result_shape"], NODES["sanitize_persisted_trace"]], type_ignores=[])
         env = {"__builtins__": __builtins__}

@@ -1377,6 +1377,8 @@ def planner_default_intents(message: str, tools: list[str]) -> list[str]:
 
 
 def select_historical_operations(message: str) -> list[str]:
+    if is_historical_readings_clarification_request(message):
+        return ["telemetry_timeseries"]
     explicit_tool = explicit_mcp_tool_request(message)
     if explicit_tool:
         return [explicit_tool]
@@ -1513,6 +1515,14 @@ def select_historical_operations(message: str) -> list[str]:
         if operation not in deduped:
             deduped.append(operation)
     return deduped[:6]
+
+
+def is_historical_readings_clarification_request(message: str) -> bool:
+    lowered = message.lower()
+    asks_readings = bool(re.search(r"\b(?:historical|history|past)\b.{0,60}\b(?:device\s+)?readings?\b|\b(?:device\s+)?readings?\b.{0,60}\b(?:historical|history|past)\b", lowered))
+    asks_to_clarify = bool(re.search(r"\b(?:please\s+)?ask\b.{0,80}\b(?:which|what)\b.{0,60}\b(?:metric|parameter|period|time\s*range|device|meter)\b|\b(?:clarify|ask me)\b.{0,80}\b(?:metric|parameter|period|time\s*range|device|meter)\b", lowered))
+    before_fetch = bool(re.search(r"\b(?:before|prior to)\s+(?:you\s+)?(?:fetch|retrieve|read|query)\b", lowered))
+    return asks_readings and (asks_to_clarify or before_fetch)
 
 
 def plan_turn_with_llm(message: str, context: dict, request_id: str):
@@ -5421,6 +5431,15 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
     clarification = metric_clarification(message)
     if clarification:
         return {"provider": "daxview-question-filter", "reply": clarification, "resolved_plan": resolved_plan_for_result("clarification", [], context)}
+    if is_historical_readings_clarification_request(message):
+        debug_trace_event(
+            "daxview_clarification_intent_debug",
+            request_id=request_id,
+            intent="historical_telemetry_clarification",
+            planner_skipped=True,
+            mcp_skipped=True,
+        )
+        return build_incomplete_request_clarification(message, context, request_id)
     operation_ids, context, planner_plan = choose_historical_operations(message, context, request_id)
     debug_trace_event(
         "daxview_tool_selection_debug",
@@ -5996,16 +6015,17 @@ def extract_clarification_details(original_message: str, reply: str, context: di
 
 def build_incomplete_request_clarification(message: str, context: dict, request_id: str) -> dict:
     missing = []
-    if not context.get("site_id"):
+    clarification_requested = is_historical_readings_clarification_request(message)
+    if not context.get("site_id") and not clarification_requested:
         if not re.search(r"\b(?:at|for|site|building)\b", message.lower()):
             missing.append("site/site scope")
         else:
             missing.append("site/site scope (select this site in DaxView so it can be authorized)")
-    if needs_device_choice(message) or (question_metrics(message) and not has_named_device_reference(message) and not context.get("device_id") and not wants_device_usage_ranking(message)):
+    if clarification_requested or needs_device_choice(message) or (question_metrics(message) and not has_named_device_reference(message) and not context.get("device_id") and not wants_device_usage_ranking(message)):
         missing.append("device or meter")
-    if not question_metrics(message) and not any(word in message.lower() for word in ("alarm", "device list", "devices", "meters")):
+    if (clarification_requested or not question_metrics(message)) and not any(word in message.lower() for word in ("alarm", "device list", "devices", "meters")):
         missing.append("metric (such as energy, demand, voltage, or current)")
-    if not has_time_scope(message):
+    if clarification_requested or not has_time_scope(message):
         missing.append("time period (such as last 7 days or 1–7 October 2026)")
     devices = []
     if context.get("site_id") and context.get("company_id") and context.get("deployment_id"):
@@ -6019,7 +6039,7 @@ def build_incomplete_request_clarification(message: str, context: dict, request_
         except Exception as error:
             log_event("clarification_device_list_unavailable", request_id=request_id, error=str(error))
     prompt = llm_clarification_prompt(message, missing or ["device, metric, and time period"], devices)
-    if not context.get("site_id"):
+    if not context.get("site_id") and not clarification_requested:
         prompt += " Please select the site in DaxView first; I can only read devices from your authorized site."
     return {
         "provider": "daxview-question-filter",
