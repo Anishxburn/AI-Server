@@ -5728,17 +5728,87 @@ def run_daxview_integration_turn(turn_id: str, message: str, context: dict, requ
             "debug_charts": [],
             "resolved_plan": resolved_plan_for_result("error", operation_ids, context, results, errors),
         }
-    deterministic_reply = summarize_historical_answers(message, results, request_id)
+    formatting_failed = False
+    summary_failed = False
+    try:
+        deterministic_reply = summarize_historical_answers(message, results, request_id)
+    except Exception as error:
+        # A presentation bug must not turn a successful MCP fetch into a failed
+        # chat job. Keep the result available and record the failing stage.
+        formatting_failed = True
+        summary_failed = True
+        log_event(
+            "historical_response_generation_failed",
+            request_id=request_id,
+            stage="answer_summary",
+            error_type=type(error).__name__,
+            error=str(error),
+        )
+        deterministic_reply = (
+            "DaxView returned historical data for this request, but the chatbot "
+            "could not format the readings into a summary. Please retry or "
+            "contact support with the request ID."
+        )
     if errors:
         failed_tools = readable_historical_errors(errors)
         deterministic_reply = f"{deterministic_reply}\n\nUnavailable detail: {failed_tools}"
-    refined_reply = refine_historical_answer_with_model(message, results, deterministic_reply, request_id)
+    if summary_failed:
+        refined_reply = deterministic_reply
+    else:
+        try:
+            refined_reply = refine_historical_answer_with_model(message, results, deterministic_reply, request_id)
+        except Exception as error:
+            formatting_failed = True
+            log_event(
+                "historical_response_generation_failed",
+                request_id=request_id,
+                stage="answer_refinement",
+                error_type=type(error).__name__,
+                error=str(error),
+            )
+            refined_reply = deterministic_reply
     if errors and "Unavailable detail:" not in refined_reply:
         refined_reply += f"\n\nUnavailable detail: {failed_tools}"
-    charts = build_charts_from_historical_results(results, message=message)
-    preview_charts = charts if charts else build_charts_from_historical_results(results, preview=True, message=message)
-    tables = build_tables_from_historical_results(results, message)
-    presentation = answer_presentation(message, operation_ids, results, charts, tables)
+    try:
+        charts = build_charts_from_historical_results(results, message=message)
+        preview_charts = charts if charts else build_charts_from_historical_results(results, preview=True, message=message)
+    except Exception as error:
+        formatting_failed = True
+        charts = []
+        preview_charts = []
+        log_event(
+            "historical_response_generation_failed",
+            request_id=request_id,
+            stage="chart_generation",
+            error_type=type(error).__name__,
+            error=str(error),
+        )
+    try:
+        tables = build_tables_from_historical_results(results, message)
+    except Exception as error:
+        formatting_failed = True
+        tables = []
+        log_event(
+            "historical_response_generation_failed",
+            request_id=request_id,
+            stage="table_generation",
+            error_type=type(error).__name__,
+            error=str(error),
+        )
+    try:
+        presentation = answer_presentation(message, operation_ids, results, charts, tables)
+    except Exception as error:
+        formatting_failed = True
+        presentation = {"type": "answer", "show_chart": bool(charts), "show_table": bool(tables)}
+        log_event(
+            "historical_response_generation_failed",
+            request_id=request_id,
+            stage="presentation_classification",
+            error_type=type(error).__name__,
+            error=str(error),
+        )
+    if formatting_failed:
+        log_event("historical_response_returned_with_formatting_fallback", request_id=request_id)
     debug_trace_event(
         "ai_final_response_debug",
         request_id=request_id,
